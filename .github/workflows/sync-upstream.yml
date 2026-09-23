@@ -1,0 +1,66 @@
+name: Sync upstream
+
+# Force-pushes upstream's `main` onto this repo's `upstream-main` branch, so a
+# SHA pinned by a consumer stays reachable from this org even if upstream goes
+# away. Commit SHAs are preserved — a mirror push rewrites nothing.
+#
+# SSH, not GITHUB_TOKEN: upstream's tree carries `.github/workflows`, and a
+# push bearing workflow files is refused for the Actions token. The deploy key
+# in MIRROR_SSH_KEY is write-scoped to this repository and nothing else.
+#
+# `mirror-ops` (this branch) is never written by the sync — only `upstream-main`
+# moves, so the workflow cannot overwrite itself.
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+permissions: {}
+
+jobs:
+  sync:
+    name: Mirror upstream main
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      UPSTREAM: https://github.com/fractalboxdev/flare-dispatch.git
+      MIRROR: git@github.com:ax-engineering/flare-dispatch-mirror.git
+    steps:
+      - name: Load the deploy key
+        env:
+          MIRROR_SSH_KEY: ${{ secrets.MIRROR_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$MIRROR_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -t rsa,ecdsa,ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Fetch upstream and force-push upstream-main
+        run: |
+          set -euo pipefail
+          git clone --bare --single-branch --branch main "$UPSTREAM" upstream.git
+          cd upstream.git
+          SHA="$(git rev-parse main)"
+          git push --force "$MIRROR" "refs/heads/main:refs/heads/upstream-main"
+          git push --force --tags "$MIRROR" || true
+          echo "SHA=$SHA" >> "$GITHUB_ENV"
+
+      - name: Summary
+        run: |
+          set -euo pipefail
+          {
+            echo "## Mirror synced"
+            echo
+            echo "- \`upstream-main\` → \`${SHA}\`"
+            echo "- Upstream: <https://github.com/fractalboxdev/flare-dispatch/commit/${SHA}>"
+          } >> "$GITHUB_STEP_SUMMARY"
