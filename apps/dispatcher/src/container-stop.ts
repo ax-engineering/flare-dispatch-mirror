@@ -39,13 +39,13 @@
 // `SUBSTRATE_BACKEND` flips to "on" loses this — silently, since nothing fails.
 // Porting it is a prerequisite of the stage-2 cutover, not of this change.
 //
-// NOTHING PRUNES `container-stops/`. There is no lifecycle rule on the bucket
-// and no reader route; the prefix is write-only and permanent until someone
-// sets one. Volume is bounded by the `requested` filter below — a healthy run
-// writes nothing — but that is a bound, not an expiry. Set a rule before
-// leaving this on indefinitely:
+// EXPIRY IS A DEPLOY STEP. Nothing in the Worker prunes `container-stops/` and
+// no route reads it; an R2 lifecycle rule on the deploying account's bucket is
+// the only expiry. Volume is bounded by the `requested` filter below — a
+// healthy run writes nothing — but that is a bound, not an expiry. Every
+// deploy that leaves `CONTAINER_STOP_RECORDS` on runs, once per bucket:
 //
-//   wrangler r2 bucket lifecycle add flare-dispatch \
+//   wrangler r2 bucket lifecycle add <RUNS_STORAGE bucket> \
 //     --name expire-container-stops --prefix container-stops/ --expire-days 90
 
 /**
