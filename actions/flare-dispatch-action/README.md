@@ -79,9 +79,18 @@ test-**merge** commit; a check-run posted there is invisible on the PR head and
 branch protection can't gate it. The action reads `pull_request.head.sha` from
 the event payload so the verdict lands on the commit the author pushed, falling
 back to `GITHUB_SHA` for push events. The same head SHA keys the
-`Idempotency-Key`, so a step re-run collapses onto one execution per head commit.
-An `inputs.checkLabel` joins the key (`<run>-<label>-<repo>-<sha12>`), so two
-steps dispatching one run with different labels stay two executions.
+`Idempotency-Key`, so the action's own POST retries collapse onto one execution
+per head commit. An `inputs.checkLabel` joins the key
+(`<run>-<label>-<repo>-<sha12>`), so two steps dispatching one run with
+different labels stay two executions.
+
+A GitHub **Re-run jobs** on the workflow (`GITHUB_RUN_ATTEMPT` > 1) appends
+`-attempt-<N>` to the key and dispatches a fresh execution; its check-run keeps
+the same name and supersedes the earlier one. This is the retry path for a check
+that failed on a platform fault (a container evicted mid-run) when the App's
+webhook — and with it the check-run's own **Re-run** button — is not configured.
+The dispatching job is green after a `202`, so use **Re-run all jobs**, not
+**Re-run failed jobs**.
 
 ## Collecting signals (`collect-command`)
 

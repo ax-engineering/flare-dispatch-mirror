@@ -9,7 +9,7 @@
 #
 #   POST ${endpoint}/v1/dispatch/${run}
 #     X-FlareDispatch-Signature: sha256=<hex over the RAW body bytes>
-#     Idempotency-Key: <run>[-<checkLabel>]-<repo>-<sha12>
+#     Idempotency-Key: <run>[-<checkLabel>]-<repo>-<sha12>[-attempt-<N>]
 #   202 { executionId, detailsUrl?, logsUrl? }   → outputs, success
 #   401                                           → HMAC drift, no retry
 #   400 / 404                                     → config bug, no retry
@@ -300,10 +300,15 @@ sign_body() {
 }
 
 # --- idempotency key + URL ---------------------------------------------------
-# {run}[-{checkLabel}]-{repo}-{sha12} so a re-run of the same step collapses
-# onto one execution at the receiver, while two steps dispatching one run with
-# different `checkLabel`s stay two executions — the label names a separate
-# check-run, so collapsing them would leave the second check never posted.
+# {run}[-{checkLabel}]-{repo}-{sha12}[-attempt-{N}] so the POST retries of one
+# step collapse onto one execution at the receiver, while two steps dispatching
+# one run with different `checkLabel`s stay two executions — the label names a
+# separate check-run, so collapsing them would leave the second check never
+# posted. A GitHub "Re-run jobs" (GITHUB_RUN_ATTEMPT > 1) appends
+# `-attempt-<N>`: the Dispatcher keeps every id it has seen, so without the
+# suffix a re-run is acknowledged with the prior execution's id and nothing
+# runs. The check-run name comes from `checkLabel`, not the key, so the new
+# execution's check supersedes the red one. Attempt 1 keeps the bare key.
 # Randomized fallback when repo/sha are absent (local act runs).
 # Sets $IDEMPOTENCY_KEY and $URL.
 
@@ -319,6 +324,10 @@ compute_targets() {
     local repo_safe="${GITHUB_REPOSITORY//\//_}" label
     label="$(check_label_suffix <<<"${INPUTS:-null}")"
     IDEMPOTENCY_KEY="${INPUT_RUN}${label}-${repo_safe}-${SHA:0:12}"
+    local attempt="${GITHUB_RUN_ATTEMPT:-1}"
+    if [[ "$attempt" =~ ^[0-9]+$ ]] && [ "$attempt" -gt 1 ]; then
+      IDEMPOTENCY_KEY="${IDEMPOTENCY_KEY}-attempt-${attempt}"
+    fi
   else
     IDEMPOTENCY_KEY="${INPUT_RUN}-$(date +%s)-${RANDOM}"
   fi

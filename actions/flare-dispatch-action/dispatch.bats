@@ -117,6 +117,26 @@ setup() {
   [ "$output" = "worker-deploy-containers-owner_name-0123456789ab" ]
 }
 
+@test "compute_targets keeps the bare key on the first run attempt" {
+  run env GITHUB_REPOSITORY=owner/name GITHUB_RUN_ATTEMPT=1 INPUT_RUN=worker-deploy ENDPOINT=https://d.example \
+    bash -c 'source "$SCRIPT"; SHA=0123456789abcdef; INPUTS="{\"checkLabel\":\"preview\"}"; compute_targets; echo "$IDEMPOTENCY_KEY"'
+  [ "$status" -eq 0 ]
+  [ "$output" = "worker-deploy-preview-owner_name-0123456789ab" ]
+}
+
+@test "compute_targets gives a GitHub job re-run its own execution" {
+  run env GITHUB_REPOSITORY=owner/name GITHUB_RUN_ATTEMPT=2 INPUT_RUN=worker-deploy ENDPOINT=https://d.example \
+    bash -c 'source "$SCRIPT"; SHA=0123456789abcdef; INPUTS="{\"checkLabel\":\"preview\"}"; compute_targets; echo "$IDEMPOTENCY_KEY"'
+  [ "$status" -eq 0 ]
+  [ "$output" = "worker-deploy-preview-owner_name-0123456789ab-attempt-2" ]
+}
+
+@test "compute_targets ignores a non-numeric run attempt" {
+  run env GITHUB_REPOSITORY=owner/name GITHUB_RUN_ATTEMPT=x INPUT_RUN=check ENDPOINT=https://d.example \
+    bash -c 'source "$SCRIPT"; SHA=0123456789abcdef; INPUTS="{}"; compute_targets; echo "$IDEMPOTENCY_KEY"'
+  [ "$output" = "check-owner_name-0123456789ab" ]
+}
+
 @test "compute_targets ignores a non-string checkLabel" {
   run env GITHUB_REPOSITORY=owner/name INPUT_RUN=check ENDPOINT=https://d.example \
     bash -c 'source "$SCRIPT"; SHA=0123456789abcdef; INPUTS="{\"checkLabel\":7}"; compute_targets; echo "$IDEMPOTENCY_KEY"'
