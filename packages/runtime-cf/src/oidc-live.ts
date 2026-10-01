@@ -32,6 +32,7 @@
 
 import { Effect, Layer } from "effect";
 import {
+  OIDC_RESERVED_CLAIMS,
   OIDC_TOKEN_TTL_SEC_DEFAULT,
   OIDC_TOKEN_MAX_TTL_SEC,
   Oidc,
@@ -54,8 +55,9 @@ export type OidcLiveConfig = {
    */
   readonly issuerUrl: string;
   /**
-   * Default subject for tokens that don't supply one. The Dispatcher sets
-   * this to `<run-name>:<execution-id>` at Layer construction.
+   * The execution's subject. The Dispatcher sets it to `<run-name>:<execution-id>`
+   * at Layer construction; once set it is the only subject this Layer signs, so a
+   * run cannot present another run's identity to a trust policy scoped by `sub`.
    */
   readonly subjectDefault?: string;
 };
@@ -122,53 +124,69 @@ export const makeOidcLive = (config: OidcLiveConfig): Layer.Layer<Oidc> => {
     return cached;
   };
 
+  const signToken = ({ audience, subject, ttlSec, claims }: { readonly audience: string; readonly subject: string;
+    readonly ttlSec: number | undefined; readonly claims: Readonly<Record<string, string | number | boolean>> | undefined }) =>
+    Effect.tryPromise({
+      try: async () => {
+        const { jwk, key } = await resolveKey();
+        const ttl = Math.min(ttlSec ?? OIDC_TOKEN_TTL_SEC_DEFAULT, OIDC_TOKEN_MAX_TTL_SEC);
+        const iat = Math.floor(Date.now() / 1000);
+        const exp = iat + ttl;
+        const headerSegment = base64url(
+          JSON.stringify({
+            alg: "ES256",
+            typ: "JWT",
+            ...(jwk.kid !== undefined ? { kid: jwk.kid } : {}),
+          }),
+        );
+        const payloadSegment = base64url(
+          // Registered claims come last, so no custom claim can stand in for one.
+          JSON.stringify({
+            ...claims,
+            iss: config.issuerUrl,
+            sub: subject,
+            aud: audience,
+            iat,
+            exp,
+            jti: crypto.randomUUID(),
+          }),
+        );
+        const signingInput = `${headerSegment}.${payloadSegment}`;
+        const sigBytes = await crypto.subtle.sign(
+          { name: "ECDSA", hash: "SHA-256" },
+          key,
+          new TextEncoder().encode(signingInput),
+        );
+        const signatureSegment = base64url(sigBytes);
+        return {
+          jwt: `${signingInput}.${signatureSegment}`,
+          expiresAt: exp * 1000,
+        };
+      },
+      catch: (cause): OidcSigningFailed => {
+        const message = cause instanceof Error ? cause.message : String(cause);
+        // Heuristic: key-import / JSON-parse failures are key-load; anything
+        // else (almost certainly a SubtleCrypto sign reject) is subtle-sign.
+        const reason = /JWK|JSON|import|component/i.test(message)
+          ? ("key-load" as const)
+          : ("subtle-sign" as const);
+        return new OidcSigningFailed({ reason, cause });
+      },
+    });
+
   const service: OidcService = {
     sign: ({ audience, subject, ttlSec, claims }) =>
-      Effect.tryPromise({
-        try: async () => {
-          const { jwk, key } = await resolveKey();
-          const ttl = Math.min(ttlSec ?? OIDC_TOKEN_TTL_SEC_DEFAULT, OIDC_TOKEN_MAX_TTL_SEC);
-          const iat = Math.floor(Date.now() / 1000);
-          const exp = iat + ttl;
-          const headerSegment = base64url(
-            JSON.stringify({
-              alg: "ES256",
-              typ: "JWT",
-              ...(jwk.kid !== undefined ? { kid: jwk.kid } : {}),
-            }),
-          );
-          const payloadSegment = base64url(
-            JSON.stringify({
-              iss: config.issuerUrl,
-              sub: subject ?? config.subjectDefault ?? "unspecified",
-              aud: audience,
-              iat,
-              exp,
-              jti: crypto.randomUUID(),
-              ...claims,
-            }),
-          );
-          const signingInput = `${headerSegment}.${payloadSegment}`;
-          const sigBytes = await crypto.subtle.sign(
-            { name: "ECDSA", hash: "SHA-256" },
-            key,
-            new TextEncoder().encode(signingInput),
-          );
-          const signatureSegment = base64url(sigBytes);
-          return {
-            jwt: `${signingInput}.${signatureSegment}`,
-            expiresAt: exp * 1000,
-          };
-        },
-        catch: (cause): OidcSigningFailed => {
-          const message = cause instanceof Error ? cause.message : String(cause);
-          // Heuristic: key-import / JSON-parse failures are key-load; anything
-          // else (almost certainly a SubtleCrypto sign reject) is subtle-sign.
-          const reason: "key-load" | "subtle-sign" = /JWK|JSON|import|component/i.test(message)
-            ? "key-load"
-            : "subtle-sign";
-          return new OidcSigningFailed({ reason, cause });
-        },
+      Effect.gen(function* () {
+        if (config.subjectDefault !== undefined && subject !== undefined && subject !== config.subjectDefault) {
+          return yield* Effect.fail(new OidcSigningFailed({ reason: "subject-pinned",
+            cause: new Error(`this execution signs as ${config.subjectDefault} only`) }));
+        }
+        const reserved = Object.keys(claims ?? {}).filter((key) => OIDC_RESERVED_CLAIMS.includes(key));
+        if (reserved.length > 0) {
+          return yield* Effect.fail(new OidcSigningFailed({ reason: "reserved-claim",
+            cause: new Error(`claims may not set ${reserved.join(", ")}`) }));
+        }
+        return yield* signToken({ audience, subject: subject ?? config.subjectDefault ?? "unspecified", ttlSec, claims });
       }),
 
     issuer: () => Effect.succeed(config.issuerUrl),

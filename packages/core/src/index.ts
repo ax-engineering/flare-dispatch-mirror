@@ -184,6 +184,7 @@ export {
   type OidcToken,
   OIDC_TOKEN_TTL_SEC_DEFAULT,
   OIDC_TOKEN_MAX_TTL_SEC,
+  OIDC_RESERVED_CLAIMS,
 } from "./services/oidc";
 export {
   checks,

@@ -58,14 +58,15 @@ export const makeOidcFake = (
         const exp = iat + effectiveTtl;
         const header = base64url(JSON.stringify({ alg: "ES256", typ: "JWT", kid: "fake-kid" }));
         const payload = base64url(
+          // Registered claims last, as the live signer writes them.
           JSON.stringify({
+            ...claims,
             iss: issuer,
             sub: subject ?? "fake-subject",
             aud: audience,
             iat,
             exp,
             jti: `fake-jti-${state.signCalls.length}`,
-            ...claims,
           }),
         );
         return {

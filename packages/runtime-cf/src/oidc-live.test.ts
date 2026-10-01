@@ -6,7 +6,7 @@
 // signature verifiability. The signature is checked with the public JWK we
 // derive at the same time — exactly what AWS STS does at the JWKS endpoint.
 
-import { Effect } from "effect";
+import { Cause, Effect, Exit } from "effect";
 import { describe, expect, it } from "vitest";
 import { Oidc } from "@fractalboxdev/flare-dispatch-core";
 import { makeOidcLive, publicJwkFromSigning } from "./oidc-live";
@@ -121,6 +121,41 @@ describe("makeOidcLive — sign()", () => {
       ),
     );
     expect(exit._tag).toBe("Failure");
+  });
+
+  it("signs only the execution's own subject once the runtime pins it", async () => {
+    const { privateJwk } = await freshSigningJwk();
+    const layer = makeOidcLive({ signingJwkJson: privateJwk, issuerUrl: ISSUER, subjectDefault: "pr-review:01ABC" });
+    const sign = (subject?: string) =>
+      Effect.runPromiseExit(
+        Effect.flatMap(Oidc, (o) => o.sign({ audience: "sts.amazonaws.com", ...(subject ? { subject } : {}) })).pipe(
+          Effect.provide(layer),
+        ),
+      );
+
+    // Another run's identity is refused, so a role scoped to `pr-review:*` cannot be assumed from elsewhere.
+    const forged = await sign("deploy:01XYZ");
+    expect(Exit.isFailure(forged)).toBe(true);
+    if (Exit.isFailure(forged)) expect(Cause.squash(forged.cause)).toMatchObject({ _tag: "OidcSigningFailed", reason: "subject-pinned" });
+
+    // Naming the pinned subject, or none, signs as the execution.
+    for (const exit of [await sign("pr-review:01ABC"), await sign()]) {
+      expect(Exit.isSuccess(exit)).toBe(true);
+      if (Exit.isSuccess(exit)) expect((decodeSegment(exit.value.jwt.split(".")[1]!) as Record<string, unknown>).sub).toBe("pr-review:01ABC");
+    }
+  });
+
+  it("refuses claims that name a registered claim, whatever the subject", async () => {
+    const { privateJwk } = await freshSigningJwk();
+    const layer = makeOidcLive({ signingJwkJson: privateJwk, issuerUrl: ISSUER, subjectDefault: "pr-review:01ABC" });
+    const forged: ReadonlyArray<Readonly<Record<string, string | number>>> = [{ sub: "deploy:01XYZ" }, { aud: "other" }, { iss: "https://elsewhere.example" }, { exp: 9999999999 }];
+    for (const claims of forged) {
+      const exit = await Effect.runPromiseExit(
+        Effect.flatMap(Oidc, (o) => o.sign({ audience: "sts.amazonaws.com", claims })).pipe(Effect.provide(layer)),
+      );
+      expect(Exit.isFailure(exit)).toBe(true);
+      if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toMatchObject({ _tag: "OidcSigningFailed", reason: "reserved-claim" });
+    }
   });
 
   it("issuer() returns the configured issuer", async () => {

@@ -24,6 +24,9 @@ export type OidcToken = {
 /** Caps how long a token lives — AWS STS / GCP STS refuse longer than 1h. */
 export const OIDC_TOKEN_MAX_TTL_SEC = 3600;
 
+/** Registered claims the signer sets itself; `claims` may not name them. */
+export const OIDC_RESERVED_CLAIMS: readonly string[] = ["iss", "sub", "aud", "iat", "nbf", "exp", "jti"];
+
 /** Default token TTL when the caller omits one (specs/03-dsl § oidc). */
 export const OIDC_TOKEN_TTL_SEC_DEFAULT = 900;
 
@@ -31,10 +34,14 @@ export const OIDC_TOKEN_TTL_SEC_DEFAULT = 900;
 export interface OidcService {
   /**
    * Sign a fresh OIDC token. `audience` is the IdP-specific value the
-   * trust policy pins (e.g. "sts.amazonaws.com" for AWS). `subject` defaults
-   * to `<run-name>:<execution-id>` so an IAM trust policy can scope a role
-   * to a *specific run*. `ttlSec` defaults to {@link OIDC_TOKEN_TTL_SEC_DEFAULT}
-   * and caps at {@link OIDC_TOKEN_MAX_TTL_SEC}.
+   * trust policy pins (e.g. "sts.amazonaws.com" for AWS). The subject is
+   * `<run-name>:<execution-id>` so an IAM trust policy can scope a role to a
+   * *specific run*: where the runtime pins it, a `subject` naming anything else
+   * fails with `reason: "subject-pinned"`, so no run can mint another run's
+   * identity. `claims` adds context and never overrides a registered claim — one
+   * named `iss`, `sub`, `aud`, `iat`, `nbf`, `exp` or `jti` fails with
+   * `reason: "reserved-claim"`. `ttlSec` defaults to
+   * {@link OIDC_TOKEN_TTL_SEC_DEFAULT} and caps at {@link OIDC_TOKEN_MAX_TTL_SEC}.
    */
   readonly sign: (opts: {
     audience: string;

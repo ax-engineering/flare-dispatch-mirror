@@ -277,8 +277,10 @@ export class OidcSigningFailed extends Schema.TaggedError<OidcSigningFailed>()(
   "OidcSigningFailed",
   {
     // "key-load" — signing key absent or malformed;
-    // "subtle-sign" — WebCrypto SubtleCrypto.sign rejected.
-    reason: Schema.Literal("key-load", "subtle-sign"),
+    // "subtle-sign" — WebCrypto SubtleCrypto.sign rejected;
+    // "subject-pinned" — the runtime pins this execution's subject and the caller asked for another;
+    // "reserved-claim" — `claims` named a registered claim the signer sets (`iss`, `sub`, `aud`, …).
+    reason: Schema.Literal("key-load", "subtle-sign", "subject-pinned", "reserved-claim"),
     cause: Schema.Unknown,
   },
 ) {}
