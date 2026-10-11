@@ -12,6 +12,7 @@ import {
   waitForChildrenDurably,
   workspace,
 } from "@fractalboxdev/flare-dispatch-core/primitives";
+import { check } from "./check";
 
 const REPO = "fractalboxdev/contextful";
 const DISCOVER = "cargo run --locked -q -p contextful-ci -- stages --parts";
@@ -19,6 +20,14 @@ const STAGE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
 const MAX_STAGES = 64;
 const MAX_STAGE_LIST_BYTES = 4096;
 const STAGE_CONCURRENCY = 2;
+/**
+ * Each part's exec deadline. One cold build of the binary under one feature set
+ * takes 550–760 s, and its ordinary suite another ~1100 s, so a single part needs
+ * up to ~1750 s; 2700 s keeps that at about 65% of the deadline.
+ */
+const STAGE_TIMEOUT_SEC = 2700;
+/** Admission queue age a part may wait before it starts. */
+const STAGE_QUEUE_SEC = 90 * 60;
 
 const Input = Schema.Struct({
   repo: Schema.Literal(REPO),
@@ -180,8 +189,8 @@ export const contextfulGate = defineRun({
               checkLabel: stage,
               command: `cargo run --locked -q -p contextful-ci -- gate --predecessors --stage ${stage} --base ${input.baseSha}`,
               failOnNonZeroExit: true,
-              timeoutSec: 1800,
-              admissionMaxQueueAgeSec: 90 * 60,
+              timeoutSec: STAGE_TIMEOUT_SEC,
+              admissionMaxQueueAgeSec: STAGE_QUEUE_SEC,
               install: false,
               secrets: [],
             }),
@@ -193,7 +202,9 @@ export const contextfulGate = defineRun({
         const results = yield* waitForChildrenDurably({
             name: `await-stages-${offset}`,
             ids: handles.map((handle) => handle.executionId),
-            timeout: "130 minutes",
+            // A batch waits out its parts' queue age and the check run's whole ceiling,
+            // so a part still inside its own budget is never reported failed.
+            timeout: `${(STAGE_QUEUE_SEC + check.limits.maxDurationSec) / 60} minutes`,
           });
         results.forEach((result, index) => {
           if (result.status !== "success") failed.push(batch[index]!);

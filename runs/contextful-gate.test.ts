@@ -3,6 +3,7 @@ import { Cause, Duration, Effect, Exit } from "effect";
 import { describe, expect } from "vitest";
 import { makeCFRuntimeTest } from "@fractalboxdev/flare-dispatch-core/testing";
 import { IO, StepFailed, StepRunner, type StepRunnerService } from "@fractalboxdev/flare-dispatch-core";
+import { check } from "./check";
 import { contextfulGate, mergeStages, parseStages } from "./contextful-gate";
 
 const SHA = "a".repeat(40);
@@ -110,6 +111,19 @@ describe("contextful-gate", () => {
         "pins", "test-first.validate", "test-first.contextful-core", "test-first.contextful-cli", "test-first.deleted-package", "formal",
       ].map((checkLabel) => expect.objectContaining({ checkLabel })));
       expect(handles.sandbox.execs.filter((exec) => exec.command.startsWith("cargo ")).map((exec) => exec.command)).toEqual([DISCOVER_HEAD, DISCOVER]);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("gives each part a 2700 s exec deadline inside the check run's ceiling", () => {
+    const { layer, handles } = makeCFRuntimeTest({
+      sandboxProgram: { [DISCOVER_HEAD]: { stdout: "budget.full\n", exitCode: 0 }, [DISCOVER]: { stdout: "budget.full\n", exitCode: 0 } },
+      childRuns: { pollFn: (ids) => ids.map((executionId) => ({ executionId, status: "success" })) },
+    });
+    return Effect.gen(function* () {
+      expect(yield* contextfulGate.run(input)).toEqual({ stages: 1, failed: [] });
+      const [part] = handles.childRuns.spawned.map((spawn) => spawn.input as { timeoutSec: number });
+      expect(part?.timeoutSec).toBe(2700);
+      expect(check.limits.maxDurationSec).toBeGreaterThan(part!.timeoutSec);
     }).pipe(Effect.provide(layer));
   });
 

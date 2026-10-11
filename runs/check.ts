@@ -277,10 +277,10 @@ export const check = defineRun({
   ],
 
   limits: {
-    // Run-body wall-time ceiling, enforced by the dispatcher: one full 1800 s
+    // Run-body wall-time ceiling, enforced by the dispatcher: one full 2700 s
     // exec (the per-stage ceiling a fan-out gate passes) plus checkout, upload
     // and the step headroom, with every retry drawing on the same budget.
-    maxDurationSec: 3600,
+    maxDurationSec: 4500,
     admissionMaxQueueAgeSec: (input) =>
       Math.min(90 * 60, Math.max(20 * 60, input.admissionMaxQueueAgeSec ?? 20 * 60)),
   },
