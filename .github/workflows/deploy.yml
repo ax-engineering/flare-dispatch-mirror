@@ -16,10 +16,9 @@ name: deploy
 # `workflow_dispatch` with `target: substrate` stops after the canary, so a
 # security patch to the substrate never queues behind a product release.
 #
-# CREDENTIALS. `CLOUDFLARE_API_TOKEN` — account-scoped to FractalBox
-# (c91d52c2…), no zone resources: Workers Scripts:Edit, Workers KV:Edit,
-# Workers R2:Edit, D1:Edit, Containers:Edit, Account Settings:Read.
-# Created 2026-08-06 · dash.cloudflare.com/profile/api-tokens · no expiry.
+# CREDENTIALS. `CLOUDFLARE_API_TOKEN` — scoped to the deploying org's account,
+# no zone resources: Workers Scripts:Edit, Workers KV:Edit, Workers R2:Edit,
+# D1:Edit, Containers:Edit, Account Settings:Read.
 # Scope is recorded here because GitHub secrets have no comment field and a
 # Cloudflare token cannot report its own policies — reading them needs a
 # *second* token with API Tokens:Read, so an undocumented token's grants are
