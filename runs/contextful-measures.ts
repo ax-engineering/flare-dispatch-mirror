@@ -27,8 +27,13 @@ const Output = Schema.Struct({
   reportUrl: Schema.String,
 });
 
-/** Build the JSON record in the container, preserving failed-tier results. */
-export const reportCommand = `node -e 'const fs=require("node:fs"); const path=require("node:path"); const dir="target/evaluate/records"; const records=fs.existsSync(dir)?fs.readdirSync(dir).filter(n=>n.endsWith(".json")).sort().map(n=>JSON.parse(fs.readFileSync(path.join(dir,n),"utf8"))):[]; fs.writeFileSync("${REPORT_FILE}",JSON.stringify({commit:process.env.MEASURE_COMMIT,run_id:process.env.MEASURE_RUN_ID,run_attempt:Number(process.env.MEASURE_RUN_ATTEMPT),exit_code:Number(process.env.MEASURE_EXIT),records})+"\\n");'`;
+/**
+ * Contextful's `measure-report` owns the note line: it collects every record, red
+ * tiers included, and annotates trend figures against the history under
+ * `refs/notes/measures`, which a plain clone omits. A failed notes fetch leaves
+ * no history, and the report then carries no annotation.
+ */
+export const reportCommand = `(git fetch -q origin +refs/notes/measures:refs/notes/measures || true) && cargo run --locked -q -p contextful-ci -- measure-report --commit "$MEASURE_COMMIT" --run-id "$MEASURE_RUN_ID" --run-attempt "$MEASURE_RUN_ATTEMPT" --exit-code "$MEASURE_EXIT" --out ${REPORT_FILE}`;
 
 export const runAttempt = (executionId: string): number =>
   Number(executionId.match(/_attempt-(\d+)$/)?.[1] ?? 1);
