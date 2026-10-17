@@ -24,6 +24,14 @@ flowchart TB
   class checks ok
 ```
 
+A cron tick carries no commit. A scheduled run whose inputs name a `repo` and a
+`refs/heads/<branch>` ref, and no `sha`, is pinned at the tick to that branch's
+head through the repo's GitHub App installation: the run receives the commit as
+`inputs.sha`, and its `flare-dispatch/<run>` check-run opens on that commit when
+the run starts and concludes with the run's outcome. A failure's summary names
+the failing step and its error tag. A repo without the App installed, or a
+deploy without App credentials, runs the schedule and posts no check-run.
+
 A run is a recipe: it composes primitives, which ride the capability layer, and
 calls capabilities directly where no primitive fits.
 

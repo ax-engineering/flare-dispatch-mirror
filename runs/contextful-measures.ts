@@ -19,6 +19,8 @@ const Input = Schema.Struct({
   repo: Schema.String,
   ref: Schema.String,
   firedAt: Schema.Number,
+  /** The head the scheduled tick pinned; its check-run lands on this commit. */
+  sha: Schema.optional(Schema.String),
   timeoutSec: Schema.optional(Schema.Number),
 });
 const Output = Schema.Struct({
@@ -46,7 +48,11 @@ export const contextfulMeasures = defineRun({
       cron: "17 2 * * *",
       idempotencyKey: ({ firedAt }) =>
         `contextful-measures:${new Date(firedAt).toISOString().slice(0, 10)}`,
-      inputs: ({ firedAt }): typeof Input.Type => ({ repo: REPO, ref: `refs/heads/${BRANCH}`, firedAt }),
+      inputs: ({ firedAt }): typeof Input.Type => ({
+        repo: REPO,
+        ref: `refs/heads/${BRANCH}`,
+        firedAt,
+      }),
     },
   ],
   serialize: (input) => ({
@@ -66,10 +72,10 @@ export const contextfulMeasures = defineRun({
           }),
         );
       }
-      // Resolve HEAD at execution time; a cron tick has no GitHub event SHA.
-      const commit = yield* step("resolve-head", () =>
-        github.branchHead({ repo: REPO, branch: BRANCH }),
-      );
+      // The tick's pinned head, else HEAD at execution time.
+      const commit =
+        input.sha ??
+        (yield* step("resolve-head", () => github.branchHead({ repo: REPO, branch: BRANCH })));
       const executionId = yield* io.executionId;
       const runId = executionId || `contextful-measures:${input.firedAt}`;
       // The ledger runs 65 entries in sequence and compiles its own test

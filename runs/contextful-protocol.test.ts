@@ -113,6 +113,24 @@ describe("contextful-protocol", () => {
     },
   );
 
+  it.effect("explores the commit the schedule pinned without re-reading the branch head", () => {
+    const pinned = "b".repeat(40);
+    const { layer, handles } = makeCFRuntimeTest({
+      sandboxProgram: {
+        "gate --predecessors --stage toolchain": { exitCode: 0 },
+        randomBytes: { exitCode: 0, stdout: "7\n" },
+        "protocol-differential": { exitCode: 0 },
+        "formal check": { exitCode: 0 },
+      },
+    });
+    return Effect.gen(function* () {
+      const out = yield* contextfulProtocol.run({ ...input, sha: pinned });
+      expect(out.commit).toBe(pinned);
+      expect(handles.github.branchHeadCalls).toHaveLength(0);
+      expect(handles.sandbox.clones).toEqual([{ repo: input.repo, sha: pinned }]);
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("rejects a different repository before allocating a sandbox", () => {
     const { layer, handles } = makeCFRuntimeTest({});
     return Effect.gen(function* () {

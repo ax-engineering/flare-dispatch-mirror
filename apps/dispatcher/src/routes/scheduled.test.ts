@@ -64,6 +64,63 @@ describe("handleScheduled", () => {
     warn.mockRestore();
   });
 
+  it("pins a branch-targeting run to the head it resolves and carries the installation for its check-run", async () => {
+    const workflow = makeFakeWorkflow();
+    const env = makeEnv(workflow);
+    const head = "c".repeat(40);
+    const resolveHead = vi.fn(async () => ({ installationId: 4242, sha: head }));
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+
+    // `contextful-measures` subscribes to "17 2 * * *" with inputs { repo, ref: refs/heads/main }.
+    await handleScheduled(env, "17 2 * * *", FIRED_AT, resolveHead);
+
+    expect(resolveHead).toHaveBeenCalledWith("fractalboxdev/contextful", "main");
+    const params = workflow.calls[0]!.params as {
+      github: { repo: string; ref: string; sha: string; installation_id?: number };
+      inputs: { sha?: string };
+    };
+    expect(params.github).toEqual({
+      repo: "fractalboxdev/contextful",
+      ref: "refs/heads/main",
+      sha: head,
+      installation_id: 4242,
+    });
+    // The run measures the same commit the check-run lands on.
+    expect(params.inputs.sha).toBe(head);
+    info.mockRestore();
+  });
+
+  it("fires without a check-run when the target repo's head does not resolve", async () => {
+    const workflow = makeFakeWorkflow();
+    const env = makeEnv(workflow);
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+
+    await handleScheduled(env, "17 2 * * *", FIRED_AT, async () => undefined);
+
+    const params = workflow.calls[0]!.params as {
+      github: { installation_id?: number };
+      inputs: { sha?: string };
+    };
+    expect(params.github.installation_id).toBeUndefined();
+    expect(params.inputs.sha).toBeUndefined();
+    info.mockRestore();
+  });
+
+  it("does not resolve a head for a run whose inputs name no branch ref", async () => {
+    const workflow = makeFakeWorkflow();
+    const env = makeEnv(workflow);
+    const resolveHead = vi.fn(async () => ({ installationId: 1, sha: "d".repeat(40) }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await handleScheduled(env, "0 14 * * *", FIRED_AT, resolveHead);
+
+    expect(resolveHead).not.toHaveBeenCalled();
+    expect((workflow.calls[0]!.params as { github: object }).github).not.toHaveProperty(
+      "installation_id",
+    );
+    warn.mockRestore();
+  });
+
   it("collapses duplicate-id create errors as the dedup path (not a hard failure)", async () => {
     const workflow = makeFakeWorkflow();
     // First call records; second call (with same id) throws as a real

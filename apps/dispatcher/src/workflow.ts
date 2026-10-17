@@ -28,7 +28,8 @@
 //
 //   * The App credentials (`GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`) come from
 //     `env`; the installation id rides in the dispatch payload's
-//     `github.installation_id` (PR5's dispatch route fills it in). When any of
+//     `github.installation_id` (PR5's dispatch route fills it in; the
+//     scheduled path resolves it for a run that targets a branch). When any of
 //     the three is absent — local dev without secrets, or a dispatch with no
 //     installation — `makeCFRuntimeLive` selects the *no-op* `Checks` Layer:
 //     the execution runs to completion and records its D1 rows, only the PR
@@ -86,7 +87,13 @@ import { lookupRun } from "./registry";
 import { preAssertedApproval, resolveTargets, runGrant, runsOnFacade } from "./grant-catalog";
 import { selectSandboxNs } from "./sandbox-routing";
 import { queuedSummary, serialQueuedSummary } from "./admission-summary";
-import { appendFailureSummary, failureSummaryMd, runSkippedReason } from "./failure-summary";
+import {
+  appendFailureSummary,
+  type FailedStepRow,
+  failingStepMd,
+  failureSummaryMd,
+  runSkippedReason,
+} from "./failure-summary";
 import { renderResultEmail } from "./notify";
 import { workflowDashboardUrl } from "./dashboard-url";
 import { checkRunNameFor, checkRunTitleFor } from "./check-name";
@@ -1031,9 +1038,28 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
       // carry markdown (`AcceptanceFailed.summaryMd` — e.g. `product-demo`'s
       // per-chapter table). Extracted ONCE here and reused by both the
       // check-run failure summary and the notify email below. `undefined` on
-      // success, on a defect/interrupt, and on a summary-less failure — those
-      // render the generic line alone, exactly as before.
-      const failureMd = failureSummaryMd(exit);
+      // success and on a defect/interrupt — those render the generic line alone.
+      //
+      // A failure leads with the step it died in and its error tag, read from
+      // the last `steps` row recorded `failure` — the diagnosis a scheduled run
+      // otherwise leaves only in D1. The read is best-effort: a D1 error drops
+      // the step name, never the verdict.
+      const failedStep = Exit.isFailure(exit)
+        ? yield* Effect.tryPromise(() =>
+            db
+              .prepare(
+                `SELECT name, error_tag AS errorTag FROM steps
+                  WHERE execution_id = ? AND status = 'failure'
+                  ORDER BY completed_at DESC LIMIT 1`,
+              )
+              .bind(payload.executionId)
+              .first<FailedStepRow>(),
+          ).pipe(Effect.orElseSucceed(() => null))
+        : null;
+      const failureMd =
+        [failingStepMd(exit, failedStep ?? undefined), failureSummaryMd(exit)]
+          .filter((part): part is string => part !== undefined && part.trim() !== "")
+          .join("\n\n") || undefined;
 
       // Persist the run output as JSON so `io.priorExecution` can recover it
       // on the next execution in the semantic family. A failed Exit has no

@@ -40,9 +40,47 @@
 // own `executions` D1 row is keyed off the *Workflow instance* id, so a
 // dedup-collapsed second call is a literal no-op end-to-end.
 
+import {
+  getInstallationToken,
+  readBranchHead,
+  resolveRepoInstallationId,
+} from "@fractalboxdev/flare-dispatch-github-app";
 import { toInstanceId } from "../instance-id";
 import { type ScheduleMatch, schedulesByCron } from "../registry";
 import type { Env } from "../env";
+
+/** The installation covering a repo and the head commit of one of its branches. */
+export type ScheduledHead = { readonly installationId: number; readonly sha: string };
+
+/**
+ * Resolve the GitHub App installation for `repo` and the head of `branch`, or
+ * `undefined` when the deploy has no App credentials, the App is not installed
+ * on the repo, or GitHub fails the read — the run then fires without a
+ * check-run, as every scheduled run did before.
+ */
+export type ResolveScheduledHead = (
+  repo: string,
+  branch: string,
+) => Promise<ScheduledHead | undefined>;
+
+/** The live resolver: App JWT → repo installation → installation token → branch ref. */
+export const githubScheduledHead =
+  (env: Env): ResolveScheduledHead =>
+  async (repo, branch) => {
+    const appId = env.GITHUB_APP_ID;
+    const privateKeyPem = env.GITHUB_APP_PRIVATE_KEY;
+    if (appId === undefined || privateKeyPem === undefined) return undefined;
+    try {
+      const installationId = await resolveRepoInstallationId({ appId, privateKeyPem, repo });
+      const token = await getInstallationToken({ appId, privateKeyPem, installationId });
+      const sha = await readBranchHead({ token, repo, branch });
+      return { installationId, sha };
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      console.warn(`[scheduled] no check-run for ${repo}:${branch} — ${message}`);
+      return undefined;
+    }
+  };
 
 /** Trim a long cron to fit inline in a log message. */
 const fmt = (cron: string): string => (cron.length > 40 ? `${cron.slice(0, 37)}...` : cron);
@@ -56,11 +94,13 @@ const fmt = (cron: string): string => (cron.length > 40 ? `${cron.slice(0, 37)}.
  * @param env             binding env (`RUNS_WORKFLOW`).
  * @param cron            `controller.cron` — the expression that fired.
  * @param scheduledTime   `controller.scheduledTime` — epoch ms.
+ * @param resolveHead     installation + branch-head lookup for runs that target a branch.
  */
 export const handleScheduled = async (
   env: Env,
   cron: string,
   scheduledTime: number,
+  resolveHead: ResolveScheduledHead = githubScheduledHead(env),
 ): Promise<void> => {
   const matches = schedulesByCron(cron);
 
@@ -74,7 +114,7 @@ export const handleScheduled = async (
 
   const ctx = { cron, firedAt: scheduledTime };
 
-  await Promise.all(matches.map(async (match) => fireOne(env, match, ctx)));
+  await Promise.all(matches.map(async (match) => fireOne(env, match, ctx, resolveHead)));
 };
 
 /** Fire a single (run, schedule-spec) match, swallowing individual failures. */
@@ -82,6 +122,7 @@ const fireOne = async (
   env: Env,
   match: ScheduleMatch,
   ctx: { cron: string; firedAt: number },
+  resolveHead: ResolveScheduledHead,
 ): Promise<void> => {
   const { run, schedule } = match;
 
@@ -92,17 +133,21 @@ const fireOne = async (
   }
 
   const id = toInstanceId(schedule.idempotencyKey(ctx));
-  const inputs = schedule.inputs(ctx);
+  const declared = schedule.inputs(ctx);
 
   // The Workflow `params` shape `RunWorkflow.run` decodes — same as dispatch.ts.
   // Schedule mode has no GitHub event; the run's own `inputs` carries the
-  // target repo/ref/sha (e.g. `product-demo` records against a deployed URL).
-  // `payload.github` here is just executions-row metadata + the optional
-  // check-run hint — installation_id is omitted, so `Checks` falls through to
-  // the no-op Layer (the run still records its rows, only the PR check-run is
-  // skipped). An operator who wants a check-run on a tracking repo sets
-  // `SCHEDULED_CHECK_RUN_*` env vars — deferred to a follow-up.
-  const target = scheduleGithubTarget(inputs);
+  // target repo/ref/sha. A run whose inputs name a repo and a `refs/heads/`
+  // branch, and no `sha`, is pinned here to that branch's head: the resolved
+  // installation selects the live `Checks` Layer, so `RunWorkflow` opens the
+  // check-run on that commit when the run starts and concludes it with the
+  // run's outcome — the same code push and PR runs take. The head also rides
+  // in `inputs.sha`, so the run executes against the commit the check names.
+  // An unresolved head leaves `installation_id` absent and the inputs as
+  // declared: the run fires, records its rows, and posts no check-run.
+  const pinned = await pinBranchHead(declared, resolveHead);
+  const inputs = pinned?.inputs ?? declared;
+  const target = scheduleGithubTarget(inputs, pinned?.installationId);
   const params = {
     executionId: id,
     run: run.name,
@@ -126,26 +171,48 @@ const fireOne = async (
 };
 
 /**
+ * Resolve the head a branch-targeting run executes against. `undefined` when
+ * the inputs name no repo, no `refs/heads/` ref, or already carry a `sha`, and
+ * when the resolver finds no installation or head.
+ */
+const pinBranchHead = async (
+  inputs: unknown,
+  resolveHead: ResolveScheduledHead,
+): Promise<{ inputs: Record<string, unknown>; installationId: number } | undefined> => {
+  if (typeof inputs !== "object" || inputs === null) return undefined;
+  const obj = inputs as Record<string, unknown>;
+  if (typeof obj.repo !== "string" || typeof obj.ref !== "string" || obj.sha !== undefined) {
+    return undefined;
+  }
+  const branch = obj.ref.startsWith("refs/heads/") ? obj.ref.slice("refs/heads/".length) : "";
+  if (branch === "") return undefined;
+  const head = await resolveHead(obj.repo, branch);
+  return head === undefined
+    ? undefined
+    : { inputs: { ...obj, sha: head.sha }, installationId: head.installationId };
+};
+
+/**
  * Synthesize the `github` block `RunWorkflow` expects. The cron tick carries
  * no GitHub payload, so we lift `repo` / `ref` / `sha` from the run's own
  * inputs when they are present. The fallback is a placeholder — the Workflow
  * uses these fields only for the executions D1 row and the (no-op) check-run
  * Layer when no `installation_id` is wired.
  *
- * A run that wants a real check-run on its tracking repo should put
- * `installation_id` in its `inputs` and the operator should set
- * `GITHUB_APP_ID` + `GITHUB_APP_PRIVATE_KEY`; that path is wired but no
- * shipped Schedule-mode run uses it yet.
+ * `installationId` comes from `pinBranchHead`; an `installation_id` in the
+ * run's own inputs is the fallback.
  */
 const scheduleGithubTarget = (
   inputs: unknown,
+  installationId?: number,
 ): { repo: string; ref: string; sha: string; installation_id?: number } => {
   const obj = (inputs ?? {}) as Record<string, unknown>;
   const repo = typeof obj.repo === "string" ? obj.repo : "schedule/unknown";
   const ref = typeof obj.ref === "string" ? obj.ref : "refs/heads/main";
   const sha =
     typeof obj.sha === "string" ? obj.sha : typeof obj.ref === "string" ? obj.ref : "main";
-  const installation_id = typeof obj.installation_id === "number" ? obj.installation_id : undefined;
+  const installation_id =
+    installationId ?? (typeof obj.installation_id === "number" ? obj.installation_id : undefined);
 
   // Warn when the run's `schedules[].inputs()` returned a shape without
   // the fields the `executions` row expects — a Schema mismatch between

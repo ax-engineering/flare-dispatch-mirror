@@ -157,6 +157,41 @@ export const failureSummaryMd = (exit: Exit.Exit<unknown, RunError>): string | u
       }),
   });
 
+/** The last `steps` row an execution recorded as `failure`. */
+export type FailedStepRow = { readonly name: string; readonly errorTag: string | null };
+
+/**
+ * Name the step a failed run died in and the tag it failed with — the line a
+ * scheduled run's check-run carries in place of a row only D1 holds. The tag is
+ * the run's typed failure; the step is the one a `StepFailed` names, else the
+ * last failed `steps` row when that row recorded the same tag. A failure no
+ * step recorded reads as outside any step. `undefined` on success and on a
+ * defect or interrupt, which carry no tag.
+ */
+export const failingStepMd = (
+  exit: Exit.Exit<unknown, RunError>,
+  failedStep: FailedStepRow | undefined,
+): string | undefined =>
+  Exit.match(exit, {
+    onSuccess: () => undefined,
+    onFailure: (cause) =>
+      Option.match(Cause.failureOption(cause), {
+        onNone: () => undefined,
+        onSome: (failure) => {
+          // `_tag` read as data for the label, as `describeFailure` in core's step.ts does.
+          const tag = (failure as { _tag?: unknown })._tag;
+          if (typeof tag !== "string") return undefined;
+          const stepName = Match.value(failure).pipe(
+            Match.tag("StepFailed", (e) => e.step),
+            Match.orElse(() => (failedStep?.errorTag === tag ? failedStep.name : undefined)),
+          );
+          return stepName === undefined
+            ? `**Failed outside any step** — \`${tag}\``
+            : `**Failing step:** \`${stepName}\` — \`${tag}\``;
+        },
+      }),
+  });
+
 /**
  * Append a run's failure markdown beneath the generic failure line (blank-line
  * separated, so the markdown renders as its own block), truncating the

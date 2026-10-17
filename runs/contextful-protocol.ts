@@ -20,7 +20,13 @@ const FORMAL_COMMAND = `${PINNED_ENVIRONMENT}cargo run --locked -q -p contextful
 const SEED_COMMAND = `node -e 'console.log(require("node:crypto").randomBytes(8).readBigUInt64LE().toString())'`;
 const REGRESSIONS = "formal/protocol/regressions.jsonl";
 const COMMAND_TIMEOUT_SEC = 1800;
-const Input = Schema.Struct({ repo: Schema.String, ref: Schema.String, firedAt: Schema.Number });
+const Input = Schema.Struct({
+  repo: Schema.String,
+  ref: Schema.String,
+  firedAt: Schema.Number,
+  /** The head the scheduled tick pinned; its check-run lands on this commit. */
+  sha: Schema.optional(Schema.String),
+});
 const Output = Schema.Struct({ commit: Schema.String, seed: Schema.String, logUrl: Schema.String });
 
 /** The gate installs elan; the separate command restores its pinned executable environment. */
@@ -50,9 +56,9 @@ export const contextfulProtocol = defineRun({
           }),
         );
       }
-      const commit = yield* step("resolve-head", () =>
-        github.branchHead({ repo: REPO, branch: "main" }),
-      );
+      const commit =
+        input.sha ??
+        (yield* step("resolve-head", () => github.branchHead({ repo: REPO, branch: "main" })));
       const ws = yield* step("checkout", () => workspace({ repo: REPO, sha: commit }));
       const provisioned = yield* step(
         "toolchain",

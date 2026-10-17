@@ -45,10 +45,26 @@ describe("contextful-measures", () => {
         { repo: input.repo, commit: sha, text: report },
       ]);
       expect(handles.artifact.uploads[0]?.name).toBe("measure-report.json");
-      const reportExec = handles.sandbox.execs.find((entry) => entry.command.includes("measure-report"));
+      const reportExec = handles.sandbox.execs.find((entry) =>
+        entry.command.includes("measure-report"),
+      );
       expect(reportExec?.env?.MEASURE_RUN_ID).toBe("contextful_measures_attempt-2");
       expect(reportExec?.env?.MEASURE_RUN_ATTEMPT).toBe("2");
       expect(reportExec?.env?.MEASURE_EXIT).toBe("0");
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("measures the commit the schedule pinned without re-reading the branch head", () => {
+    const pinned = "b".repeat(40);
+    const { layer, handles } = makeCFRuntimeTest({
+      sandboxProgram: { "measure --tier all": { exitCode: 0 }, "measure-report": { exitCode: 0 } },
+      sandboxFiles: { "/workspace/contextful/measure-report.json": report },
+    });
+    return Effect.gen(function* () {
+      const out = yield* contextfulMeasures.run({ ...input, sha: pinned });
+      expect(out.commit).toBe(pinned);
+      expect(handles.github.branchHeadCalls).toHaveLength(0);
+      expect(handles.sandbox.clones).toEqual([{ repo: input.repo, sha: pinned }]);
     }).pipe(Effect.provide(layer));
   });
 

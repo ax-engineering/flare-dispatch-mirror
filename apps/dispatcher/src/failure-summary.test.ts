@@ -24,6 +24,7 @@ import {
   TRUNCATION_NOTE,
   admissionTimedOutMd,
   appendFailureSummary,
+  failingStepMd,
   failureSummaryMd,
   runSkippedReason,
 } from "./failure-summary";
@@ -271,5 +272,35 @@ describe("appendFailureSummary", () => {
     const combined = appendFailureSummary(generic, md);
     expect(combined).toBe(`${generic}\n\n${md}`);
     expect(combined).not.toContain("summary truncated");
+  });
+});
+
+describe("failingStepMd", () => {
+  it("names the recorded step and the tag it failed with", () => {
+    const md = failingStepMd(Exit.fail(new ExecFailed({ exitCode: 101, stderrTail: "x" })), {
+      name: "measure",
+      errorTag: "ExecFailed",
+    });
+    expect(md).toBe("**Failing step:** `measure` — `ExecFailed`");
+  });
+
+  it("takes the step a StepFailed names when no step row recorded the failure", () => {
+    const md = failingStepMd(
+      Exit.fail(new StepFailed({ step: "build-report", cause: "exit 2" })),
+      undefined,
+    );
+    expect(md).toBe("**Failing step:** `build-report` — `StepFailed`");
+  });
+
+  it("ignores a step row whose tag differs from the run's failure", () => {
+    const md = failingStepMd(Exit.fail(new SecretsMissing({ keys: ["K"] })), {
+      name: "checkout",
+      errorTag: "ExecFailed",
+    });
+    expect(md).toBe("**Failed outside any step** — `SecretsMissing`");
+  });
+
+  it("is undefined for a success Exit", () => {
+    expect(failingStepMd(Exit.succeed(1), undefined)).toBeUndefined();
   });
 });
