@@ -3,6 +3,12 @@
   // Non-destructive: distinct name + fresh D1/R2/KV so it never collides with
   // any prior deployment in the same account. Dashboard SPA assets are omitted
   // (the SSR fallback in dashboard.ts serves the routes).
+  //
+  // Account-specific values below are placeholders marked `operator overlay`.
+  // A deploying org replaces this whole file with its own copy carrying the
+  // real ones (actions/deploy-dispatcher-action). Locally, keep that copy as
+  // the gitignored wrangler.overlay.local.jsonc and pass it with
+  // `pnpm exec wrangler deploy -c wrangler.overlay.local.jsonc`.
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "flare-dispatch",
   "main": "apps/dispatcher/src/index.ts",
@@ -45,12 +51,11 @@
   //
   // Add the expression here when that decision is made; the runs need no change.
 
-  // Custom domain (requires the fractalbox.dev zone in this account). The
-  // GitHub App install flow substitutes the request origin into the manifest,
-  // so hitting the install page on this host wires the App's webhook/callback
-  // URLs to it. The bare flare-dispatch.fractalbox.dev serves the documentation
-  // site (apps/docs/wrangler.jsonc).
-  "routes": [{ "pattern": "flare-dispatch-app.fractalbox.dev", "custom_domain": true }],
+  // Custom domain (requires its zone in the deploying account). The GitHub App
+  // install flow substitutes the request origin into the manifest, so hitting
+  // the install page on this host wires the App's webhook/callback URLs to it.
+  // Hostname: operator overlay.
+  "routes": [{ "pattern": "dispatcher.example.com", "custom_domain": true }],
 
   // Workers AI — backs the modelGateway capability the pr-review engine calls.
   // The binding IS the auth (account-billed), so no model API key is needed.
@@ -61,14 +66,15 @@
   "browser": { "binding": "BROWSER" },
 
   "vars": {
-    "CLOUDFLARE_ACCOUNT_ID": "c91d52c288c452ab734ede1518b00e11",
+    // Operator overlay.
+    "CLOUDFLARE_ACCOUNT_ID": "00000000000000000000000000000000",
     // AI Gateway the modelGateway routes through — REQUIRED for prefixed model
     // ids (`anthropic/*`, `deepseek/*`, `openai/*`, `bedrock/*`), which ride the
     // gateway universal endpoint / Bedrock forwarder. `openai/*` additionally
     // needs unified billing enabled on this gateway (or a stored OpenAI key —
     // mutually exclusive). If the gateway has Authenticated Gateway turned on,
-    // also set the AI_GATEWAY_AUTH_TOKEN secret.
-    "AI_GATEWAY_ID": "fractalbox-engineering-gateway",
+    // also set the AI_GATEWAY_AUTH_TOKEN secret. Operator overlay.
+    "AI_GATEWAY_ID": "your-ai-gateway",
     "ADMISSION_CAP": "16",
     // Opt the human-facing viewer surfaces (incl. the GitHub App install flow)
     // out of the Cloudflare Access gate for the initial dogfood. Configure
@@ -80,11 +86,13 @@
     // Cloudflare Access team domain (issuer) — shared by the viewer + deploy
     // gates. The deploy console verifies the Access JWT against this + the AUD
     // below, and fetches identity from <issuer>/cdn-cgi/access/get-identity.
-    "ACCESS_TEAM_DOMAIN": "fractalbox.cloudflareaccess.com",
+    // Operator overlay.
+    "ACCESS_TEAM_DOMAIN": "your-team.cloudflareaccess.com",
     // Deploy console (/deploy) Access application AUD. Distinct from the viewer
-    // ACCESS_AUD. The app's policy allows the GitHub `fractalboxdev/devs` team;
-    // per-env authorization is CONFIG_KV `deploy.env-authz`. See deploy-access.ts.
-    "DEPLOY_ACCESS_AUD": "44c3a07df1b0a4e454b28da9f55e7dbf3e279d1d09274667467a4d41ba79cafe",
+    // ACCESS_AUD. The app's policy allows the org's GitHub team; per-env
+    // authorization is CONFIG_KV `deploy.env-authz`. See deploy-access.ts.
+    // Operator overlay.
+    "DEPLOY_ACCESS_AUD": "your-deploy-access-aud",
     // Execution backend. "on" routes every facade-capable run through the
     // SUBSTRATE binding below; anything else keeps the container path in this
     // config. Flipping it is the cutover — see apps/substrate/specs/adoption-runbook.md.
@@ -207,13 +215,14 @@
     { "tag": "v4", "new_sqlite_classes": ["RunSandboxRelease"] },
   ],
 
-  "r2_buckets": [{ "binding": "RUNS_STORAGE", "bucket_name": "flare-dispatch" }],
+  // Bucket name, database name and id, and namespace ids: operator overlay.
+  "r2_buckets": [{ "binding": "RUNS_STORAGE", "bucket_name": "your-runs-bucket" }],
 
   "d1_databases": [
     {
       "binding": "RUNS_METADATA",
-      "database_name": "flare-dispatch",
-      "database_id": "3a365bf1-fae3-4a29-bef7-5b020f8cb283",
+      "database_name": "your-runs-database",
+      "database_id": "00000000-0000-0000-0000-000000000000",
       "migrations_dir": "infra/migrations",
     },
   ],
@@ -221,11 +230,11 @@
   "kv_namespaces": [
     {
       "binding": "CONFIG_KV",
-      "id": "dff3e9657cf34c94955c31a333084f1c",
+      "id": "00000000000000000000000000000001",
     },
     {
       "binding": "IDEMPOTENCY_KV",
-      "id": "3002db8dac904fc794cf2686fb5dfe57",
+      "id": "00000000000000000000000000000002",
     },
   ],
 }

@@ -193,14 +193,33 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
 
+      # The committed wrangler.jsonc carries placeholders for every
+      # account-specific value; the real file is the operator overlay, stored
+      # base64-encoded (one line, so log masking covers all of it) and written
+      # over the placeholders here — the same single-file overwrite
+      # actions/deploy-dispatcher-action performs. A missing secret fails the
+      # job rather than deploying placeholders.
+      - name: Apply operator overlay
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${WRANGLER_OVERLAY_B64:-}" ]; then
+            echo "::error title=overlay missing::Set the WRANGLER_OVERLAY_B64 secret to the base64 of this deploy's wrangler.jsonc." >&2
+            exit 1
+          fi
+          printf '%s' "$WRANGLER_OVERLAY_B64" | base64 -d > wrangler.jsonc
+        env:
+          WRANGLER_OVERLAY_B64: ${{ secrets.WRANGLER_OVERLAY_B64 }}
+
       # Schema before code — the same rule the substrate job states, which the
       # dispatcher's own database was never held to. Its five migrations were
       # applied by hand in a single run on 2026-07-11 and nothing here has ever
       # applied one since, so a PR that adds a migration ships code querying a
       # column production does not have. Already-applied migrations are a no-op,
-      # which is what makes this safe to add after the fact.
+      # which is what makes this safe to add after the fact. Addressed by binding,
+      # so the overlay's database name never needs restating here.
       - name: Apply D1 migrations
-        run: pnpm exec wrangler d1 migrations apply flare-dispatch --remote
+        run: pnpm exec wrangler d1 migrations apply RUNS_METADATA --remote
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
