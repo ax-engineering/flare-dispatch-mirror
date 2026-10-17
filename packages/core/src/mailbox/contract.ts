@@ -114,12 +114,12 @@ export type OtpExtraction = {
  * Build a full disposable address from a minted local-part and the configured
  * inbox target. Two forms, decided by whether the target carries an `@`:
  *
- *   - **Sub-addressing** (`base@domain`, e.g. `flare-dispatch-inbox@fractalbox.dev`):
+ *   - **Sub-addressing** (`base@domain`, e.g. `flare-dispatch-inbox@example.com`):
  *     returns `base+<localPart>@domain`. ONE Email Routing custom rule for
  *     `base@domain` → the Worker then matches every `base+…@domain` (Cloudflare
  *     supports RFC 5233 sub-addressing), so the zone's existing catch-all stays
  *     untouched — no disruption to other mail. This is the form used on a shared
- *     zone like `fractalbox.dev`.
+ *     zone like `example.com`.
  *   - **Catch-all** (bare `domain`): returns `<localPart>@domain`, for a
  *     dedicated zone/subdomain whose whole catch-all routes to the Worker.
  */

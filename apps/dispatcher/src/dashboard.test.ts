@@ -35,7 +35,7 @@ describe("renderDashboard", () => {
     rows: readonly DashboardRow[],
     over: { filters?: DashboardFilters; pagination?: DashboardPagination } = {},
   ) => ({
-    origin: "https://flare-dispatch-app.fractalbox.dev",
+    origin: "https://dispatcher.example.com",
     rows,
     filters: over.filters ?? {},
     pagination: over.pagination ?? {
@@ -217,9 +217,7 @@ describe("renderDashboard", () => {
 
   it("emits canonical + OG metadata pointing at the origin root", () => {
     const html = renderDashboard(data([]));
-    expect(html).toContain(
-      '<link rel="canonical" href="https://flare-dispatch-app.fractalbox.dev/" />',
-    );
+    expect(html).toContain('<link rel="canonical" href="https://dispatcher.example.com/" />');
     expect(html).toContain('property="og:title"');
   });
 });
@@ -232,7 +230,7 @@ describe("GET / — dashboard route", () => {
       workflow: makeFakeWorkflow(),
       storage: makeFakeR2(),
       metadata,
-      publicOrigin: "https://flare-dispatch-app.fractalbox.dev",
+      publicOrigin: "https://dispatcher.example.com",
     });
     return { env };
   };
@@ -255,7 +253,7 @@ describe("GET / — dashboard route", () => {
 
   it("returns 200 text/html listing executions with tokened log links", async () => {
     const { env } = fixture([execRow({ id: "a:b:c", run: "offload-test", status: "success" })]);
-    const res = await handleRequest(new Request("https://flare-dispatch-app.fractalbox.dev/"), env);
+    const res = await handleRequest(new Request("https://dispatcher.example.com/"), env);
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("text/html");
     const body = await res.text();
@@ -265,7 +263,7 @@ describe("GET / — dashboard route", () => {
 
   it("links the product-demo viewer for product-demo runs", async () => {
     const { env } = fixture([execRow({ id: "demo1", run: "product-demo", status: "success" })]);
-    const res = await handleRequest(new Request("https://flare-dispatch-app.fractalbox.dev/"), env);
+    const res = await handleRequest(new Request("https://dispatcher.example.com/"), env);
     const body = await res.text();
     expect(body).toContain("/demos/demo1?t=");
   });
@@ -277,7 +275,7 @@ describe("GET / — dashboard route", () => {
       execRow({ id: "c:1", run: "offload-test", status: "failure" }),
     ]);
     const res = await handleRequest(
-      new Request("https://flare-dispatch-app.fractalbox.dev/?status=failure&run=offload-test"),
+      new Request("https://dispatcher.example.com/?status=failure&run=offload-test"),
       env,
     );
     const body = await res.text();
@@ -293,7 +291,7 @@ describe("GET / — dashboard route", () => {
       execRow({ id: "b:1", run: "pr-review" }),
     ]);
     const res = await handleRequest(
-      new Request("https://flare-dispatch-app.fractalbox.dev/?run=&status=%20"),
+      new Request("https://dispatcher.example.com/?run=&status=%20"),
       env,
     );
     const body = await res.text();
@@ -307,17 +305,14 @@ describe("GET / — dashboard route", () => {
       execRow({ id: "r2", started_at: 2000 }),
       execRow({ id: "r3", started_at: 1000 }),
     ]);
-    const page1 = await handleRequest(
-      new Request("https://flare-dispatch-app.fractalbox.dev/?limit=1"),
-      env,
-    );
+    const page1 = await handleRequest(new Request("https://dispatcher.example.com/?limit=1"), env);
     const body1 = await page1.text();
     expect(body1).toContain("r1");
     expect(body1).not.toContain("r2");
     expect(body1).toContain("Older →");
 
     const page2 = await handleRequest(
-      new Request("https://flare-dispatch-app.fractalbox.dev/?limit=1&before=3000"),
+      new Request("https://dispatcher.example.com/?limit=1&before=3000"),
       env,
     );
     const body2 = await page2.text();
@@ -334,7 +329,7 @@ describe("GET / — dashboard route", () => {
     ]);
     // Page boundary lands mid-tie at (1000, a2): the same-ms a1 must not vanish.
     const res = await handleRequest(
-      new Request("https://flare-dispatch-app.fractalbox.dev/?limit=2&before=1000&beforeId=a2"),
+      new Request("https://dispatcher.example.com/?limit=2&before=1000&beforeId=a2"),
       env,
     );
     const body = await res.text();
@@ -349,16 +344,13 @@ describe("GET / — dashboard route", () => {
       execRow({ id: "r2", started_at: 2000 }),
       execRow({ id: "r3", started_at: 1000 }),
     ]);
-    const page1 = await handleRequest(
-      new Request("https://flare-dispatch-app.fractalbox.dev/?limit=1"),
-      env,
-    );
+    const page1 = await handleRequest(new Request("https://dispatcher.example.com/?limit=1"), env);
     const html1 = await page1.text();
     // Page 1's Older link opens page 2 (no prevBefore yet).
     expect(html1).toContain('href="/?limit=1&amp;before=3000&amp;beforeId=r1"');
 
     const page2 = await handleRequest(
-      new Request("https://flare-dispatch-app.fractalbox.dev/?limit=1&before=3000&beforeId=r1"),
+      new Request("https://dispatcher.example.com/?limit=1&before=3000&beforeId=r1"),
       env,
     );
     const html2 = await page2.text();
@@ -372,7 +364,7 @@ describe("GET / — dashboard route", () => {
 
     const page3 = await handleRequest(
       new Request(
-        "https://flare-dispatch-app.fractalbox.dev/?limit=1&before=2000&beforeId=r2&prevBefore=3000&prevBeforeId=r1",
+        "https://dispatcher.example.com/?limit=1&before=2000&beforeId=r2&prevBefore=3000&prevBeforeId=r1",
       ),
       env,
     );
@@ -384,7 +376,7 @@ describe("GET / — dashboard route", () => {
   it("405s a non-GET method", async () => {
     const { env } = fixture([]);
     const res = await handleRequest(
-      new Request("https://flare-dispatch-app.fractalbox.dev/", {
+      new Request("https://dispatcher.example.com/", {
         method: "POST",
       }),
       env,
@@ -402,7 +394,7 @@ describe("GET / — dashboard route", () => {
       viewerAccessMode: "required",
     });
     // ACCESS_AUD / ACCESS_TEAM_DOMAIN unset under "required" → 503, default-deny.
-    const res = await handleRequest(new Request("https://flare-dispatch-app.fractalbox.dev/"), env);
+    const res = await handleRequest(new Request("https://dispatcher.example.com/"), env);
     expect(res.status).toBe(503);
   });
 });
@@ -415,7 +407,7 @@ describe("GET /v1/dashboard.json — SPA feed", () => {
       workflow: makeFakeWorkflow(),
       storage: makeFakeR2(),
       metadata,
-      publicOrigin: "https://flare-dispatch-app.fractalbox.dev",
+      publicOrigin: "https://dispatcher.example.com",
     });
     return { env };
   };
@@ -439,7 +431,7 @@ describe("GET /v1/dashboard.json — SPA feed", () => {
   it("returns 200 application/json with rows carrying tokened log links", async () => {
     const { env } = fixture([execRow({ id: "a:b:c", run: "offload-test" })]);
     const res = await handleRequest(
-      new Request("https://flare-dispatch-app.fractalbox.dev/v1/dashboard.json"),
+      new Request("https://dispatcher.example.com/v1/dashboard.json"),
       env,
     );
     expect(res.status).toBe(200);
@@ -466,7 +458,7 @@ describe("GET /v1/dashboard.json — SPA feed", () => {
       }),
     ]);
     const res = await handleRequest(
-      new Request("https://flare-dispatch-app.fractalbox.dev/v1/dashboard.json"),
+      new Request("https://dispatcher.example.com/v1/dashboard.json"),
       env,
     );
     const body = (await res.json()) as { rows: { selfHealPrUrl: string | null }[] };
@@ -484,7 +476,7 @@ describe("GET /v1/dashboard.json — SPA feed", () => {
       }),
     ]);
     const res = await handleRequest(
-      new Request("https://flare-dispatch-app.fractalbox.dev/v1/dashboard.json"),
+      new Request("https://dispatcher.example.com/v1/dashboard.json"),
       env,
     );
     const body = (await res.json()) as { rows: { selfHealPrUrl: string | null }[] };
@@ -497,9 +489,7 @@ describe("GET /v1/dashboard.json — SPA feed", () => {
       execRow({ id: "b:1", run: "pr-review", status: "failure", started_at: 1000 }),
     ]);
     const res = await handleRequest(
-      new Request(
-        "https://flare-dispatch-app.fractalbox.dev/v1/dashboard.json?limit=999&status=failure",
-      ),
+      new Request("https://dispatcher.example.com/v1/dashboard.json?limit=999&status=failure"),
       env,
     );
     const body = (await res.json()) as {
@@ -527,7 +517,7 @@ describe("GET /v1/dashboard.json — SPA feed", () => {
       execRow({ id: "b:1", started_at: 1000 }),
     ]);
     const res = await handleRequest(
-      new Request("https://flare-dispatch-app.fractalbox.dev/v1/dashboard.json?limit=1"),
+      new Request("https://dispatcher.example.com/v1/dashboard.json?limit=1"),
       env,
     );
     const body = (await res.json()) as {
@@ -550,7 +540,7 @@ describe("GET /v1/dashboard.json — SPA feed", () => {
   it("405s a non-GET method", async () => {
     const { env } = fixture([]);
     const res = await handleRequest(
-      new Request("https://flare-dispatch-app.fractalbox.dev/v1/dashboard.json", {
+      new Request("https://dispatcher.example.com/v1/dashboard.json", {
         method: "POST",
       }),
       env,
@@ -567,7 +557,7 @@ describe("GET /v1/dashboard.json — SPA feed", () => {
       viewerAccessMode: "required",
     });
     const res = await handleRequest(
-      new Request("https://flare-dispatch-app.fractalbox.dev/v1/dashboard.json"),
+      new Request("https://dispatcher.example.com/v1/dashboard.json"),
       env,
     );
     expect(res.status).toBe(503);
@@ -588,7 +578,7 @@ describe("app shell routing — gated SPA shell with SSR fallback", () => {
     workflow: makeFakeWorkflow(),
     storage: makeFakeR2(),
     metadata: makeFakeD1({ executions: [] }),
-    publicOrigin: "https://flare-dispatch-app.fractalbox.dev",
+    publicOrigin: "https://dispatcher.example.com",
   };
 
   it("serves the SPA shell from the asset binding for / when ASSETS is present", async () => {
@@ -596,7 +586,7 @@ describe("app shell routing — gated SPA shell with SSR fallback", () => {
       ...base,
       assets: fakeAssets('<!doctype html><div id="root"></div>'),
     });
-    const res = await handleRequest(new Request("https://flare-dispatch-app.fractalbox.dev/"), env);
+    const res = await handleRequest(new Request("https://dispatcher.example.com/"), env);
     expect(res.status).toBe(200);
     expect(await res.text()).toContain('id="root"');
   });
@@ -604,7 +594,7 @@ describe("app shell routing — gated SPA shell with SSR fallback", () => {
   it("gates and serves the shell for /executions/:id (SPA deep-link)", async () => {
     const env = makeFakeEnv({ ...base, assets: fakeAssets("SHELL") });
     const res = await handleRequest(
-      new Request("https://flare-dispatch-app.fractalbox.dev/executions/a%3Ab%3Ac"),
+      new Request("https://dispatcher.example.com/executions/a%3Ab%3Ac"),
       env,
     );
     expect(res.status).toBe(200);
@@ -621,7 +611,7 @@ describe("app shell routing — gated SPA shell with SSR fallback", () => {
       assets: fakeAssets("SHELL"),
     });
     const res = await handleRequest(
-      new Request("https://flare-dispatch-app.fractalbox.dev/executions/x"),
+      new Request("https://dispatcher.example.com/executions/x"),
       env,
     );
     expect(res.status).toBe(503);
@@ -649,7 +639,7 @@ describe("app shell routing — gated SPA shell with SSR fallback", () => {
         ],
       }),
     });
-    const res = await handleRequest(new Request("https://flare-dispatch-app.fractalbox.dev/"), env);
+    const res = await handleRequest(new Request("https://dispatcher.example.com/"), env);
     expect(res.status).toBe(200);
     const body = await res.text();
     // The SSR marker the SPA shell never contains.

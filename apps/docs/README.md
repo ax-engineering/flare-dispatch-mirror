@@ -37,4 +37,4 @@ pnpm --filter @fractalboxdev/flare-dispatch-docs run build   # what CI runs
 
 `.github/workflows/docs.yml` builds the site on every pull request and deploys it on `main`, to a
 static-assets Worker (`wrangler.jsonc`). The dispatcher Worker — API, webhooks, dashboard, log
-viewer — serves `flare-dispatch-app.fractalbox.dev`.
+viewer — serves the custom domain the root `wrangler.jsonc` routes.

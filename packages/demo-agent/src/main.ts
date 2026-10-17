@@ -1,7 +1,7 @@
 #!/usr/bin/env -S npx tsx
 // @fractalboxdev/flare-dispatch-demo-agent — CLI entry point.
 //
-// Baked into `registry.cloudflare.com/openhackersclub/flare-dispatch-demo`;
+// Baked into `registry.cloudflare.com/<account>/flare-dispatch-demo`;
 // the `product-demo` run invokes this CLI through `sandbox.exec` for each
 // step of an AI-driven product walkthrough — see runs/product-demo.ts.
 

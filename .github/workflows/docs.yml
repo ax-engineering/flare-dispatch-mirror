@@ -14,7 +14,7 @@ name: docs
 #
 # `site` builds the documentation site (apps/docs) on every run — the build fails
 # on a broken internal link — and on main deploys it to its Worker, which serves
-# flare-dispatch.fractalbox.dev. Its pages are symbolic links to Markdown across
+# the custom domain apps/docs/wrangler.jsonc routes. Its pages are symbolic links to Markdown across
 # the repo (guides, run catalog, action READMEs, specs), so any path can change
 # the site and the workflow carries no path filter.
 on:

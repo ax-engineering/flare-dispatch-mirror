@@ -33,7 +33,7 @@ A run can be started from three sources:
 
 ## Deployment model
 
-Single-tenant BYOC — no multi-tenant SaaS. Deploy with `wrangler deploy` into your own Cloudflare account. The dispatcher serves `flare-dispatch-app.fractalbox.dev` (API, GitHub App webhook, dashboard); the documentation site (`apps/docs`) serves `flare-dispatch.fractalbox.dev`.
+Single-tenant BYOC — no multi-tenant SaaS. Deploy with `wrangler deploy` into your own Cloudflare account. The dispatcher serves its API, GitHub App webhook and dashboard on the custom domain its `wrangler.jsonc` routes; the documentation site (`apps/docs`) serves the one in `apps/docs/wrangler.jsonc`. Account-specific values in both workers' committed configs are placeholders; the deploy workflow writes each operator overlay from a repository secret.
 
 ## Conventions
 

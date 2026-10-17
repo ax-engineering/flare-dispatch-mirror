@@ -73,10 +73,10 @@ describe("exchangeUrlForHost", () => {
   it("exchanges against the full target path for the app's own host (path-scoped app)", () => {
     expect(
       exchangeUrlForHost(
-        "flare-dispatch-app.openhackers.club",
-        "https://flare-dispatch-app.openhackers.club/logs/abc?t=xyz",
+        "dispatcher.example.com",
+        "https://dispatcher.example.com/logs/abc?t=xyz",
       ),
-    ).toBe("https://flare-dispatch-app.openhackers.club/logs/abc?t=xyz");
+    ).toBe("https://dispatcher.example.com/logs/abc?t=xyz");
   });
 
   it("falls back to the host root for a different (CF_ACCESS_HOSTS) host", () => {

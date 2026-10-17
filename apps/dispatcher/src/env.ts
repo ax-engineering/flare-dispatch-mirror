@@ -352,7 +352,7 @@ export interface Env {
   /**
    * Where the `mailbox` capability mints disposable test inboxes. Two forms:
    *
-   *   - **Sub-addressing** `base@domain` (e.g. `flare-dispatch-inbox@fractalbox.dev`):
+   *   - **Sub-addressing** `base@domain` (e.g. `flare-dispatch-inbox@example.com`):
    *     mints `base+demo-<rand>@domain`. ONE Email Routing custom-address rule for
    *     `base@domain` → this Worker matches every `base+…@domain` (RFC 5233
    *     sub-addressing must be ON in Email Routing settings), so the zone's

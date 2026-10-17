@@ -10,11 +10,16 @@
   //   services: [{ binding: "SUBSTRATE", service: "flare-dispatch-substrate",
   //                entrypoint: "FractalbotFacade" }]
   //
-  // Provisioning, once per account (done for FractalBox; the ids below are
-  // this account's real ones). A new org adopting the substrate runs:
+  // Account-specific values below are placeholders marked `operator overlay`.
+  // A deploying org replaces this whole file with its own copy carrying the
+  // real ones; the deploy workflow writes it from a repository secret. Locally,
+  // keep that copy as the gitignored wrangler.overlay.local.jsonc beside this
+  // file and pass it with `-c`.
+  //
+  // Provisioning, once per account:
   //   wrangler d1 create flare-dispatch-substrate   # id → operator overlay
   //   wrangler r2 bucket create flare-dispatch-substrate
-  //   wrangler secret put TICKET_SECRET -c apps/substrate/wrangler.jsonc
+  // then set the admission-ticket signing secret src/secrets.ts names.
   // Migrations are applied by the deploy workflow, not by hand.
   //
   // A deploy is not finished until the canary passes: `POST /canary` proves a
@@ -134,11 +139,8 @@
     {
       "binding": "ADMISSION_DB",
       "database_name": "flare-dispatch-substrate",
-      // FractalBox account (c91d52c2…). Committed inline, as the dispatcher's
-      // own id is: this repo is single-org today, and an id that lives only in
-      // someone's shell is an id the next deploy cannot reproduce. A second org
-      // adopting the substrate replaces this in its operator overlay.
-      "database_id": "0bf91199-34dc-431e-b4d8-7073bd467269",
+      // Operator overlay.
+      "database_id": "00000000-0000-0000-0000-000000000000",
       "migrations_dir": "migrations",
     },
   ],

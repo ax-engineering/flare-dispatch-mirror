@@ -70,7 +70,7 @@ const validClaims = (): Record<string, unknown> => ({
   aud: AUD,
   exp: nowS() + 600,
   nbf: nowS() - 10,
-  email: "v@fractalbox.dev",
+  email: "operator@example.com",
 });
 
 describe("accessIssuer", () => {

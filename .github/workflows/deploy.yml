@@ -112,6 +112,22 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
 
+      # The same operator overlay the deploy job applies, for the substrate's
+      # own config: placeholders committed, the real file stored base64-encoded
+      # and written over them before migrations and deploy. A missing secret
+      # fails the job rather than deploying placeholders.
+      - name: Apply operator overlay
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${SUBSTRATE_WRANGLER_OVERLAY_B64:-}" ]; then
+            echo "::error title=overlay missing::Set the SUBSTRATE_WRANGLER_OVERLAY_B64 secret to the base64 of this deploy's apps/substrate/wrangler.jsonc." >&2
+            exit 1
+          fi
+          printf '%s' "$SUBSTRATE_WRANGLER_OVERLAY_B64" | base64 -d > apps/substrate/wrangler.jsonc
+        env:
+          SUBSTRATE_WRANGLER_OVERLAY_B64: ${{ secrets.SUBSTRATE_WRANGLER_OVERLAY_B64 }}
+
       # Schema before code: the deployed worker reads tables this applies, and
       # a hand-run migration is one that the next org's deploy cannot reproduce.
       # Already-applied migrations are a no-op.
@@ -211,13 +227,11 @@ jobs:
         env:
           WRANGLER_OVERLAY_B64: ${{ secrets.WRANGLER_OVERLAY_B64 }}
 
-      # Schema before code — the same rule the substrate job states, which the
-      # dispatcher's own database was never held to. Its five migrations were
-      # applied by hand in a single run on 2026-07-11 and nothing here has ever
-      # applied one since, so a PR that adds a migration ships code querying a
-      # column production does not have. Already-applied migrations are a no-op,
-      # which is what makes this safe to add after the fact. Addressed by binding,
-      # so the overlay's database name never needs restating here.
+      # Schema before code — the same rule the substrate job states. Without
+      # this step a PR that adds a migration ships code querying a column
+      # production does not have. Already-applied migrations are a no-op.
+      # Addressed by binding, so the overlay's database name never needs
+      # restating here.
       - name: Apply D1 migrations
         run: pnpm exec wrangler d1 migrations apply RUNS_METADATA --remote
         env:

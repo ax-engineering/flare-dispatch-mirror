@@ -195,7 +195,7 @@ describe("cf-api", () => {
   it("serves the writes a wrangler deploy makes", () => {
     // The floor that decides whether a deploy may run at all is ADR-0007's
     // attestation, one layer up; this profile only decides where it may send.
-    const account = "c91d52c288c452ab734ede1518b00e11";
+    const account = "0123456789abcdef0123456789abcdef";
     expect(
       allows(
         p,
@@ -217,7 +217,7 @@ describe("cf-api", () => {
       allows(
         p,
         "GET",
-        "https://api.cloudflare.com/client/v4/accounts/c91d52c288c452ab734ede1518b00e11/pages/projects",
+        "https://api.cloudflare.com/client/v4/accounts/0123456789abcdef0123456789abcdef/pages/projects",
       ),
     ).toBe(false);
   });

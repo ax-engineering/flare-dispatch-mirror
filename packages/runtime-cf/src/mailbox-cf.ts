@@ -34,7 +34,7 @@ import {
  */
 export type MailboxCloudflareConfig = {
   /** The Email-Routing catch-all domain minted addresses live on
-   * (`INBOX_DOMAIN`), e.g. `inbox.fractalbox.dev`. */
+   * (`INBOX_DOMAIN`), e.g. `inbox.example.com`. */
   readonly inboxDomain: string;
   /** D1 binding — `env.RUNS_METADATA`. The `inbox_allocations` row is written
    * here; the inbound handler reads it back. */
