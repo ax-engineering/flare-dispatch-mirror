@@ -41,13 +41,14 @@
 
 import {
   createCheckRun,
+  getCheckRunStatus,
   getInstallationToken,
   GithubApiError as GithubAppApiError,
   progressCheckRun,
   updateCheckRun,
 } from "@fractalboxdev/flare-dispatch-github-app";
 import { Effect, Layer, Schedule } from "effect";
-import { Checks, type ChecksService } from "@fractalboxdev/flare-dispatch-core";
+import { Checks, type CheckRunState, type ChecksService } from "@fractalboxdev/flare-dispatch-core";
 
 /**
  * The GitHub App credentials + installation context the live `Checks` Layer
@@ -107,6 +108,7 @@ const makeNoopChecks = (reason: string): ChecksService => ({
     ),
   progress: () =>
     Effect.logInfo(`checks.progress skipped (${reason}) — in-progress output not posted`),
+  status: () => Effect.succeed<CheckRunState>("unknown"),
   update: ({ conclusion }) =>
     Effect.logInfo(`checks.update skipped (${reason}) — conclusion "${conclusion}" not posted`),
 });
@@ -199,6 +201,27 @@ export const makeChecksGithubLive = (
         Effect.catchIf(isRetryable, (e) => Effect.logWarning(degradeMsg("progress", e))),
         Effect.orDie,
       ),
+
+    status: ({ repo, checkRunId }) =>
+      checkRunId === NOOP_CHECK_RUN_ID
+        ? Effect.succeed<CheckRunState>("unknown")
+        : Effect.gen(function* () {
+            const accessToken = yield* token();
+            return yield* Effect.tryPromise({
+              try: () => getCheckRunStatus({ token: accessToken, repo, checkRunId }),
+              // Keep the typed error so `checksRetry` can classify a rate limit.
+              catch: (cause) => cause,
+            });
+          }).pipe(
+            Effect.retry(checksRetry),
+            Effect.map((status): CheckRunState => (status === "completed" ? "completed" : "open")),
+            Effect.catchAllCause((cause) =>
+              Effect.as(
+                Effect.logWarning(`checks.status unreadable — ${cause}`),
+                "unknown" as const,
+              ),
+            ),
+          ),
 
     update: ({ repo, checkRunId, conclusion, output, detailsUrl }) =>
       Effect.gen(function* () {

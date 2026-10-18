@@ -159,3 +159,31 @@ export const updateCheckRun = async (opts: UpdateCheckRunOptions): Promise<void>
 
   await assertOk(res, "check-run update failed");
 };
+
+/** Options for {@link getCheckRunStatus}. */
+export type GetCheckRunStatusOptions = ClientOptions & {
+  /** `"owner/repo"`. */
+  readonly repo: string;
+  /** The check-run id returned by {@link createCheckRun}. */
+  readonly checkRunId: string;
+};
+
+/**
+ * Read a check-run's lifecycle status: `queued`, `in_progress` or `completed`.
+ *
+ * @throws {GithubApiError} when the API returns non-2xx.
+ */
+export const getCheckRunStatus = async (opts: GetCheckRunStatusOptions): Promise<string> => {
+  const { owner, name: repoName } = splitRepo(opts.repo);
+  const { apiBase, doFetch } = resolveClient(opts);
+
+  const res = await doFetch(`${apiBase}/repos/${owner}/${repoName}/check-runs/${opts.checkRunId}`, {
+    method: "GET",
+    headers: ghHeaders(opts.token),
+  });
+
+  await assertOk(res, "check-run read failed");
+
+  const body = (await res.json()) as { status?: unknown };
+  return String(body.status);
+};

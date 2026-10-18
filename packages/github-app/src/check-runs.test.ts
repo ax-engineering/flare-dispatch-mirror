@@ -9,7 +9,13 @@
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { createCheckRun, GithubApiError, progressCheckRun, updateCheckRun } from "./index";
+import {
+  createCheckRun,
+  getCheckRunStatus,
+  GithubApiError,
+  progressCheckRun,
+  updateCheckRun,
+} from "./index";
 
 /** Records the requests MSW intercepted, for per-test assertions. */
 type CapturedPost = {
@@ -207,6 +213,42 @@ describe("updateCheckRun", () => {
         checkRunId: "555001",
         conclusion: "success",
       }),
+    ).rejects.toBeInstanceOf(GithubApiError);
+  });
+});
+
+describe("getCheckRunStatus", () => {
+  it("GETs /check-runs/{id} and resolves to its status", async () => {
+    let authorization: string | null = null;
+    server.use(
+      http.get(
+        "https://api.github.com/repos/:owner/:repo/check-runs/:id",
+        ({ request, params }) => {
+          authorization = request.headers.get("authorization");
+          return HttpResponse.json({
+            id: Number(params.id),
+            status: params.id === "1" ? "completed" : "in_progress",
+          });
+        },
+      ),
+    );
+    await expect(
+      getCheckRunStatus({ token: "ghs_test", repo: "owner/name", checkRunId: "1" }),
+    ).resolves.toBe("completed");
+    await expect(
+      getCheckRunStatus({ token: "ghs_test", repo: "owner/name", checkRunId: "2" }),
+    ).resolves.toBe("in_progress");
+    expect(authorization).toBe("Bearer ghs_test");
+  });
+
+  it("surfaces a GithubApiError on a non-2xx response", async () => {
+    server.use(
+      http.get("https://api.github.com/repos/:owner/:repo/check-runs/:id", () =>
+        HttpResponse.json({ message: "Not Found" }, { status: 404 }),
+      ),
+    );
+    await expect(
+      getCheckRunStatus({ token: "ghs_test", repo: "owner/name", checkRunId: "9" }),
     ).rejects.toBeInstanceOf(GithubApiError);
   });
 });

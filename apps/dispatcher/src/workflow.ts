@@ -45,6 +45,9 @@
 //       specs/pm/plan.md § PR4 + § PR6.
 
 import { checkConclusion } from "./terminal-verdict";
+import { openCheckRun } from "./check-run-open";
+import { concludeOpenChildCheckRuns, readChildCheckRuns } from "./child-check-runs";
+import { isEngineInterruption } from "./engine-interruption";
 import { WorkflowEntrypoint } from "cloudflare:workers";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import { getSandbox } from "@cloudflare/sandbox";
@@ -634,6 +637,9 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
     //      recorded `failure` row + a `failure` check-run conclusion — never a
     //      thrown Workflow infra error);
     //   4. write the terminal `executions` status + complete the check-run.
+    // Set when the run's exit is an engine interruption: the replay continues
+    // the execution, so this invocation leaves its post-run teardown alone.
+    let engineInterrupted = false;
     const program = Effect.gen(function* () {
       const executions = yield* Executions;
       const checks = yield* Checks;
@@ -651,21 +657,41 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
         ...(payload.retryOf !== undefined ? { retryOf: payload.retryOf } : {}),
       });
 
-      // Open the check-run (`in_progress`). With no App config this resolves
-      // to the no-op sentinel id and posts nothing.
-      const checkRunId = yield* checks.create({
-        repo: payload.github.repo,
-        sha: payload.github.sha,
-        name: checkRunName,
-        ...(checkDetailsUrl !== undefined ? { detailsUrl: checkDetailsUrl } : {}),
-        output: {
-          title: checkRunTitle,
-          // Both log links from the very first render (summary-links.ts) — a
-          // reviewer watching an in-progress check reaches the viewer without
-          // waiting for the verdict update.
-          summary: startedSummary(payload.executionId, summaryLinks),
-        },
-      });
+      // Wrap a raw CF durable step as an Effect. The check-run open, the
+      // admission gate and the run ceiling run their I/O in `step.do` /
+      // `step.sleep` (NOT the run DSL's StepRunner — these steps precede the
+      // run body) so every clock read + claim is checkpointed and a replay
+      // re-reads the recorded result. A rejected step promise is
+      // platform/infra breakage → defect (`orDie`), keeping the gate's typed
+      // error channel a clean `AdmissionTimedOut`.
+      // CF types `step.do<T extends Rpc.Serializable<T>>`; the step results
+      // are plain JSON records, so bridge through the simple
+      // `(name, callback)` view — the same narrowing `step-runner-cf.ts` uses
+      // for its `WorkflowStepLike`.
+      const stepDo = <T>(name: string, body: () => Promise<T>): Effect.Effect<T> =>
+        Effect.tryPromise(() =>
+          (step.do as unknown as (n: string, cb: () => Promise<T>) => Promise<T>)(name, body),
+        ).pipe(Effect.orDie);
+
+      // Open the check-run (`in_progress`) once per execution — a replay reads
+      // the id back (check-run-open.ts). With no App config this resolves to
+      // the no-op sentinel id and posts nothing.
+      const checkRunId = yield* openCheckRun(
+        stepDo,
+        checks.create({
+          repo: payload.github.repo,
+          sha: payload.github.sha,
+          name: checkRunName,
+          ...(checkDetailsUrl !== undefined ? { detailsUrl: checkDetailsUrl } : {}),
+          output: {
+            title: checkRunTitle,
+            // Both log links from the very first render (summary-links.ts) — a
+            // reviewer watching an in-progress check reaches the viewer without
+            // waiting for the verdict update.
+            summary: startedSummary(payload.executionId, summaryLinks),
+          },
+        }),
+      );
       // Persist the GitHub check-run id onto the `executions` row.
       // D1 write for check_run_id — best-effort metadata, retry once on
       // transient errors then die (the execution and check-run are already
@@ -706,21 +732,6 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
         throw new Error(`Invalid admission queue age for run ${run.name}`);
       }
       const admissionMaxQueueAgeMs = admissionMaxQueueAgeSec * 1000;
-      // Wrap a raw CF durable step as an Effect. The gate runs its I/O in
-      // `step.do` / `step.sleep` (NOT the run DSL's StepRunner — these steps
-      // precede the run body) so every clock read + claim is checkpointed and
-      // a replay re-reads the recorded result. A rejected step promise is
-      // platform/infra breakage → defect (`orDie`), keeping the gate's typed
-      // error channel a clean `AdmissionTimedOut`.
-      // CF types `step.do<T extends Rpc.Serializable<T>>`; the admission step
-      // results are plain JSON records, so bridge through the simple
-      // `(name, callback)` view — the same narrowing `step-runner-cf.ts` uses
-      // for its `WorkflowStepLike`.
-      const stepDo = <T>(name: string, body: () => Promise<T>): Effect.Effect<T> =>
-        Effect.tryPromise(() =>
-          (step.do as unknown as (n: string, cb: () => Promise<T>) => Promise<T>)(name, body),
-        ).pipe(Effect.orDie);
-
       const admissionGate: Effect.Effect<void, AdmissionTimedOut> = Effect.gen(function* () {
         // Enqueue — the row's `enqueued_at` (FIFO key + dispatch-age basis)
         // is read inside the step, so a replay sees the SAME timestamp.
@@ -1017,6 +1028,16 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
               );
             });
       const exit = yield* Effect.exit(gated);
+      // The engine lost this instance mid-step and replays it from its last
+      // checkpoint: nothing this invocation writes is the run's verdict, so it
+      // writes nothing and ends here (engine-interruption.ts).
+      if (Exit.isFailure(exit) && isEngineInterruption(exit)) {
+        engineInterrupted = true;
+        yield* Effect.logWarning(
+          `engine interruption in ${payload.executionId} — leaving the verdict to the replay`,
+        );
+        return yield* Effect.failCause(exit.cause);
+      }
       const completedAt = yield* Effect.sync(() => Date.now());
 
       // A `RunSkipped` failure is a CAPACITY bow-out (the run's work was
@@ -1203,6 +1224,17 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
         },
       });
 
+      // A fan-out parent concludes any child check-run still open — one whose
+      // own terminal update never landed (child-check-runs.ts). Best-effort.
+      const childrenConcluded = yield* readChildCheckRuns(db, payload.executionId).pipe(
+        Effect.flatMap((rows) => concludeOpenChildCheckRuns(rows, checks)),
+      );
+      if (childrenConcluded.length > 0) {
+        yield* Effect.logWarning(
+          `concluded ${childrenConcluded.length} open child check-run(s) at parent close`,
+        );
+      }
+
       // Completion-notify email — the other side of the GitHub check-run, for
       // recipients who aren't watching the PR. Renders the run's verdict +
       // output (artifact / demo / log links) and sends to each `notify.emails`
@@ -1309,7 +1341,11 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
       // (deterministic, non-expiring) capability token can't drain the remaining
       // budget after the execution finishes. Best-effort — the hard token cap
       // already bounds spend; this revokes the post-run tail. specs/08 § 6.3.
-      if (configOverrides !== undefined && this.env.AGENT_BUDGET !== undefined) {
+      if (
+        !engineInterrupted &&
+        configOverrides !== undefined &&
+        this.env.AGENT_BUDGET !== undefined
+      ) {
         await this.env.AGENT_BUDGET.get(this.env.AGENT_BUDGET.idFromName(payload.executionId))
           .kill()
           .catch(() => {});

@@ -25,11 +25,13 @@ export {
 } from "./installation-token";
 export {
   createCheckRun,
+  getCheckRunStatus,
   progressCheckRun,
   updateCheckRun,
   type CheckConclusion,
   type CheckRunOutput,
   type CreateCheckRunOptions,
+  type GetCheckRunStatusOptions,
   type ProgressCheckRunOptions,
   type UpdateCheckRunOptions,
 } from "./check-runs";

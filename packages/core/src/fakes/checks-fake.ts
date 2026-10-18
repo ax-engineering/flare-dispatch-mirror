@@ -67,6 +67,16 @@ export const makeChecksFake = (): {
         state.progresses.push({ checkRunId, repo, output, detailsUrl });
       }),
 
+    // A check-run is completed once the fake recorded an update for it.
+    status: ({ checkRunId }) =>
+      Effect.sync(() =>
+        state.creates.some((c) => c.checkRunId === checkRunId)
+          ? state.updates.some((u) => u.checkRunId === checkRunId)
+            ? "completed"
+            : "open"
+          : "unknown",
+      ),
+
     update: ({ repo, checkRunId, conclusion, output, detailsUrl }) =>
       Effect.sync(() => {
         state.updates.push({ checkRunId, repo, conclusion, output, detailsUrl });

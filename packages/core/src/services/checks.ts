@@ -14,6 +14,12 @@ import { Context, Effect } from "effect";
 /** A check-run conclusion — the terminal verdict GitHub renders. */
 export type CheckConclusion = "success" | "failure" | "neutral" | "cancelled" | "timed_out";
 
+/**
+ * Whether a check-run still renders as running. `unknown` when it cannot be
+ * read — a caller deciding whether to conclude it leaves an `unknown` one alone.
+ */
+export type CheckRunState = "completed" | "open" | "unknown";
+
 /** The output block GitHub renders under the check-run. */
 export type CheckOutput = {
   readonly title: string;
@@ -47,6 +53,9 @@ export interface ChecksService {
     /** Optional "Details" link, preserved across the update. */
     detailsUrl?: string;
   }) => Effect.Effect<void>;
+
+  /** Read whether a check-run is completed. Total: an unreadable one is `unknown`. */
+  readonly status: (opts: { repo: string; checkRunId: string }) => Effect.Effect<CheckRunState>;
 
   /** Complete a check-run with a conclusion. */
   readonly update: (opts: {
