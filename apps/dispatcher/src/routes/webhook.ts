@@ -85,8 +85,12 @@ export const synthesizeGithubBlock = (
   const checkSuiteSha = (payload as { check_suite?: { head_sha?: string } }).check_suite?.head_sha;
   const pushSha = (payload as { after?: string }).after;
   const pushRef = (payload as { ref?: string }).ref;
+  // An annotated tag push's `after` is the tag object, which a check-run refuses
+  // (HTTP 422); `head_commit.id` is the commit the tag names.
+  const tagPush = typeof pushRef === "string" && pushRef.startsWith("refs/tags/");
+  const pushedSha = tagPush ? (commitSha ?? pushSha) : (pushSha ?? commitSha);
   const sha =
-    deploymentSha ?? prSha ?? pushSha ?? commitSha ?? checkRunSha ?? checkSuiteSha ?? "main";
+    deploymentSha ?? prSha ?? pushedSha ?? checkRunSha ?? checkSuiteSha ?? "main";
   const ref =
     typeof pushRef === "string" && pushRef.startsWith("refs/") ? pushRef : "refs/heads/main";
 

@@ -215,7 +215,8 @@ describe("POST /v1/webhooks/github — event allowlist", () => {
 });
 
 describe("POST /v1/webhooks/github — trigger evaluation", () => {
-  it("preserves the pushed tag ref and commit for release triggers", () => {
+  it("preserves the pushed tag ref and names the tagged commit for release triggers", () => {
+    // An annotated tag's `after` is the tag object; a check-run needs the commit it tags.
     expect(
       synthesizeGithubBlock({
         ref: "refs/tags/v1.2.3",
@@ -227,9 +228,20 @@ describe("POST /v1/webhooks/github — trigger evaluation", () => {
     ).toEqual({
       repo: "owner/test-repo",
       ref: "refs/tags/v1.2.3",
-      sha: "a".repeat(40),
+      sha: "b".repeat(40),
       installation_id: 99999,
     });
+  });
+
+  it("a branch push names its `after` commit", () => {
+    expect(
+      synthesizeGithubBlock({
+        ref: "refs/heads/main",
+        after: "c".repeat(40),
+        head_commit: { id: "c".repeat(40) },
+        repository: { full_name: "owner/test-repo" },
+      }).sha,
+    ).toBe("c".repeat(40));
   });
 
   it("valid sig + matching deployment_status → dispatches deploy-smoke", async () => {
