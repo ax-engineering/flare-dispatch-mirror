@@ -68,6 +68,28 @@ describe("contextful-measures", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.effect("re-clones a recycled container inside the measure step and reports from it", () => {
+    const { layer, handles } = makeCFRuntimeTest({
+      github: { branchHeads: { "fractalboxdev/contextful:main": sha } },
+      sandboxProgram: {
+        // The probe answers non-zero: the container was recycled after checkout
+        // and took the clone with it.
+        "test -d /workspace/contextful/.git": { exitCode: 1 },
+        "measure --tier all": { exitCode: 0 },
+        "measure-report": { exitCode: 0 },
+      },
+      sandboxFiles: { "/workspace/contextful/measure-report.json": report },
+    });
+    return Effect.gen(function* () {
+      yield* contextfulMeasures.run(input);
+      expect(handles.sandbox.clones).toEqual([
+        { repo: input.repo, sha },
+        { repo: input.repo, sha },
+      ]);
+      expect(handles.github.appendMeasureNoteCalls).toHaveLength(1);
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("attaches a report even when a measure tier is red", () => {
     const { layer, handles } = makeCFRuntimeTest({
       github: { branchHeads: { "fractalboxdev/contextful:main": sha } },

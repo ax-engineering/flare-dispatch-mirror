@@ -9,10 +9,11 @@ import {
   StepFailed,
   step,
 } from "@fractalboxdev/flare-dispatch-core";
-import { workspace } from "@fractalboxdev/flare-dispatch-core/primitives";
+import { ensureWorkspace, workspace } from "@fractalboxdev/flare-dispatch-core/primitives";
 
 const REPO = "fractalboxdev/contextful";
 const BRANCH = "main";
+const MEASURE_RETRIES = 2;
 const MEASURE_COMMAND = "cargo run --locked -q -p contextful-ci -- measure --tier all";
 const REPORT_FILE = "measure-report.json";
 const Input = Schema.Struct({
@@ -82,23 +83,36 @@ export const contextfulMeasures = defineRun({
       // binaries. Allow the operator to raise or lower the command ceiling.
       const timeoutSec = Math.max(300, Math.min(input.timeoutSec ?? 18000, 20000));
       const ws = yield* step("checkout", () => workspace({ repo: REPO, sha: commit }));
+      // A container recycled mid-measure answers `ExecFailed` (exit -1) and takes
+      // the checkout with it, so the retry rebuilds the workspace inside the step
+      // before measuring again, and the report steps read the workspace it measured.
       const measured = yield* step(
         "measure",
         () =>
-          sandbox.exec({
-            container: ws.container,
-            cwd: ws.dir,
-            command: MEASURE_COMMAND,
-            timeoutSec,
-          }),
-        { timeoutSec: timeoutSec + 100, retries: 0 },
+          ensureWorkspace({ current: ws, repo: REPO, sha: commit }).pipe(
+            Effect.flatMap((current) =>
+              sandbox
+                .exec({
+                  container: current.container,
+                  cwd: current.dir,
+                  command: MEASURE_COMMAND,
+                  timeoutSec,
+                })
+                .pipe(Effect.map((result) => ({ exitCode: result.exitCode, workspace: current }))),
+            ),
+          ),
+        {
+          timeoutSec: timeoutSec + 100,
+          retries: MEASURE_RETRIES,
+          retryOn: ["ExecFailed", "CheckoutFailed"],
+        },
       );
       // A red tier still gets a note. Only report construction or note writing
       // prevents history from being attached.
       const report = yield* step("build-report", () =>
         sandbox.exec({
-          container: ws.container,
-          cwd: ws.dir,
+          container: measured.workspace.container,
+          cwd: measured.workspace.dir,
           command: reportCommand,
           env: {
             MEASURE_COMMIT: commit,
@@ -112,19 +126,19 @@ export const contextfulMeasures = defineRun({
       if (report.exitCode !== 0) {
         return yield* Effect.fail(new StepFailed({ step: "build-report", cause: report.stderr }));
       }
-      const reportPath = `${ws.dir}/${REPORT_FILE}`;
+      const reportPath = `${measured.workspace.dir}/${REPORT_FILE}`;
       const reportUrl = yield* step("upload-report", () =>
         artifact.upload({
           name: REPORT_FILE,
           path: reportPath,
-          container: ws.container,
+          container: measured.workspace.container,
           contentType: "application/json",
           signedUrlTTL: "30 days",
         }),
       );
       const reportText = yield* step("read-report", () =>
         sandbox
-          .readFile({ path: reportPath, container: ws.container })
+          .readFile({ path: reportPath, container: measured.workspace.container })
           .pipe(
             Effect.catchTag("ReadFileFailed", (error) =>
               Effect.fail(new StepFailed({ step: "read-report", cause: error.message })),
