@@ -40,6 +40,7 @@ import {
   type ExecutionsService,
   IO,
   type IOService,
+  isEngineInterruptedCause,
   runEffect,
   type RunContext,
   StepFailed,
@@ -47,34 +48,7 @@ import {
   StepRunner,
   type StepRunnerService,
 } from "@fractalboxdev/flare-dispatch-core";
-
-/**
- * The minimal `WorkflowStep` surface the runner needs. CF's full type covers
- * many more methods; the runner uses only `do` for normal step checkpoints
- * and `waitForEvent` for human-in-the-loop hibernation.
- */
-type WorkflowStepLike = {
-  readonly sleep?: (name: string, milliseconds: number) => Promise<void>;
-  readonly do: <T>(name: string, callback: () => Promise<T>) => Promise<T>;
-  readonly waitForEvent?: (
-    name: string,
-    opts: { type: string; timeout: string | number },
-  ) => Promise<{ type: string; payload: unknown }>;
-};
-
-/**
- * CF's `WorkflowStep.do` has a second overload — `do(name, config, callback)` —
- * that takes a per-step `WorkflowStepConfig` (timeout, retries). We model the
- * step surface minimally (no CF type dependency), so that overload isn't on
- * `WorkflowStepLike`; this is the typed view we cast to when passing a config.
- * Without it every step inherits CF Workflows' 10-minute default step timeout,
- * which capped the multi-minute acceptance suite at 600s. See `buildStepConfig`.
- */
-type DoWithConfig = <T>(
-  name: string,
-  config: WorkflowStepConfigLike,
-  callback: () => Promise<T>,
-) => Promise<T>;
+import { WorkflowEngine } from "./workflow-engine";
 
 /**
  * The subset of CF's `WorkflowStepConfig` the runner sets from `StepOpts`.
@@ -151,33 +125,25 @@ const errorTagOf = (cause: Cause.Cause<unknown> | undefined): string | undefined
       });
 
 /**
- * Build a `StepRunner` Layer backed by a CF `WorkflowStep`. Depends on
- * `Executions` (lifecycle records) and `IO` (deterministic step timestamps),
- * so the resulting Layer requires both.
+ * Build a `StepRunner` Layer backed by the invocation's `WorkflowEngine`.
+ * Depends on `Executions` (lifecycle records) and `IO` (deterministic step
+ * timestamps), so the resulting Layer requires all three.
  *
- * @param workflowStep  the `step` argument passed to `WorkflowEntrypoint.run`.
  * @param executionId   the execution the `steps` rows are recorded under.
  */
 export const makeStepRunnerCloudflare = (
-  workflowStep: WorkflowStepLike,
   executionId: string,
-): Layer.Layer<StepRunner, never, Executions | IO> =>
+): Layer.Layer<StepRunner, never, Executions | IO | WorkflowEngine> =>
   Layer.effect(
     StepRunner,
     Effect.gen(function* () {
+      const engine = yield* WorkflowEngine;
       const executions: ExecutionsService = yield* Executions;
       const ioSvc: IOService = yield* IO;
 
       const service: StepRunnerService = {
         sleep: (name, milliseconds) =>
-          Effect.tryPromise({
-            try: async () => {
-              if (workflowStep.sleep === undefined)
-                throw new Error("Workflow durable sleep is unavailable");
-              await workflowStep.sleep(name, milliseconds);
-            },
-            catch: (cause) => new StepFailed({ step: name, cause }),
-          }),
+          engine.sleep(name, milliseconds, (cause) => new StepFailed({ step: name, cause })),
         run: (name, body, stepOpts) =>
           Effect.gen(function* () {
             // Capture the ambient RunContext so the body — which still needs
@@ -210,19 +176,21 @@ export const makeStepRunnerCloudflare = (
               runEffect(Effect.provide(body(), context)).catch((error: unknown) => {
                 throw rethrowForRetryPolicy(error, retryOn);
               });
-            // `WorkflowStepLike` models only the no-config `do` overload; the
-            // real CF `step.do` also accepts `(name, config, callback)`. Bridge
-            // to it via `DoWithConfig` when a step set a timeout/retries.
-            const doWithConfig = workflowStep.do as unknown as DoWithConfig;
+            // An engine interruption dies here, before `finishStep`: the
+            // invocation that saw it writes no `steps` row the replay would
+            // contradict.
             const exit = yield* Effect.exit(
-              Effect.tryPromise({
-                try: () =>
-                  stepConfig === undefined
-                    ? workflowStep.do(name, runBody)
-                    : doWithConfig(name, stepConfig, runBody),
-                catch: (error): { readonly error: unknown } => ({ error }),
-              }),
+              engine.do(
+                name,
+                runBody,
+                (error): { readonly error: unknown } => ({ error }),
+                stepConfig,
+              ),
             );
+            // A die carries no typed failure, so the cause narrows to `never`.
+            if (Exit.isFailure(exit) && isEngineInterruptedCause(exit.cause)) {
+              return yield* Effect.failCause(exit.cause as Cause.Cause<never>);
+            }
 
             const completedAt = yield* ioSvc.now;
 
@@ -284,50 +252,54 @@ export const makeStepRunnerCloudflare = (
         //     `EventPayloadInvalid` (the safer choice — a corrupted event
         //     surface in production is a bug, not a wait-longer condition).
         waitForEvent: (name, { type, timeout, payloadSchema }) =>
-          Effect.suspend(() => {
-            if (typeof workflowStep.waitForEvent !== "function") {
+          Option.match(engine.waitForEvent, {
+            onNone: () => {
               const timeoutMs = Duration.toMillis(
                 Duration.decode(timeout as Duration.DurationInput),
               );
               return Effect.fail(new ApprovalTimedOut({ eventName: type, timeoutMs }));
-            }
-            const timeoutMs = Duration.toMillis(Duration.decode(timeout as Duration.DurationInput));
-            // CF Workflows `waitForEvent` accepts either an ISO-8601 duration
-            // string or a number-of-seconds. Pass ms-converted-to-seconds for
-            // unambiguous behaviour across runtime versions.
-            return Effect.tryPromise({
-              try: () =>
-                workflowStep.waitForEvent!(name, {
+            },
+            onSome: (wait) => {
+              const timeoutMs = Duration.toMillis(
+                Duration.decode(timeout as Duration.DurationInput),
+              );
+              // CF Workflows `waitForEvent` accepts either an ISO-8601 duration
+              // string or a number-of-seconds. Pass ms-converted-to-seconds for
+              // unambiguous behaviour across runtime versions.
+              return wait(
+                name,
+                {
                   type,
                   timeout: Math.max(1, Math.ceil(timeoutMs / 1000)),
-                }),
-              catch: (cause) => {
-                const message = cause instanceof Error ? cause.message : String(cause);
-                if (/timeout|timed[- ]?out/i.test(message)) {
-                  return new ApprovalTimedOut({
-                    eventName: type,
-                    timeoutMs,
-                  }) as ApprovalTimedOut | EventPayloadInvalid;
-                }
-                return new EventPayloadInvalid({
-                  eventName: type,
-                  reason: message,
-                });
-              },
-            }).pipe(
-              Effect.flatMap((event) => {
-                const decoded = Schema.decodeUnknownEither(payloadSchema)(event.payload);
-                if (decoded._tag === "Left") {
-                  return Effect.fail(
-                    new EventPayloadInvalid({
+                },
+                (cause) => {
+                  const message = cause instanceof Error ? cause.message : String(cause);
+                  if (/timeout|timed[- ]?out/i.test(message)) {
+                    return new ApprovalTimedOut({
                       eventName: type,
-                      reason: "decode failed",
-                    }),
-                  );
-                }
-                return Effect.succeed(decoded.right);
-              }),
-            );
+                      timeoutMs,
+                    }) as ApprovalTimedOut | EventPayloadInvalid;
+                  }
+                  return new EventPayloadInvalid({
+                    eventName: type,
+                    reason: message,
+                  });
+                },
+              ).pipe(
+                Effect.flatMap((event) => {
+                  const decoded = Schema.decodeUnknownEither(payloadSchema)(event.payload);
+                  if (decoded._tag === "Left") {
+                    return Effect.fail(
+                      new EventPayloadInvalid({
+                        eventName: type,
+                        reason: "decode failed",
+                      }),
+                    );
+                  }
+                  return Effect.succeed(decoded.right);
+                }),
+              );
+            },
           }),
       };
 

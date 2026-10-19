@@ -47,11 +47,10 @@
 import { checkConclusion } from "./terminal-verdict";
 import { openCheckRun } from "./check-run-open";
 import { concludeOpenChildCheckRuns, readChildCheckRuns } from "./child-check-runs";
-import { isEngineInterruption } from "./engine-interruption";
 import { WorkflowEntrypoint } from "cloudflare:workers";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import { getSandbox } from "@cloudflare/sandbox";
-import { Duration, Effect, Exit, Runtime, Schedule, Schema } from "effect";
+import { Duration, Effect, Exit, identity, Runtime, Schedule, Schema } from "effect";
 import {
   admissionAcquireAttempts,
   type AdmissionPool,
@@ -60,11 +59,15 @@ import {
   decideAdmission,
   Email,
   Executions,
+  EngineInterrupted,
+  isEngineInterruptedCause,
+  isEngineInterruption,
   withRunCeiling,
   type RunContext,
   type RunError,
 } from "@fractalboxdev/flare-dispatch-core";
 import {
+  makeWorkflowEngine,
   ADMISSION_MAX_QUEUE_AGE_MS,
   ADMISSION_POLL_EVERY_MS,
   type BrowserRenderingConfig,
@@ -287,7 +290,11 @@ const resolveEmailConfig = (env: Env): EmailCloudflareConfig | undefined => {
  * URL segment. MUST stay in sync with `wrangler.jsonc` → `workflows[0].name`.
  */
 export class RunWorkflow extends WorkflowEntrypoint<Env> {
-  override async run(event: WorkflowEvent<unknown>, step: WorkflowStep): Promise<void> {
+  override async run(event: WorkflowEvent<unknown>, platformStep: WorkflowStep): Promise<void> {
+    // Every durable call this invocation makes — the run body's, through the
+    // runtime, and the dispatcher's own — goes through one engine, so one
+    // engine rejection ends all of them (runtime-cf's workflow-engine.ts).
+    const engine = Effect.runSync(makeWorkflowEngine(platformStep));
     // Decode the dispatch payload — a malformed event is a hard failure.
     const payload: DispatchPayload = Schema.decodeUnknownSync(DispatchPayload)(event.payload);
 
@@ -529,7 +536,7 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
               };
             },
           }),
-      workflowStep: step,
+      engine,
       // The `Workflow` binding backs the `childRuns` capability — a run can
       // `spawnChildRun` / `fanOut` to independent child `RunWorkflow` instances.
       runsWorkflow: this.env.RUNS_WORKFLOW,
@@ -637,7 +644,8 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
     //      recorded `failure` row + a `failure` check-run conclusion — never a
     //      thrown Workflow infra error);
     //   4. write the terminal `executions` status + complete the check-run.
-    // Set when the run's exit is an engine interruption: the replay continues
+    // Set when this invocation ends in an engine interruption — wherever it
+    // struck, the check-run open and admission included: the replay continues
     // the execution, so this invocation leaves its post-run teardown alone.
     let engineInterrupted = false;
     const program = Effect.gen(function* () {
@@ -663,15 +671,12 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
       // run body) so every clock read + claim is checkpointed and a replay
       // re-reads the recorded result. A rejected step promise is
       // platform/infra breakage → defect (`orDie`), keeping the gate's typed
-      // error channel a clean `AdmissionTimedOut`.
-      // CF types `step.do<T extends Rpc.Serializable<T>>`; the step results
-      // are plain JSON records, so bridge through the simple
-      // `(name, callback)` view — the same narrowing `step-runner-cf.ts` uses
-      // for its `WorkflowStepLike`.
+      // error channel a clean `AdmissionTimedOut`; an engine interruption is
+      // the `EngineInterrupted` defect (runtime-cf's workflow-engine.ts).
       const stepDo = <T>(name: string, body: () => Promise<T>): Effect.Effect<T> =>
-        Effect.tryPromise(() =>
-          (step.do as unknown as (n: string, cb: () => Promise<T>) => Promise<T>)(name, body),
-        ).pipe(Effect.orDie);
+        engine.do(name, body, identity).pipe(Effect.orDie);
+      const stepSleep = (name: string, ms: number): Effect.Effect<void> =>
+        engine.sleep(name, ms, identity).pipe(Effect.orDie);
 
       // Open the check-run (`in_progress`) once per execution — a replay reads
       // the id back (check-run-open.ts). With no App config this resolves to
@@ -802,9 +807,7 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
           // Durable, free hibernation between polls. Don't sleep after the
           // final attempt — fall straight through to timeout.
           if (i < maxAttempts - 1) {
-            yield* Effect.tryPromise(() =>
-              step.sleep(`admission-wait-${i}`, ADMISSION_POLL_EVERY_MS),
-            ).pipe(Effect.orDie);
+            yield* stepSleep(`admission-wait-${i}`, ADMISSION_POLL_EVERY_MS);
           } else {
             return yield* Effect.fail(
               new AdmissionTimedOut({
@@ -887,6 +890,11 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
       // On the substrate path the same teardown is `abort(key)` — kill + stop,
       // skipping the snapshot, and it releases the admission slot with it. The
       // dispatcher holds no container to destroy there, which is the point.
+      // A lost invocation releases nothing: the replay is the same execution,
+      // re-enters its own lease, admission and serial rows, and keeps using
+      // the container this invocation would otherwise destroy under it.
+      const unlessLost = (teardown: Effect.Effect<void>): Effect.Effect<void> =>
+        Effect.unlessEffect(teardown, engine.lost).pipe(Effect.asVoid);
       const destroySandbox: Effect.Effect<void> = Effect.tryPromise(() =>
         substrateFacade !== undefined
           ? substrateFacade.abort(payload.executionId).then(() => undefined)
@@ -932,8 +940,8 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
           maxDurationSec: run.limits.maxDurationSec,
           startedAt: bodyStartedAt,
         }).pipe(
-          Effect.ensuring(destroySandbox),
-          Effect.ensuring(lease.release().pipe(Effect.ignore)),
+          Effect.ensuring(unlessLost(destroySandbox)),
+          Effect.ensuring(unlessLost(lease.release().pipe(Effect.ignore))),
         );
       }).pipe(Effect.scoped);
 
@@ -964,7 +972,7 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
       // failure-summary.ts rendering it unmistakably as an infra-wait timeout.
       const admitted: Effect.Effect<unknown, RunError, RunContext> = admissionGate.pipe(
         Effect.andThen(admissionHeld),
-        Effect.ensuring(admissions.release(payload.executionId).pipe(Effect.ignore)),
+        Effect.ensuring(unlessLost(admissions.release(payload.executionId).pipe(Effect.ignore))),
       );
 
       // --- Per-group serialization (runs that declare `serialize`) ---------
@@ -994,8 +1002,7 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
                 ...(readCurrent !== undefined
                   ? { current: () => Runtime.runPromise(rt)(readCurrent) }
                   : {}),
-                sleep: (name, ms) =>
-                  Effect.tryPromise(() => step.sleep(name, ms)).pipe(Effect.orDie),
+                sleep: stepSleep,
                 onWait: (holderRevision) =>
                   checks
                     .progress({
@@ -1024,19 +1031,25 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
                     return yield* admitted;
                   }).pipe(Effect.scoped),
                 ),
-                Effect.ensuring(serialQueue.release(payload.executionId).pipe(Effect.ignore)),
+                Effect.ensuring(
+                  unlessLost(serialQueue.release(payload.executionId).pipe(Effect.ignore)),
+                ),
               );
             });
       const exit = yield* Effect.exit(gated);
       // The engine lost this instance mid-step and replays it from its last
       // checkpoint: nothing this invocation writes is the run's verdict, so it
-      // writes nothing and ends here (engine-interruption.ts).
-      if (Exit.isFailure(exit) && isEngineInterruption(exit)) {
-        engineInterrupted = true;
+      // writes nothing and ends here (core's engine-interruption.ts). The
+      // latch covers a run body that recovered the defect and returned.
+      if ((yield* engine.lost) || (Exit.isFailure(exit) && isEngineInterruptedCause(exit.cause))) {
         yield* Effect.logWarning(
           `engine interruption in ${payload.executionId} — leaving the verdict to the replay`,
         );
-        return yield* Effect.failCause(exit.cause);
+        return yield* Exit.isFailure(exit) && isEngineInterruptedCause(exit.cause)
+          ? Effect.failCause(exit.cause)
+          : Effect.die(
+              new EngineInterrupted({ step: "run", reason: "a recovered step lost the instance" }),
+            );
       }
       const completedAt = yield* Effect.sync(() => Date.now());
 
@@ -1155,33 +1168,30 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
             repo,
             payload.github.installation_id,
           );
-          const outcome: WritebackOutcome = yield* Effect.tryPromise(() =>
-            (
-              step.do as unknown as (
-                n: string,
-                cb: () => Promise<WritebackOutcome>,
-              ) => Promise<WritebackOutcome>
-            )("writeback", () =>
-              runWriteback({
-                bucket,
-                executionId: payload.executionId,
-                spec,
-                repo,
-                dispatchRef: payload.github.ref,
-                artifactName: WRITEBACK_ARTIFACT,
-                mintToken,
-              }),
-            ),
+          const outcome: WritebackOutcome = yield* stepDo("writeback", () =>
+            runWriteback({
+              bucket,
+              executionId: payload.executionId,
+              spec,
+              repo,
+              dispatchRef: payload.github.ref,
+              artifactName: WRITEBACK_ARTIFACT,
+              mintToken,
+            }),
           ).pipe(
             // A writeback failure (GitHub API error, missing creds mid-flight)
-            // must never turn a green run red — log it and surface a line.
+            // must never turn a green run red — log it and surface a line. An
+            // engine interruption is not a writeback failure: the replay
+            // re-runs the step, so this invocation ends without concluding.
             Effect.catchAllCause((cause) =>
-              Effect.logError(`writeback failed — ${cause}`).pipe(
-                Effect.as<WritebackOutcome>({
-                  kind: "rejected",
-                  reasons: ["writeback errored — see Worker logs"],
-                }),
-              ),
+              isEngineInterruptedCause(cause)
+                ? Effect.failCause(cause)
+                : Effect.logError(`writeback failed — ${cause}`).pipe(
+                    Effect.as<WritebackOutcome>({
+                      kind: "rejected",
+                      reasons: ["writeback errored — see Worker logs"],
+                    }),
+                  ),
             ),
           );
           writebackLine = describeOutcome(outcome);
@@ -1335,7 +1345,16 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
     });
 
     try {
-      await Effect.runPromise(program.pipe(Effect.provide(runtime)));
+      await Effect.runPromise(
+        program.pipe(
+          Effect.onExit((exit) =>
+            Effect.map(engine.lost, (lost) => {
+              engineInterrupted = lost || isEngineInterruption(exit);
+            }),
+          ),
+          Effect.provide(runtime),
+        ),
+      );
     } finally {
       // Self-heal: mark the AgentBudget no longer live once the run ends, so the
       // (deterministic, non-expiring) capability token can't drain the remaining

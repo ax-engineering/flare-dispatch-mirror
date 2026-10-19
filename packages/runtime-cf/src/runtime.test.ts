@@ -53,6 +53,7 @@ import { makeMailboxCloudflareLive } from "./mailbox-cf";
 import { makeNoticeCloudflareLive } from "./notice-cf";
 import { makeIOLive } from "./io-live";
 import { makeStepRunnerCloudflare } from "./step-runner-cf";
+import { WorkflowEngine } from "./workflow-engine";
 import { countRows, makeTestBindings, type TestBindings } from "./test-support";
 
 /**
@@ -92,7 +93,9 @@ const makeRuntimeUnderTest = (
   const io = makeIOLive();
   const executions = makeD1ExecutionsLive(bindings.db, ctx);
   const artifact = makeR2ArtifactLive(bindings.bucket, executionId);
-  const stepRunner = makeStepRunnerCloudflare(fakeWorkflowStep, executionId);
+  const stepRunner = makeStepRunnerCloudflare(executionId).pipe(
+    Layer.provide(WorkflowEngine.layer(fakeWorkflowStep)),
+  );
 
   return Layer.mergeAll(
     sandboxFakeProgram(sandboxProgram),

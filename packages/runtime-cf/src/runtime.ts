@@ -47,6 +47,7 @@ import type { CheckCommandOwner, Container } from "@fractalboxdev/flare-dispatch
 import { resolveAppCredentials } from "./sandbox-clone-auth";
 import { CacheOnFacade, makeSandboxFacadeLive, type SandboxFacadeOptions } from "./sandbox-facade";
 import { makeStepRunnerCloudflare } from "./step-runner-cf";
+import { WorkflowEngine, type WorkflowEngineService } from "./workflow-engine";
 
 /**
  * What `makeCFRuntimeLive` needs to run this execution on the substrate rather
@@ -58,11 +59,6 @@ export type SubstrateExecution = Omit<
   SandboxFacadeOptions,
   "bucket" | "executionId" | "repo" | "sha" | "logsViewerBase"
 >;
-
-/** The minimal `WorkflowStep` surface `StepRunnerCloudflare` needs. */
-type WorkflowStepLike = {
-  readonly do: <T>(name: string, callback: () => Promise<T>) => Promise<T>;
-};
 
 /** Everything `makeCFRuntimeLive` needs to wire the per-execution runtime. */
 export type CFRuntimeLiveOptions<T extends Sandbox = Sandbox> = {
@@ -86,8 +82,11 @@ export type CFRuntimeLiveOptions<T extends Sandbox = Sandbox> = {
    * service binding plus the run's grant-catalog entry.
    */
   readonly substrate?: SubstrateExecution;
-  /** The `step` argument from `WorkflowEntrypoint.run`. */
-  readonly workflowStep: WorkflowStepLike;
+  /**
+   * The invocation's `step`, as the engine `RunWorkflow` built over it. The
+   * dispatcher's own steps share it, so one engine loss latches both.
+   */
+  readonly engine: WorkflowEngineService;
   /**
    * The CF `Workflow` binding (`env.RUNS_WORKFLOW`) backing the `childRuns`
    * capability (`spawnChildRun` / the `fanOut` primitive). A run spawns child
@@ -331,7 +330,7 @@ export const makeCFRuntimeLive = <T extends Sandbox>(
           opts.sandboxTransport,
           opts.checkCommandOwner,
         );
-  const stepRunner = makeStepRunnerCloudflare(opts.workflowStep, opts.executionId);
+  const stepRunner = makeStepRunnerCloudflare(opts.executionId);
   const checks = makeChecksGithubLive(opts.checks);
   // The cache archive key is scoped by repo so two repos with an identical
   // lockfile hash cannot collide (cross-repo cache poisoning). On the substrate
@@ -443,6 +442,9 @@ export const makeCFRuntimeLive = <T extends Sandbox>(
     childRuns,
     executions,
     // StepRunnerCloudflare needs Executions + IO — supply them from the merge.
-    Layer.provide(stepRunner, Layer.merge(executions, io)),
+    Layer.provide(
+      stepRunner,
+      Layer.mergeAll(executions, io, Layer.succeed(WorkflowEngine, opts.engine)),
+    ),
   );
 };

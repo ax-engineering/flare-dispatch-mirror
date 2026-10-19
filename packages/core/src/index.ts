@@ -88,6 +88,11 @@ export {
 
 // --- Run ceiling (limits.maxDurationSec, replay-stable) ----------------------
 export { withRunCeiling, type RunCeiling } from "./run-ceiling";
+export {
+  EngineInterrupted,
+  isEngineInterruptedCause,
+  isEngineInterruption,
+} from "./engine-interruption";
 
 // --- Agent token-budget (pure decision logic for the AgentBudget DO) ----------
 export {
