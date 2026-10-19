@@ -17,6 +17,21 @@ describe("contextful-release", () => {
     expect(trigger.gate!({ payload: { ...base, ref: "refs/heads/main" } })).toBe(false);
     expect(trigger.gate!({ payload: { ...base, repository: { full_name: "other/repo" } } })).toBe(false);
     expect(trigger.inputs({ payload: base })).toEqual({ repo, tag: "v0.5.0", sha, dryRun: false });
+    expect(trigger.gate!({ payload: { ...base, ref: "refs/tags/dry-run/v0.5.0" } })).toBe(false);
+  });
+
+  it("subscribes to dry-run tag pushes as a dry run of the named version", () => {
+    const [live, dry] = contextfulRelease.triggers!;
+    const base = { repository: { full_name: repo }, ref: "refs/tags/dry-run/v0.5.0", after: sha };
+    expect(dry!.gate!({ payload: base })).toBe(true);
+    expect(dry!.gate!({ payload: { ...base, after: "0".repeat(40) } })).toBe(false);
+    expect(dry!.gate!({ payload: { ...base, ref: "refs/tags/v0.5.0" } })).toBe(false);
+    expect(dry!.gate!({ payload: { ...base, ref: "refs/heads/dry-run/v0.5.0" } })).toBe(false);
+    expect(dry!.gate!({ payload: { ...base, repository: { full_name: "other/repo" } } })).toBe(false);
+    expect(dry!.inputs({ payload: base })).toEqual({ repo, tag: "v0.5.0", sha, dryRun: true });
+    expect(dry!.idempotencyKey!({ payload: base })).toBe(`contextful-release-dry:refs/tags/dry-run/v0.5.0:${sha}`);
+    expect(dry!.idempotencyKey!({ payload: base })).not.toBe(
+      live!.idempotencyKey!({ payload: { ...base, ref: "refs/tags/v0.5.0" } }));
   });
 
   it.effect("builds and stages a dry-run cell without publishing", () => {
@@ -348,7 +363,7 @@ describe("contextful-release", () => {
     // The parent queues behind other releases, never behind lean-pool gates.
     expect(contextfulRelease.sandboxImage).toBe("release");
     expect(contextfulReleaseCell.sandboxImage).toBe("release");
-    expect(contextfulRelease.version).toBe("1.2.0");
+    expect(contextfulRelease.version).toBe("1.3.0");
   });
 
   it.effect("window steps share no name with the fixed batches a release in flight checkpointed", () => {

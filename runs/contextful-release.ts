@@ -11,6 +11,7 @@ import {
 const REPO = "fractalboxdev/contextful";
 const VERSION_TAG = /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?$/;
 const SHA = /^[a-f0-9]{40}$/;
+const DRY_RUN_TAG_PREFIX = "refs/tags/dry-run/v";
 const PROFILES = ["contextful-control", "contextful-edge", "contextful-full"] as const;
 const LINUX = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"] as const;
 const DARWIN = ["x86_64-apple-darwin", "aarch64-apple-darwin"] as const;
@@ -304,9 +305,10 @@ export const contextfulReleaseFormula = defineRun({
 
 export const contextfulRelease = defineRun({
   name: "contextful-release",
+  // 1.3.0 — a `dry-run/v<version>` tag push starts a dry run of `v<version>`.
   // 1.2.0 — publishes the formula step's release notes as the release body.
   // 1.1.0 — release pool, sliding window of cells.
-  version: "1.2.0",
+  version: "1.3.0",
   // The parent makes no sandbox call and hands its admission row off after
   // its first spawn. On the release pool it queues only behind other
   // releases, never behind pull-request gates on the lean pool.
@@ -321,6 +323,18 @@ export const contextfulRelease = defineRun({
       typeof payload.after === "string" && SHA.test(payload.after) && payload.after !== "0".repeat(40),
     idempotencyKey: ({ payload }) => `contextful-release:${String(payload.ref)}:${String(payload.after)}`,
     inputs: ({ payload }) => ({ repo: REPO, tag: String(payload.ref).slice("refs/tags/".length), sha: String(payload.after), dryRun: false }),
+  }, {
+    // `refs/tags/dry-run/v<version>` builds every cell, the formula and the
+    // image archives for `v<version>` and publishes nothing: a dry run creates
+    // no draft release, uploads no release asset, pushes no container image
+    // and never publishes. `after` is the pushed object, so the tag must be
+    // lightweight to name the commit directly.
+    event: "push",
+    gate: ({ payload }) => payload.repository?.full_name === REPO &&
+      typeof payload.ref === "string" && payload.ref.startsWith(DRY_RUN_TAG_PREFIX) &&
+      typeof payload.after === "string" && SHA.test(payload.after) && payload.after !== "0".repeat(40),
+    idempotencyKey: ({ payload }) => `contextful-release-dry:${String(payload.ref)}:${String(payload.after)}`,
+    inputs: ({ payload }) => ({ repo: REPO, tag: String(payload.ref).slice("refs/tags/dry-run/".length), sha: String(payload.after), dryRun: true }),
   }],
   run: (input) => Effect.gen(function* () {
     requireValidRequest(input.repo, input.tag, input.sha);
