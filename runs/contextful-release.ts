@@ -1,7 +1,7 @@
 import { Effect, Schema } from "effect";
 import {
-  AcceptanceFailed, artifact, defineRun, github, handoffChildAdmission, io, isTerminalChildStatus, sandbox, step, StepFailed,
-  type ChildStatusRecord,
+  AcceptanceFailed, artifact, checkpointSleep, defineRun, GitHubApiError, github, handoffChildAdmission, io,
+  isTerminalChildStatus, sandbox, step, StepFailed, type ChildStatusRecord,
 } from "@fractalboxdev/flare-dispatch-core";
 import {
   DURABLE_EXEC_RETRY_ON, durableExec, ensureWorkspace, fanOut, waitForAnyChildDurably, waitForChildren, workspace,
@@ -44,6 +44,16 @@ const CELLS = PROFILES.flatMap((profile) =>
     target,
   })),
 );
+/**
+ * Total time one cell waits out GitHub rate limits on its asset uploads. A
+ * primary quota resets within the hour; a limit outlasting this fails the cell.
+ */
+const PUBLISH_RATE_LIMIT_BUDGET_MS = 3_600_000;
+/**
+ * Added per cell index to each rate-limit wait, so cells limited together
+ * retry in sequence rather than as one burst.
+ */
+const PUBLISH_STAGGER_MS = 15_000;
 /** A cell's admission queue age: two concurrent releases share the release pool. */
 const CELL_QUEUE_SEC = 21600;
 /**
@@ -214,9 +224,30 @@ const collect = (input: { profile: string; target: string }, version: string, ws
     return { kind: "staged", manifest, assets, imageLayer: { name: layerName, archiveName, size, digest, diffId } } as Collected;
   });
 
+/**
+ * One upload attempt. A rate limit carrying a retry hint completes the step
+ * with the hint instead of failing it: the step's own retries would resend
+ * within seconds, and the cell waits the hint out in a durable sleep.
+ */
+const publishOrRateLimit = (
+  input: typeof ReleaseCellInput.Type,
+  asset: StagedAsset,
+) =>
+  github.publishReleaseAsset({
+    repo: input.repo, releaseId: input.releaseId, artifactName: asset.name,
+    contentType: asset.contentType, sha256: asset.sha256,
+  }).pipe(
+    Effect.as({ kind: "published" as const }),
+    Effect.catchTag("GitHubApiError", (error) =>
+      error.reason === "rate-limited" && error.retryAfterMs !== undefined
+        ? Effect.succeed({ kind: "rate-limited" as const, status: error.status, retryAfterMs: error.retryAfterMs })
+        : Effect.fail(error)),
+  );
+
 export const contextfulReleaseCell = defineRun({
   name: "contextful-release-cell",
-  version: "1.1.0",
+  // 1.2.0 — a rate-limited asset upload waits out its retry hint durably.
+  version: "1.2.0",
   sandboxImage: "release",
   inputs: ReleaseCellInput,
   outputs: ReleaseCellOutput,
@@ -264,11 +295,23 @@ export const contextfulReleaseCell = defineRun({
         // Each asset publishes from R2 in its own step; an asset already
         // uploaded with the same digest is kept, so a retry is a no-op.
         if (!input.dryRun) {
+          const stagger = CELLS.findIndex((cell) => cell.profile === input.profile && cell.target === input.target)
+            * PUBLISH_STAGGER_MS;
+          let waitedMs = 0;
           for (const asset of collected.assets) {
-            yield* step(`publish-${asset.name}`, () => github.publishReleaseAsset({
-              repo: input.repo, releaseId: input.releaseId, artifactName: asset.name,
-              contentType: asset.contentType, sha256: asset.sha256,
-            }), { retries: 3, retryOn: ["GitHubApiError", "StepFailed"] });
+            for (let attempt = 0; ; attempt++) {
+              const name = attempt === 0 ? `publish-${asset.name}` : `publish-${asset.name}-retry-${attempt}`;
+              const outcome = yield* step(name, () => publishOrRateLimit(input, asset),
+                { retries: 3, retryOn: ["GitHubApiError", "StepFailed"] });
+              if (outcome.kind === "published") break;
+              const waitMs = outcome.retryAfterMs + stagger;
+              if (waitedMs + waitMs > PUBLISH_RATE_LIMIT_BUDGET_MS) {
+                return yield* Effect.fail(new GitHubApiError({ status: outcome.status, reason: "rate-limited",
+                  retryAfterMs: outcome.retryAfterMs }));
+              }
+              waitedMs += waitMs;
+              yield* checkpointSleep(`${name}-rate-limit-wait`, waitMs);
+            }
           }
         }
         return { profile: input.profile, target: input.target, manifest: collected.manifest,

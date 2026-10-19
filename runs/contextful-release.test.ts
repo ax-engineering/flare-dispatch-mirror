@@ -1,7 +1,7 @@
 import { it } from "@effect/vitest";
 import { Cause, Effect, Exit, Fiber, Option, TestClock } from "effect";
 import { describe, expect } from "vitest";
-import { ChildRuns, IO, Sandbox, StepRunner, type CheckCommandService } from "@fractalboxdev/flare-dispatch-core";
+import { ChildRuns, GitHubApiError, Github, IO, Sandbox, StepRunner, type CheckCommandService } from "@fractalboxdev/flare-dispatch-core";
 import { makeCFRuntimeTest } from "@fractalboxdev/flare-dispatch-core/testing";
 import { contextfulRelease, contextfulReleaseCell, contextfulReleaseFormula, RELEASE_WINDOW, SPAWN_ORDER } from "./contextful-release";
 
@@ -122,6 +122,55 @@ describe("contextful-release", () => {
       const longest = Math.max(...handles.executions.steps.map((entry) =>
         Number(entry.metadata?.["stepOpts.timeoutSec"] ?? 0)));
       expect(longest).toBeLessThanOrEqual(1800);
+    }).pipe(Effect.provide(layer));
+  });
+
+  /** A `publishReleaseAsset` that answers each call from `script`, then succeeds. */
+  const scriptedPublish = (script: Array<GitHubApiError | undefined>, calls: string[]) =>
+    Effect.gen(function* () {
+      const original = yield* Github;
+      return { ...original, publishReleaseAsset: (req: Parameters<typeof original.publishReleaseAsset>[0]) =>
+        Effect.suspend(() => {
+          calls.push(req.artifactName);
+          const failure = script.shift();
+          return failure === undefined ? original.publishReleaseAsset(req) : Effect.fail(failure);
+        }) };
+    });
+
+  it.effect("a rate-limited asset upload waits out the retry hint durably, then publishes", () => {
+    const { profile, target, name, runtime: { layer, handles } } = cellFixture();
+    const calls: string[] = [];
+    const limited = new GitHubApiError({ status: 403, reason: "rate-limited", retryAfterMs: 700_965 });
+    return Effect.gen(function* () {
+      const scripted = yield* scriptedPublish([limited], calls);
+      const running = yield* Effect.fork(contextfulReleaseCell.run({ repo, tag: "v0.5.0", sha,
+        profile, target, releaseId: 7, dryRun: false }).pipe(Effect.provideService(Github, scripted)));
+      yield* TestClock.adjust("10 minutes");
+      expect(calls).toEqual([`${name}.tar.gz`]);
+      yield* TestClock.adjust("1 hour");
+      const result = yield* Fiber.join(running);
+      expect(result.assets).toHaveLength(3);
+      expect(calls).toEqual([`${name}.tar.gz`, `${name}.tar.gz`, `${name}.tar.gz.sha256`, `${name}.cdx.json`]);
+      const publishes = handles.executions.steps.map((entry) => entry.name)
+        .filter((step) => step.startsWith(`publish-${name}.tar.gz`) && !step.endsWith(".sha256"));
+      expect(publishes).toEqual([`publish-${name}.tar.gz`, `publish-${name}.tar.gz-retry-1`]);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("rate limits a cell cannot wait out within an hour fail the cell as rate-limited", () => {
+    const { profile, target, runtime: { layer } } = cellFixture();
+    const calls: string[] = [];
+    const limited = () => new GitHubApiError({ status: 403, reason: "rate-limited", retryAfterMs: 1_500_000 });
+    return Effect.gen(function* () {
+      const scripted = yield* scriptedPublish([limited(), limited(), limited()], calls);
+      const running = yield* Effect.fork(Effect.exit(contextfulReleaseCell.run({ repo, tag: "v0.5.0", sha,
+        profile, target, releaseId: 7, dryRun: false }).pipe(Effect.provideService(Github, scripted))));
+      yield* TestClock.adjust("3 hours");
+      const exit = yield* Fiber.join(running);
+      expect(calls).toHaveLength(3);
+      expect(Exit.isFailure(exit)).toBe(true);
+      if (Exit.isFailure(exit)) expect(Cause.failureOption(exit.cause)).toMatchObject({
+        _tag: "Some", value: { _tag: "GitHubApiError", reason: "rate-limited" } });
     }).pipe(Effect.provide(layer));
   });
 

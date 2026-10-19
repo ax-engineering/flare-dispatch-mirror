@@ -581,7 +581,10 @@ export const makeGithubLive = (
           return yield* Effect.fail(new GitHubApiError({ status: 404, reason: "other" }));
         }
         const token = yield* mintToken(config, req.repo, req.installationId);
-        return yield* ghCall(() =>
+        // One attempt, outside `ghCall`'s retry: the R2 body is a stream a
+        // resend finds consumed, and a rate limit's wait belongs to the run's
+        // durable sleep. The caller's step retries re-read the artifact.
+        return yield* Effect.tryPromise({ catch: toGitHubApiError, try: () =>
           uploadReleaseAsset({
             token,
             repo: req.repo,
@@ -592,7 +595,7 @@ export const makeGithubLive = (
             size: source.size,
             ...(req.sha256 !== undefined ? { sha256: req.sha256 } : {}),
           }),
-        );
+        });
       }),
     publishContainerImage: (req): Effect.Effect<void, GitHubApiError> =>
       Effect.gen(function* () {

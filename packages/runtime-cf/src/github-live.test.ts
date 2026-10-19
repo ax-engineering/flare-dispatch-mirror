@@ -129,6 +129,30 @@ describe("makeGithubLive — publishReleaseAsset", () => {
     expect(Exit.isFailure(exit)).toBe(true);
     expect(recorded.assets).toHaveLength(0);
   });
+
+  it("surfaces a rate limit with its retry hint after one upload, leaving the wait to the run", async () => {
+    server.use(
+      http.post("https://uploads.github.com/repos/:owner/:repo/releases/:id/assets", async ({ request }) => {
+        recorded.assets.push({
+          name: new URL(request.url).searchParams.get("name"),
+          authorization: request.headers.get("authorization"),
+          bytes: new Uint8Array(await request.arrayBuffer()),
+        });
+        return HttpResponse.json({ message: "secondary rate limit" }, { status: 403, headers: { "retry-after": "700" } });
+      }),
+    );
+    const bucket = {
+      get: async () => ({ size: 3, body: new Blob([new Uint8Array([1, 2, 3])]).stream() }),
+    } as unknown as R2Bucket;
+    const exit = await Effect.runPromiseExit(
+      github
+        .publishReleaseAsset(request)
+        .pipe(Effect.provide(makeGithubLive(CONFIG, bucket, "01EXEC"))),
+    );
+    expect(Exit.isFailure(exit) && exit.cause._tag === "Fail" ? exit.cause.error : undefined)
+      .toMatchObject({ status: 403, reason: "rate-limited", retryAfterMs: 700_000 });
+    expect(recorded.assets).toHaveLength(1);
+  });
 });
 
 const CONFIG: GithubLiveConfig = {
