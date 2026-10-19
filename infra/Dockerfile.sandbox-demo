@@ -69,11 +69,37 @@ RUN if [ "$WITH_BUILD_TOOLS" = "true" ]; then \
       set -eux; \
       export DEBIAN_FRONTEND=noninteractive; \
       apt-get update; \
-      apt-get install -y --no-install-recommends build-essential pkg-config; \
+      apt-get install -y --no-install-recommends build-essential pkg-config xz-utils; \
       rm -rf /var/lib/apt/lists/*; \
       cc --version; \
     else \
       echo "WITH_BUILD_TOOLS=false — no native toolchain baked. Lean image."; \
+    fi
+
+# ── shellcheck (gated by the WITH_BUILD_TOOLS build arg) ────────────────────
+#
+# A run that lints shell scripts finds `shellcheck` on PATH. The release
+# archive for the build architecture is pinned by SHA-256 and only the binary
+# is extracted; `xz-utils` comes from the build-tools layer above.
+ARG SHELLCHECK_VERSION=v0.10.0
+RUN if [ "$WITH_BUILD_TOOLS" = "true" ]; then \
+      set -eux; \
+      arch="$(uname -m)"; \
+      case "$arch" in \
+        x86_64)  sha256=6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87 ;; \
+        aarch64) sha256=324a7e89de8fa2aed0d0c28f3dab59cf84c6d74264022c00c22af665ed1a09bb ;; \
+        *) echo "shellcheck: unsupported architecture $arch" >&2; exit 1 ;; \
+      esac; \
+      archive="/tmp/shellcheck-${SHELLCHECK_VERSION}.linux.${arch}.tar.xz"; \
+      curl -fsSL -o "$archive" \
+        "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.${arch}.tar.xz"; \
+      echo "${sha256}  ${archive}" | sha256sum -c -; \
+      tar -xJf "$archive" --strip-components=1 -C /usr/local/bin \
+        "shellcheck-${SHELLCHECK_VERSION}/shellcheck"; \
+      rm -f "$archive"; \
+      shellcheck --version; \
+    else \
+      echo "WITH_BUILD_TOOLS=false — no shellcheck baked. Lean image."; \
     fi
 
 # ── Rust toolchain (gated by the WITH_RUST build arg) ───────────────────────
