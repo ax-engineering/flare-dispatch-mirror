@@ -57,12 +57,12 @@ const PUBLISH_STAGGER_MS = 15_000;
 /** A cell's admission queue age: two concurrent releases share the release pool. */
 const CELL_QUEUE_SEC = 21600;
 /**
- * Cells in flight at once, half the release pool's `max_instances` (wrangler.jsonc
- * `RunSandboxRelease`). Eight concurrent cross-builds lost two cells' containers
- * within minutes of launch, and one lost cell fails the whole release; four keep
- * the release under the container capacity the gate pools share.
+ * Cells in flight at once: the release pool's `max_instances` (wrangler.jsonc
+ * `RunSandboxRelease`). The container losses #223 saw at eight were deploy
+ * rollouts replacing running release containers; #226's rollout grace keeps a
+ * rollout off a running release container, so the whole pool runs cells.
  */
-export const RELEASE_WINDOW = 4;
+export const RELEASE_WINDOW = 8;
 /**
  * Respawns of a cell the platform lost: its container, its launch, or its
  * admission. Each is a fresh child instance; a build that ran and failed is a

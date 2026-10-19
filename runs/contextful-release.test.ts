@@ -379,7 +379,7 @@ describe("contextful-release", () => {
     }).pipe(Effect.provide(layer));
   });
 
-  it.effect("starts the four longest cells at once and refills each freed slot, polling every 30 s", () => {
+  it.effect("starts every full and edge cell at once and refills each freed slot, polling every 30 s", () => {
     // full x86_64 settles on the second poll; every other long cell on the fourth.
     const { layer, handles, sleeps, provideClock } = releaseFixture((cell, poll) =>
       cell.profile === "contextful-control" ? "success"
@@ -388,13 +388,13 @@ describe("contextful-release", () => {
     return Effect.gen(function* () {
       const result = yield* provideClock(contextfulRelease.run({ repo, tag: "v0.5.0", sha, dryRun: true }));
       expect(result).toMatchObject({ cells: 10, assets: 36 });
-      expect(RELEASE_WINDOW).toBe(4);
+      expect(RELEASE_WINDOW).toBe(8);
       expect(cellsOf(handles)).toEqual(SPAWN_ORDER.map((cell) => `${cell.profile}/${cell.target}`));
       expect(cellsOf(handles).slice(0, 8).some((cell) => cell.startsWith("contextful-control/"))).toBe(false);
       expect(cellsOf(handles).slice(8)).toEqual([
         "contextful-control/x86_64-unknown-linux-musl", "contextful-control/aarch64-unknown-linux-musl"]);
       expect(stepNames(handles).filter((name) => name.startsWith("spawn-cells-")))
-        .toEqual(["spawn-cells-0", "spawn-cells-4", "spawn-cells-5", "spawn-cells-9"]);
+        .toEqual(["spawn-cells-0", "spawn-cells-8", "spawn-cells-9"]);
       expect(handles.childRuns.admissionHandoffs).toBe(1);
       const cellSleeps = sleeps.filter((sleep) => sleep.name.startsWith("await-cells-"));
       expect(cellSleeps.length).toBeGreaterThan(0);
@@ -417,12 +417,10 @@ describe("contextful-release", () => {
       expect(Exit.isFailure(exit)).toBe(true);
       expect(verdictOf(exit)).toEqual([
         "- Failed: `contextful-full/x86_64-unknown-linux-musl`, `contextful-full/aarch64-apple-darwin`",
-        "- Not started: `contextful-edge/x86_64-unknown-linux-musl`, `contextful-edge/aarch64-unknown-linux-musl`, "
-          + "`contextful-edge/x86_64-apple-darwin`, `contextful-edge/aarch64-apple-darwin`, "
-          + "`contextful-control/x86_64-unknown-linux-musl`, `contextful-control/aarch64-unknown-linux-musl`",
+        "- Not started: `contextful-control/x86_64-unknown-linux-musl`, `contextful-control/aarch64-unknown-linux-musl`",
       ]);
-      expect(cellsOf(handles)).toHaveLength(4);
-      expect(cellsOf(handles).every((cell) => cell.startsWith("contextful-full/"))).toBe(true);
+      expect(cellsOf(handles)).toHaveLength(8);
+      expect(cellsOf(handles).some((cell) => cell.startsWith("contextful-control/"))).toBe(false);
       expect(handles.childRuns.spawned.some((child) => child.run === "contextful-release-formula")).toBe(false);
     }).pipe(Effect.provide(layer));
   });
@@ -507,9 +505,7 @@ describe("contextful-release", () => {
       expect(verdictOf(exit)).toEqual([
         "- Failed: `contextful-full/x86_64-unknown-linux-musl`",
         "- Timed out: `contextful-full/aarch64-apple-darwin`",
-        "- Not started: `contextful-edge/x86_64-unknown-linux-musl`, `contextful-edge/aarch64-unknown-linux-musl`, "
-          + "`contextful-edge/x86_64-apple-darwin`, `contextful-edge/aarch64-apple-darwin`, "
-          + "`contextful-control/x86_64-unknown-linux-musl`, `contextful-control/aarch64-unknown-linux-musl`",
+        "- Not started: `contextful-control/x86_64-unknown-linux-musl`, `contextful-control/aarch64-unknown-linux-musl`",
       ]);
     }).pipe(Effect.provide(layer));
   });
