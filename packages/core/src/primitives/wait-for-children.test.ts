@@ -6,7 +6,7 @@ import { IO } from "../services/io";
 import { StepRunner, type StepRunnerService } from "../services/step-runner";
 import { StepFailed } from "../errors";
 import type { RunContext } from "../context";
-import { waitForChildren, waitForChildrenDurably } from "./wait-for-children";
+import { waitForAnyChildDurably, waitForChildren, waitForChildrenDurably } from "./wait-for-children";
 
 /** Run `waitForChildren` against a ChildRuns fake + the (no-op-sleep) IO fake. */
 const run = (
@@ -160,5 +160,60 @@ describe("waitForChildrenDurably", () => {
     expect(Exit.isFailure(exit)).toBe(true);
     if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("ChildWaitTimeout");
     expect(f.handles.childRuns.polls).toBe(1);
+  });
+});
+
+describe("waitForAnyChildDurably", () => {
+  const fixture = (poll: (ids: readonly string[], clock: { now: number }) => readonly ChildStatusRecord[]) => {
+    const clock = { now: 0 };
+    const sleeps: number[] = [];
+    const { layer, handles } = makeCFRuntimeTest({ childRuns: { pollFn: (ids) => poll(ids, clock) } });
+    const program = (expiresAt = 100) => Effect.gen(function* () {
+      const ordinary = yield* StepRunner;
+      const io = yield* IO;
+      const runner: StepRunnerService = {
+        ...ordinary,
+        sleep: (_name, ms) => Effect.sync(() => { sleeps.push(ms); clock.now += ms; }),
+      };
+      return yield* waitForAnyChildDurably({ name: "slot", ids: ["a", "b", "c"], expiresAt, pollEvery: 40 }).pipe(
+        Effect.provideService(StepRunner, runner), Effect.provideService(IO, { ...io, now: Effect.sync(() => clock.now) }),
+      );
+    }).pipe(Effect.provide(layer));
+    return { clock, sleeps, handles, program };
+  };
+
+  it("returns as soon as one child settles, with every record in input order", async () => {
+    const f = fixture((ids, clock) => ids.map((executionId) => ({
+      executionId, status: executionId === "b" && clock.now >= 40 ? "failure" : "running",
+    })));
+    const result = await Effect.runPromise(f.program());
+    expect(result.map((record) => [record.executionId, record.status])).toEqual([
+      ["a", "running"], ["b", "failure"], ["c", "running"],
+    ]);
+    expect(f.sleeps).toEqual([40]);
+  });
+
+  it("fails ChildWaitTimeout at the caller's deadline when nothing settles", async () => {
+    const f = fixture((ids) => ids.map((executionId) => ({ executionId, status: "running" })));
+    const exit = await Effect.runPromiseExit(f.program(100));
+    expect(Exit.isFailure(exit)).toBe(true);
+    if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("ChildWaitTimeout");
+    expect(f.sleeps).toEqual([40, 40, 20]);
+  });
+
+  it("bounds its polls when the clock never advances", async () => {
+    const { layer, handles } = makeCFRuntimeTest({
+      childRuns: { pollFn: (ids) => ids.map((executionId) => ({ executionId, status: "running" })) },
+    });
+    const exit = await Effect.runPromiseExit(Effect.gen(function* () {
+      const ordinary = yield* StepRunner;
+      const io = yield* IO;
+      return yield* waitForAnyChildDurably({ name: "slot", ids: ["a"], expiresAt: 200, pollEvery: 100 }).pipe(
+        Effect.provideService(StepRunner, { ...ordinary, sleep: () => Effect.void }),
+        Effect.provideService(IO, { ...io, now: Effect.succeed(0) }),
+      );
+    }).pipe(Effect.provide(layer)));
+    expect(Exit.isFailure(exit)).toBe(true);
+    expect(handles.childRuns.polls).toBe(3);
   });
 });

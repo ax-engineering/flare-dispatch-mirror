@@ -36,7 +36,7 @@ export {
 } from "./prebuilt-binary";
 export { sharded, type Shard } from "./sharded";
 export { fanOut, type FanOutShard } from "./fan-out";
-export { waitForChildren, waitForChildrenDurably } from "./wait-for-children";
+export { waitForAnyChildDurably, waitForChildren, waitForChildrenDurably } from "./wait-for-children";
 export { bootApp } from "./boot-app";
 export { probeHttp, type ProbeResult } from "./probe-http";
 export { loadSecrets } from "./load-secrets";

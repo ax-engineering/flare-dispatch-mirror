@@ -1,6 +1,6 @@
 import { Effect } from "effect";
 import { describe, expect, it } from "vitest";
-import { openCheckRun } from "./check-run-open";
+import { openCheckRun, persistCheckRunId } from "./check-run-open";
 
 /** A durable step store that memoizes results by name, as an engine replay does. */
 const memoizingStepDo = () => {
@@ -15,6 +15,22 @@ const memoizingStepDo = () => {
 };
 
 describe("openCheckRun", () => {
+  it("concludes an opened check when cancellation wins before id persistence", async () => {
+    let status = "running";
+    const events: string[] = [];
+    const id = await Effect.runPromise(openCheckRun(memoizingStepDo(), Effect.sync(() => {
+      status = "cancelled";
+      return "check-raced";
+    })));
+    const active = await Effect.runPromise(persistCheckRunId(id, {
+      persist: (id) => Effect.sync(() => { events.push(`persist:${id}`); }),
+      status: Effect.sync(() => status),
+      cancel: (id) => Effect.sync(() => { events.push(`cancel:${id}`); }),
+    }));
+    expect(active).toBe(false);
+    expect(events).toEqual(["persist:check-raced", "cancel:check-raced"]);
+  });
+
   it("posts one check-run per execution across replays", async () => {
     const stepDo = memoizingStepDo();
     let creates = 0;

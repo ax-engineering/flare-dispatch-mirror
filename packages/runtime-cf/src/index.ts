@@ -80,6 +80,12 @@ export {
   type SerialObservation,
   type SerialDecision,
 } from "./serial-queue-d1";
+export {
+  makeRunSupersedeD1,
+  TERMINAL_EXECUTION_STATUSES,
+  type RunSupersedeStore,
+  type SupersededRow,
+} from "./run-supersede-d1";
 export { makeStepRunnerCloudflare } from "./step-runner-cf";
 export {
   isEngineGone,

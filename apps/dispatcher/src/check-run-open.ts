@@ -16,3 +16,18 @@ export const openCheckRun = (
   stepDo: StepDo,
   create: Effect.Effect<string>,
 ): Effect.Effect<string> => stepDo("open-check-run", () => Effect.runPromise(create));
+
+/** Publish the id before reconciling a cancellation that raced check creation. */
+export const persistCheckRunId = (
+  checkRunId: string,
+  ports: {
+    readonly persist: (id: string) => Effect.Effect<void>;
+    readonly status: Effect.Effect<string | undefined, Error>;
+    readonly cancel: (id: string) => Effect.Effect<void>;
+  },
+): Effect.Effect<boolean, Error> => Effect.gen(function* () {
+  yield* ports.persist(checkRunId);
+  if ((yield* ports.status) !== "cancelled") return true;
+  yield* ports.cancel(checkRunId);
+  return false;
+});

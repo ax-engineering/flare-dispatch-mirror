@@ -14,7 +14,7 @@ import { installCached, TOOLS } from "./install-cached";
 import { probeHttp } from "./probe-http";
 import { sharded } from "./sharded";
 import { makeCFRuntimeTest } from "../testing";
-import { workspace } from "./workspace";
+import { ensureWorkspace, workspace } from "./workspace";
 
 describe("workspace", () => {
   it("a keyed acquire is a DIFFERENT container; an unkeyed one is always the same", async () => {
@@ -37,6 +37,19 @@ describe("workspace", () => {
     expect(handles.sandbox.acquired.map((x) => x.key)).toEqual([undefined, undefined, "features"]);
   });
 
+
+  it("rebuilds a keyed workspace in its own container, never the execution's", async () => {
+    const { layer, handles } = makeCFRuntimeTest({ sandboxProgram: { "test -d": { stdout: "", exitCode: 1 } } });
+
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const current = yield* workspace({ repo: "owner/myrepo", sha: "base", key: "base" });
+        return yield* ensureWorkspace({ current, repo: "owner/myrepo", sha: "base", key: "base" });
+      }).pipe(Effect.provide(layer)),
+    );
+
+    expect(handles.sandbox.acquired.map((x) => x.key)).toEqual(["base", "base"]);
+  });
 
   it("acquires a container, clones the repo, returns { container, dir }", async () => {
     const { layer, handles } = makeCFRuntimeTest();

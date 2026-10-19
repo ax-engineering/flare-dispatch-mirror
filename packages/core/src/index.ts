@@ -20,6 +20,7 @@ export {
   type HumanGateSpec,
   type SandboxImage,
   type SerializeSpec,
+  type SupersedeSpec,
   type TriggerSpec,
   type ScheduleSpec,
   type ScheduleContext,

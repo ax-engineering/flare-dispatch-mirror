@@ -90,7 +90,7 @@ export interface ExecutionsService {
     retryOf?: string;
   }) => Effect.Effect<void>;
 
-  /** Mark an `executions` row terminal. */
+  /** Claim a running execution's terminal status. False when cancellation or another finish won. */
   readonly finishExecution: (opts: {
     id: string;
     completedAt: number;
@@ -103,7 +103,7 @@ export interface ExecutionsService {
      * the column stays NULL.
      */
     summaryJson?: string;
-  }) => Effect.Effect<void>;
+  }) => Effect.Effect<boolean>;
 
   /** Record a `steps` row at step entry. */
   readonly startStep: (opts: {

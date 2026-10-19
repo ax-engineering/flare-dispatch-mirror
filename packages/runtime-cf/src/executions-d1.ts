@@ -128,13 +128,13 @@ export const makeD1ExecutionsLive = (
       ),
 
     finishExecution: ({ id, completedAt, status, summaryJson }) =>
-      run("finishExecution", () =>
-        summaryJson === undefined
+      Effect.tryPromise({
+        try: () => (summaryJson === undefined
           ? db
               .prepare(
                 `UPDATE executions
                    SET status = ?, completed_at = ?
-                 WHERE id = ?`,
+                 WHERE id = ? AND status = 'running'`,
               )
               .bind(status, completedAt, id)
               .run()
@@ -142,11 +142,12 @@ export const makeD1ExecutionsLive = (
               .prepare(
                 `UPDATE executions
                    SET status = ?, completed_at = ?, summary_json = ?
-                 WHERE id = ?`,
+                 WHERE id = ? AND status = 'running'`,
               )
               .bind(status, completedAt, summaryJson, id)
-              .run(),
-      ),
+              .run()).then((result) => result.meta.changes > 0),
+        catch: (cause) => new Error("D1ExecutionsLive: finishExecution failed", { cause }),
+      }).pipe(Effect.retry(WRITE_RETRY), Effect.orDie),
 
     startStep: ({ executionId, name, startedAt }) =>
       run("startStep", () =>

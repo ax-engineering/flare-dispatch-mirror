@@ -181,6 +181,15 @@ export type RunSpec<I, O, IEnc, OEnc> = {
    * `SerializeSpec`.
    */
   readonly serialize?: (input: I) => SerializeSpec | undefined;
+  /**
+   * Cancels older executions that share a group: a newer execution of the
+   * group terminates every older live one — queued or running — together with
+   * its children, releases their admission slots, and concludes their check
+   * runs `cancelled`; an older one that registers after a newer one cancels
+   * itself. A re-run (an execution carrying `retryOf`) joins the group and
+   * cancels nothing. See `SupersedeSpec`.
+   */
+  readonly supersede?: (input: I) => SupersedeSpec | undefined;
   readonly run: (input: I) => Effect.Effect<O, RunError, RunContext>;
 };
 
@@ -205,6 +214,22 @@ export type SerializeSpec = {
    * order alone decides.
    */
   readonly current?: Effect.Effect<string | undefined, never, RunContext>;
+};
+
+/**
+ * The supersession group one execution joins. `undefined` from `supersede`
+ * opts that execution out.
+ */
+export type SupersedeSpec = {
+  /** Executions with equal `group` strings: only the newest stays live. */
+  readonly group: string;
+  /**
+   * The member's revision rank — larger is newer — such as the pull request's
+   * `updated_at` in ms. A member registering below a live member's rank cancels
+   * itself instead of the higher one. Omitted, the rank is the registration
+   * time; every member of one group supplies a rank or none does.
+   */
+  readonly order?: number;
 };
 
 /**

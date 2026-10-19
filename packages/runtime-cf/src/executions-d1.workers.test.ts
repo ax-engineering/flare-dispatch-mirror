@@ -9,6 +9,7 @@ import { Effect } from "effect";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Executions } from "@fractalboxdev/flare-dispatch-core";
 import { type ExecutionContext, makeD1ExecutionsLive } from "./executions-d1";
+import { makeRunSupersedeD1 } from "./run-supersede-d1";
 import { countRows, makeTestBindings, type TestBindings } from "./test-support-workers";
 
 const EXECUTION_ID = "01TEST00000000000000000001";
@@ -70,6 +71,24 @@ describe("D1ExecutionsLive", () => {
       completed_at: 2000,
     });
     expect(JSON.parse(String(row?.input_json))).toEqual({ command: "pnpm test" });
+  });
+
+  it("does not overwrite cancellation with a late run verdict", async () => {
+    const executions = await Effect.runPromise(Executions.pipe(Effect.provide(makeD1ExecutionsLive(bindings.db, CTX))));
+    const supersessions = makeRunSupersedeD1(bindings.db, () => 1_500);
+    await Effect.runPromise(executions.startExecution({ id: EXECUTION_ID, run: "offload-test", startedAt: 1_000 }));
+    await Effect.runPromise(supersessions.markCancelled(EXECUTION_ID));
+    expect(await Effect.runPromise(executions.finishExecution({ id: EXECUTION_ID, completedAt: 2_000, status: "success" }))).toBe(false);
+    expect(await Effect.runPromise(supersessions.status(EXECUTION_ID))).toBe("cancelled");
+  });
+
+  it("keeps a finished verdict when cancellation arrives later", async () => {
+    const executions = await Effect.runPromise(Executions.pipe(Effect.provide(makeD1ExecutionsLive(bindings.db, CTX))));
+    const supersessions = makeRunSupersedeD1(bindings.db, () => 2_000);
+    await Effect.runPromise(executions.startExecution({ id: EXECUTION_ID, run: "offload-test", startedAt: 1_000 }));
+    expect(await Effect.runPromise(executions.finishExecution({ id: EXECUTION_ID, completedAt: 1_500, status: "success" }))).toBe(true);
+    await Effect.runPromise(supersessions.markCancelled(EXECUTION_ID));
+    expect(await Effect.runPromise(supersessions.status(EXECUTION_ID))).toBe("success");
   });
 
   it("records parent_execution_id lineage for a spawned child, NULL for a top-level row", async () => {

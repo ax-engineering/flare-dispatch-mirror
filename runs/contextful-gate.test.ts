@@ -4,12 +4,24 @@ import { describe, expect } from "vitest";
 import { makeCFRuntimeTest } from "@fractalboxdev/flare-dispatch-core/testing";
 import { IO, StepFailed, StepRunner, type StepRunnerService } from "@fractalboxdev/flare-dispatch-core";
 import { check } from "./check";
-import { contextfulGate, mergeStages, parseStages, stageCommand } from "./contextful-gate";
+import {
+  contextfulGate,
+  mergeStages,
+  NOT_AFFECTED_SUMMARY,
+  parseAffected,
+  parseStages,
+  parseWindow,
+  planStages,
+  stageCommand,
+  WINDOW_DEFAULT,
+  WINDOW_MAX,
+} from "./contextful-gate";
 
 const SHA = "a".repeat(40);
 const BASE_SHA = "b".repeat(40);
 const DISCOVER = "cargo run --locked -q -p contextful-ci -- stages --parts";
 const DISCOVER_HEAD = `${DISCOVER} --base ${BASE_SHA}`;
+const DISCOVER_AFFECTED = `${DISCOVER_HEAD} --affected`;
 const input = { repo: "fractalboxdev/contextful", sha: SHA, baseSha: BASE_SHA } as const;
 
 describe("contextful-gate", () => {
@@ -52,7 +64,7 @@ describe("contextful-gate", () => {
           sleep: (duration) => Effect.sync(() => { now += Duration.toMillis(Duration.decode(duration as Duration.DurationInput)); }),
         }),
       );
-      expect(result).toEqual({ stages: 1, failed: [] });
+      expect(result).toEqual({ stages: 1, failed: [], notAffected: [] });
       expect(now).toBeGreaterThan(600_000);
       expect(sleeps.length).toBeGreaterThan(0);
       expect(callbacks.every((call) => call.elapsed <= call.timeout)).toBe(true);
@@ -106,7 +118,7 @@ describe("contextful-gate", () => {
       childRuns: { pollFn: (ids) => ids.map((executionId) => ({ executionId, status: "success" })) },
     });
     return Effect.gen(function* () {
-      expect(yield* contextfulGate.run(input)).toEqual({ stages: 6, failed: [] });
+      expect(yield* contextfulGate.run(input)).toEqual({ stages: 6, failed: [], notAffected: [] });
       expect(handles.childRuns.spawned.map((spawn) => spawn.input)).toEqual([
         "pins", "test-first.validate", "test-first.contextful-core", "test-first.contextful-cli", "test-first.deleted-package", "formal",
       ].map((checkLabel) => expect.objectContaining({ checkLabel })));
@@ -120,7 +132,7 @@ describe("contextful-gate", () => {
       childRuns: { pollFn: (ids) => ids.map((executionId) => ({ executionId, status: "success" })) },
     });
     return Effect.gen(function* () {
-      expect(yield* contextfulGate.run(input)).toEqual({ stages: 1, failed: [] });
+      expect(yield* contextfulGate.run(input)).toEqual({ stages: 1, failed: [], notAffected: [] });
       const [part] = handles.childRuns.spawned.map((spawn) => spawn.input as { timeoutSec: number });
       expect(part?.timeoutSec).toBe(2700);
       expect(check.limits.maxDurationSec).toBeGreaterThan(part!.timeoutSec);
@@ -133,7 +145,7 @@ describe("contextful-gate", () => {
       childRuns: { pollFn: (ids) => ids.map((executionId) => ({ executionId, status: "success" })) },
     });
     return Effect.gen(function* () {
-      expect(yield* contextfulGate.run(input)).toEqual({ stages: 2, failed: [] });
+      expect(yield* contextfulGate.run(input)).toEqual({ stages: 2, failed: [], notAffected: [] });
       expect(handles.childRuns.spawned.map((spawn) => spawn.input)).toEqual(["pins", "test-first.validate"].map((checkLabel) => expect.objectContaining({ checkLabel })));
     }).pipe(Effect.provide(layer));
   });
@@ -151,7 +163,7 @@ describe("contextful-gate", () => {
       childRuns: { pollFn: (ids) => ids.map((executionId) => ({ executionId, status: "success" })) },
     });
     return Effect.gen(function* () {
-      expect(yield* contextfulGate.run(input)).toEqual({ stages: 3, failed: [] });
+      expect(yield* contextfulGate.run(input)).toEqual({ stages: 3, failed: [], notAffected: [] });
       expect(handles.childRuns.spawned.map((spawn) => spawn.input)).toEqual(["pins", "test-first.validate", "test-first"].map((checkLabel) => expect.objectContaining({ checkLabel })));
       expect(handles.sandbox.execs.filter((exec) => exec.command.includes("stages --parts")).map((exec) => exec.command)).toEqual([DISCOVER_HEAD, DISCOVER, DISCOVER]);
     }).pipe(Effect.provide(layer));
@@ -185,7 +197,7 @@ describe("contextful-gate", () => {
       },
     };
     expect(trigger?.gate?.({ payload } as never)).toBe(true);
-    expect(trigger?.inputs({ payload } as never)).toEqual(input);
+    expect(trigger?.inputs({ payload } as never)).toEqual({ ...input, pr: 42 });
     const event = { payload } as never;
     expect(trigger?.idempotencyKey?.(event)).toBe(`contextful-gate:42:${SHA}:${BASE_SHA}`);
     expect(
@@ -214,8 +226,11 @@ describe("contextful-gate", () => {
     ).toBe(false);
   });
 
-  it.effect("spawns at most two stages per wave and reports every stage", () => {
+  it.effect("starts the next part as soon as any running part settles", () => {
+    // pins (check:0) settles on the first poll; workspace.compile (check:1)
+    // stays running until formal (check:2) has started in pins' freed slot.
     const { layer, handles } = makeCFRuntimeTest({
+      config: { "contextful-gate.window:fractalboxdev/contextful": "2" },
       sandboxProgram: {
         [DISCOVER_HEAD]: {
           stdout: "pins\nworkspace.compile\nformal\ntest-first.contextful-core\n",
@@ -224,46 +239,35 @@ describe("contextful-gate", () => {
         [DISCOVER]: { stdout: "pins\nworkspace.compile\nformal\n", exitCode: 0 },
       },
       childRuns: {
-        pollFn: (ids) => ids.map((executionId) => ({ executionId, status: "success" })),
+        pollFn: (ids) => ids.map((executionId) => ({
+          executionId,
+          status: executionId === "check:1" && !ids.includes("check:2") ? "running" : "success",
+        })),
       },
     });
     return Effect.gen(function* () {
       const output = yield* contextfulGate.run(input);
-      expect(output).toEqual({ stages: 4, failed: [] });
-      expect(handles.childRuns.spawned.map((spawn) => spawn.input)).toEqual([
-        expect.objectContaining({
-          checkLabel: "pins",
-          command: expect.stringContaining(`--stage pins --base ${BASE_SHA}`),
-        }),
-        expect.objectContaining({
-          checkLabel: "workspace.compile",
-          command: expect.stringContaining(`--stage workspace.compile --base ${BASE_SHA}`),
-        }),
-        expect.objectContaining({
-          checkLabel: "formal",
-          command: expect.stringContaining(`--stage formal --base ${BASE_SHA}`),
-        }),
-        expect.objectContaining({
-          checkLabel: "test-first.contextful-core",
-          command: expect.stringContaining(`--stage test-first.contextful-core --base ${BASE_SHA}`),
-        }),
-      ]);
-      expect(handles.executions.steps.map((entry) => entry.name)).toEqual([
-        "checkout",
-        "discover-stages",
+      expect(output).toEqual({ stages: 4, failed: [], notAffected: [] });
+      expect(handles.childRuns.spawned.map((spawn) => spawn.input)).toEqual(
+        ["pins", "workspace.compile", "formal", "test-first.contextful-core"].map((stage) =>
+          expect.objectContaining({
+            checkLabel: stage,
+            command: expect.stringContaining(`--stage ${stage} --base ${BASE_SHA}`),
+          }),
+        ),
+      );
+      expect(handles.executions.steps.map((entry) => entry.name).filter((name) => !name.startsWith("checkout") && !name.startsWith("discover") && name !== "release-discovery-container")).toEqual([
         "prebuild-ci-binary",
-        "checkout-base",
-        "discover-base-stages",
-        "release-discovery-container",
-        "spawn-stages-0",
+        "resolve-window",
+        "spawn-parts-0",
         "handoff-admission",
-        "await-stages-0-deadline",
-        "await-stages-0-poll-0",
-        "spawn-stages-2",
-        "await-stages-2-deadline",
-        "await-stages-2-poll-0",
+        "await-parts-0-poll-0",
+        "spawn-parts-2",
+        "await-parts-1-poll-0",
+        "spawn-parts-3",
+        "await-parts-2-poll-0",
       ]);
-      expect(handles.sandbox.destroyed).toHaveLength(1);
+      expect(handles.sandbox.destroyed).toEqual(["fake-container"]);
       expect(handles.childRuns.admissionHandoffs).toBe(1);
     }).pipe(Effect.provide(layer));
   });
@@ -292,7 +296,7 @@ describe("contextful-gate", () => {
     it.effect("builds the tool once and runs every part through it, with the registry cache", () => {
       const { layer, handles } = gate(keyed);
       return Effect.gen(function* () {
-        expect(yield* contextfulGate.run(input)).toEqual({ stages: 2, failed: [] });
+        expect(yield* contextfulGate.run(input)).toEqual({ stages: 2, failed: [], notAffected: [] });
         const builds = handles.sandbox.execs.filter((exec) => exec.command.includes("cargo build"));
         expect(builds).toHaveLength(1);
         const restore = [{ key: `contextful-ci-${DIGEST}`, base: "/tmp/flare-dispatch-prebuilt/contextful-ci", paths: ["bin"] }];
@@ -312,7 +316,7 @@ describe("contextful-gate", () => {
     it.effect("keeps every part on cargo run when the tool cannot be built", () => {
       const { layer, handles } = gate({ ...keyed, "cargo build": { exitCode: 101 } });
       return Effect.gen(function* () {
-        expect(yield* contextfulGate.run(input)).toEqual({ stages: 2, failed: [] });
+        expect(yield* contextfulGate.run(input)).toEqual({ stages: 2, failed: [], notAffected: [] });
         for (const spawn of handles.childRuns.spawned) {
           const part = spawn.input as { checkLabel: string; command: string; install: boolean; restore?: unknown };
           expect(part.command).toBe(`${CARGO_RUN} gate --predecessors --stage ${part.checkLabel} --base ${BASE_SHA}`);
@@ -341,6 +345,264 @@ describe("contextful-gate", () => {
     it("names the cargo run command when no binary was stored", () => {
       expect(stageCommand("pins", BASE_SHA, null)).toBe(`${CARGO_RUN} gate --predecessors --stage pins --base ${BASE_SHA}`);
     });
+  });
+
+  it.effect("keeps ten parts in flight by default", () => {
+    const stages = Array.from({ length: 12 }, (_, i) => `part${i}`).join("\n");
+    const { layer, handles } = makeCFRuntimeTest({
+      sandboxProgram: { [DISCOVER_HEAD]: { stdout: stages, exitCode: 0 }, [DISCOVER]: { stdout: stages, exitCode: 0 } },
+      childRuns: { pollFn: (ids) => ids.map((executionId) => ({ executionId, status: "success" })) },
+    });
+    return Effect.gen(function* () {
+      expect(yield* contextfulGate.run(input)).toEqual({ stages: 12, failed: [], notAffected: [] });
+      const spawns = handles.executions.steps.map((entry) => entry.name).filter((name) => name.startsWith("spawn-parts-"));
+      expect(spawns).toEqual(["spawn-parts-0", "spawn-parts-10"]);
+      expect(WINDOW_DEFAULT).toBe(10);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it("clamps the configured window below the default admission cap", () => {
+    expect(parseWindow(undefined)).toBe(WINDOW_DEFAULT);
+    expect(parseWindow("")).toBe(WINDOW_DEFAULT);
+    expect(parseWindow("abc")).toBe(WINDOW_DEFAULT);
+    expect(parseWindow("0")).toBe(WINDOW_DEFAULT);
+    expect(parseWindow("2.5")).toBe(WINDOW_DEFAULT);
+    expect(parseWindow(" 4 ")).toBe(4);
+    expect(parseWindow("40")).toBe(WINDOW_MAX);
+    expect(WINDOW_MAX).toBeLessThan(16);
+  });
+
+  it.effect("discovers head then base in its one container and destroys it before handing off its slot", () => {
+    const { layer, handles } = makeCFRuntimeTest({
+      sandboxProgram: {
+        [DISCOVER_AFFECTED]: { stdout: "pins\n", exitCode: 0 },
+        [DISCOVER_HEAD]: { stdout: "pins\n", exitCode: 0 },
+        [DISCOVER]: { stdout: "pins\n", exitCode: 0 },
+      },
+      childRuns: { pollFn: (ids) => ids.map((executionId) => ({ executionId, status: "success" })) },
+    });
+    return Effect.gen(function* () {
+      expect(yield* contextfulGate.run(input)).toEqual({ stages: 1, failed: [], notAffected: [] });
+      // No second container: every acquisition is the execution's own.
+      expect(handles.sandbox.acquired.every((acquire) => acquire.key === undefined)).toBe(true);
+      expect(handles.sandbox.clones).toEqual([{ repo: input.repo, sha: SHA }]);
+      // The base runs in the head's checkout, after the head is fully discovered
+      // and its contextful-ci keyed for the prebuilt binary.
+      const setup = /^(test|sha256sum|pnpm) /;
+      expect(handles.sandbox.execs.map((exec) => exec.command).filter((command) => !setup.test(command))).toEqual([
+        DISCOVER_HEAD,
+        expect.stringMatching(/^cargo tree --locked -p contextful-ci /),
+        `git -c advice.detachedHead=false checkout --quiet --force --detach ${BASE_SHA}`,
+        DISCOVER,
+      ]);
+      const steps = handles.executions.steps.map((entry) => entry.name);
+      expect(handles.sandbox.destroyed).toEqual(["fake-container"]);
+      expect(steps.indexOf("release-discovery-container")).toBeLessThan(steps.indexOf("handoff-admission"));
+      expect(steps.indexOf("release-discovery-container")).toBeLessThan(steps.indexOf("spawn-parts-0"));
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("clones the base on its own when the head checkout cannot reach it", () => {
+    const { layer, handles } = makeCFRuntimeTest({
+      sandboxProgram: {
+        [`--detach ${BASE_SHA}`]: { stdout: "", stderr: "fatal: reference is not a tree", exitCode: 128 },
+        [DISCOVER_HEAD]: { stdout: "pins\n", exitCode: 0 },
+        [DISCOVER]: { stdout: "pins\n", exitCode: 0 },
+      },
+      childRuns: { pollFn: (ids) => ids.map((executionId) => ({ executionId, status: "success" })) },
+    });
+    return Effect.gen(function* () {
+      expect(yield* contextfulGate.run(input)).toEqual({ stages: 1, failed: [], notAffected: [] });
+      expect(handles.sandbox.clones).toEqual([
+        { repo: input.repo, sha: SHA },
+        { repo: input.repo, sha: BASE_SHA },
+      ]);
+      expect(handles.sandbox.acquired.every((acquire) => acquire.key === undefined)).toBe(true);
+      expect(handles.sandbox.destroyed).toEqual(["fake-container"]);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("finishes from a pre-window checkpoint whose spawn steps returned bare handle arrays", () => {
+    // A gate in flight across the deploy replays its old `spawn-stages-<offset>`
+    // and `await-stages-<offset>` checkpoints; none of them is read again.
+    const { layer, handles } = makeCFRuntimeTest({
+      sandboxProgram: { [DISCOVER_HEAD]: { stdout: "pins\nformal\n", exitCode: 0 }, [DISCOVER]: { stdout: "pins\nformal\n", exitCode: 0 } },
+      childRuns: { pollFn: (ids) => ids.map((executionId) => ({ executionId, status: "success" })) },
+    });
+    return Effect.gen(function* () {
+      const ordinary = yield* StepRunner;
+      const replayed: string[] = [];
+      const runner: StepRunnerService = {
+        ...ordinary,
+        run: (name, body, opts) =>
+          /^(spawn|await)-stages-/.test(name)
+            ? Effect.sync(() => { replayed.push(name); return [{ executionId: "old" }] as never; })
+            : ordinary.run(name, body, opts),
+      };
+      expect(yield* contextfulGate.run(input).pipe(Effect.provideService(StepRunner, runner))).toEqual({ stages: 2, failed: [], notAffected: [] });
+      expect(replayed).toEqual([]);
+      expect(handles.childRuns.spawned).toHaveLength(2);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("never opens synthetic checks for a head-selected subset", () => {
+    const { layer, handles } = makeCFRuntimeTest({
+      sandboxProgram: {
+        [DISCOVER_AFFECTED]: { stdout: "pins\n", exitCode: 0 },
+        [DISCOVER_HEAD]: { stdout: "pins\nworkspace.compile\nformal\n", exitCode: 0 },
+        [DISCOVER]: { stdout: "pins\nworkspace.compile\nformal\n", exitCode: 0 },
+      },
+      childRuns: { pollFn: (ids) => ids.map((executionId) => ({ executionId, status: "success" })) },
+    });
+    return Effect.gen(function* () {
+      const ordinary = yield* StepRunner;
+      const failedOnce = new Set<string>();
+      // The engine re-runs a step whose body failed: the first attempt of each
+      // conclusion runs its body, then fails as a transient GitHub error would.
+      const runner: StepRunnerService = {
+        ...ordinary,
+        run: (name, body, opts) =>
+          /^(conclude-not-affected-|report-not-affected$)/.test(name) && !failedOnce.has(name)
+            ? Effect.gen(function* () {
+                failedOnce.add(name);
+                yield* Effect.exit(body());
+                return yield* ordinary.run(name, body, opts);
+              })
+            : ordinary.run(name, body, opts),
+      };
+      expect(yield* contextfulGate.run(input).pipe(Effect.provideService(StepRunner, runner))).toEqual({
+        stages: 3, failed: [], notAffected: [],
+      });
+      expect(failedOnce.size).toBe(0);
+      expect(handles.checks.creates).toEqual([]);
+      expect(handles.childRuns.spawned).toHaveLength(3);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it("dispatches every required part even if the head claims only one is affected", () => {
+    const head = ["pins", "workspace.compile", "formal"];
+    const base = ["pins", "workspace.compile", "legacy"];
+    expect(planStages(head, base, { headDiscoveredAgainstBase: true }, ["pins"])).toEqual({
+      required: ["pins", "workspace.compile", "formal", "legacy"],
+      dispatch: ["pins", "workspace.compile", "formal", "legacy"],
+      notAffected: [],
+    });
+    expect(planStages(head, base, { headDiscoveredAgainstBase: true }, undefined)).toEqual({
+      required: ["pins", "workspace.compile", "formal", "legacy"],
+      dispatch: ["pins", "workspace.compile", "formal", "legacy"],
+      notAffected: [],
+    });
+    expect(planStages(head, base, { headDiscoveredAgainstBase: true }, []).dispatch).toEqual([
+      "pins", "workspace.compile", "formal", "legacy",
+    ]);
+  });
+
+  it("accepts an empty affected list and refuses parts outside the required set", () => {
+    const required = ["pins", "formal"];
+    expect(parseAffected("", required)).toEqual([]);
+    expect(parseAffected("\n", required)).toEqual([]);
+    expect(parseAffected("formal\n", required)).toEqual(["formal"]);
+    expect(parseAffected("budget.full\n", required)).toBeUndefined();
+    expect(parseAffected("pins\npins\n", required)).toBeUndefined();
+    expect(parseAffected(" ".repeat(4097), required)).toBeUndefined();
+  });
+
+  it.effect("dispatches all required parts despite a head-selected subset", () => {
+    const { layer, handles } = makeCFRuntimeTest({
+      sandboxProgram: {
+        [DISCOVER_AFFECTED]: { stdout: "pins\n", exitCode: 0 },
+        [DISCOVER_HEAD]: { stdout: "pins\nworkspace.compile\nformal\n", exitCode: 0 },
+        [DISCOVER]: { stdout: "pins\nworkspace.compile\nlegacy\n", exitCode: 0 },
+      },
+      childRuns: { pollFn: (ids) => ids.map((executionId) => ({ executionId, status: "success" })) },
+    });
+    return Effect.gen(function* () {
+      expect(yield* contextfulGate.run(input)).toEqual({
+        stages: 4, failed: [], notAffected: [],
+      });
+      expect(handles.childRuns.spawned.map((spawn) => (spawn.input as { checkLabel: string }).checkLabel)).toEqual([
+        "pins", "workspace.compile", "formal", "legacy",
+      ]);
+      expect(handles.checks.creates).toEqual([]);
+      expect(NOT_AFFECTED_SUMMARY).toBe("not affected by this change");
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("runs every head part when untrusted discovery reports an empty affected set", () => {
+    const { layer, handles } = makeCFRuntimeTest({
+      sandboxProgram: {
+        [DISCOVER_AFFECTED]: { stdout: "", exitCode: 0 },
+        [DISCOVER_HEAD]: { stdout: "pins\nformal\n", exitCode: 0 },
+        [DISCOVER]: { stdout: "pins\nformal\n", exitCode: 0 },
+      },
+      childRuns: { pollFn: (ids) => ids.map((executionId) => ({ executionId, status: "success" })) },
+    });
+    return Effect.gen(function* () {
+      expect(yield* contextfulGate.run(input)).toEqual({ stages: 2, failed: [], notAffected: [] });
+      expect(handles.childRuns.spawned).toHaveLength(2);
+      expect(handles.checks.updates).toEqual([]);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("dispatches every part when the consumer rejects or garbles --affected", () => {
+    return Effect.gen(function* () {
+      for (const affected of [
+        { stdout: "", stderr: "error: unexpected argument '--affected' found\nUsage: contextful-ci stages --parts", exitCode: 2 },
+        { stdout: "", exitCode: 1 },
+        { stdout: "budget.full\n", exitCode: 0 },
+      ]) {
+        const { layer, handles } = makeCFRuntimeTest({
+          sandboxProgram: {
+            [DISCOVER_AFFECTED]: affected,
+            [DISCOVER_HEAD]: { stdout: "pins\nformal\n", exitCode: 0 },
+            [DISCOVER]: { stdout: "pins\nformal\n", exitCode: 0 },
+          },
+          childRuns: { pollFn: (ids) => ids.map((executionId) => ({ executionId, status: "success" })) },
+        });
+        expect(yield* contextfulGate.run(input).pipe(Effect.provide(layer))).toEqual({ stages: 2, failed: [], notAffected: [] });
+        expect(handles.childRuns.spawned).toHaveLength(2);
+        expect(handles.checks.creates).toHaveLength(0);
+      }
+    });
+  });
+
+  it.effect("never asks an older head without --base for its affected parts", () => {
+    const { layer, handles } = makeCFRuntimeTest({
+      sandboxProgram: {
+        [DISCOVER_HEAD]: { stdout: "", stderr: "error: unexpected argument '--base' found\nUsage: contextful-ci stages --parts", exitCode: 2 },
+        [DISCOVER]: { stdout: "pins\n", exitCode: 0 },
+      },
+      childRuns: { pollFn: (ids) => ids.map((executionId) => ({ executionId, status: "success" })) },
+    });
+    return Effect.gen(function* () {
+      yield* contextfulGate.run(input);
+      expect(handles.sandbox.execs.some((exec) => exec.command.includes("--affected"))).toBe(false);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it("joins one supersession group per pull request", () => {
+    expect(contextfulGate.supersede?.({ ...input, pr: 42 })).toEqual({ group: "contextful-gate:fractalboxdev/contextful#42" });
+    expect(contextfulGate.supersede?.(input)).toBeUndefined();
+  });
+
+  it("ranks a gate within its group by the pull request's revision time, not by arrival", () => {
+    const trigger = contextfulGate.triggers?.[0];
+    const payloadAt = (updatedAt: string | undefined) => ({
+      payload: {
+        repository: { full_name: input.repo },
+        pull_request: {
+          number: 42,
+          ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}),
+          head: { sha: SHA, repo: { full_name: input.repo } },
+          base: { sha: BASE_SHA },
+        },
+      },
+    }) as never;
+    const earlier = trigger?.inputs(payloadAt("2026-10-19T10:00:00Z")) as typeof input & { revisedAt?: number };
+    const later = trigger?.inputs(payloadAt("2026-10-19T10:00:05Z")) as typeof input & { revisedAt?: number };
+    expect(earlier?.revisedAt).toBe(Date.parse("2026-10-19T10:00:00Z"));
+    expect(contextfulGate.supersede?.(later!)?.order).toBeGreaterThan(contextfulGate.supersede?.(earlier!)?.order ?? Infinity);
+    expect(trigger?.inputs(payloadAt("not a time"))).toEqual({ ...input, pr: 42 });
   });
 
   it.effect("fails its own check when discovery fails", () => {
@@ -373,7 +635,7 @@ describe("contextful-gate", () => {
     });
     return Effect.gen(function* () {
       const output = yield* contextfulGate.run(input);
-      expect(output).toEqual({ stages: 1, failed: [] });
+      expect(output).toEqual({ stages: 1, failed: [], notAffected: [] });
       expect(
         handles.sandbox.execs
           .map((exec) => exec.command)

@@ -46,13 +46,15 @@ export const makeExecutionsFake = (): {
     finishExecution: ({ id, completedAt, status }) =>
       Effect.sync(() => {
         const idx = state.executions.findIndex((e) => e.id === id);
-        if (idx >= 0) {
+        if (idx >= 0 && state.executions[idx]?.status === undefined) {
           state.executions[idx] = {
             ...state.executions[idx]!,
             completedAt,
             status,
           };
+          return true;
         }
+        return false;
       }),
 
     startStep: ({ executionId, name, startedAt, metadata }) =>

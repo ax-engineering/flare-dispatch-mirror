@@ -45,8 +45,9 @@
 //       specs/pm/plan.md § PR4 + § PR6.
 
 import { checkConclusion } from "./terminal-verdict";
-import { openCheckRun } from "./check-run-open";
+import { openCheckRun, persistCheckRunId } from "./check-run-open";
 import { concludeOpenChildCheckRuns, readChildCheckRuns } from "./child-check-runs";
+import { cancelSupersededTree, enterSupersession, withSupersessionRelease } from "./supersede";
 import { WorkflowEntrypoint } from "cloudflare:workers";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import { getSandbox } from "@cloudflare/sandbox";
@@ -79,6 +80,7 @@ import {
   makeCFRuntimeLive,
   makeContainerLeaseD1,
   makeRunAdmissionD1,
+  makeRunSupersedeD1,
   makeSerialQueueD1,
   makeWritebackTokenMinter,
   previewSafeSandboxId,
@@ -697,16 +699,84 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
           },
         }),
       );
-      // Persist the GitHub check-run id onto the `executions` row.
-      // D1 write for check_run_id — best-effort metadata, retry once on
-      // transient errors then die (the execution and check-run are already
-      // complete; losing the check_run_id on the D1 row is a minor loss).
-      yield* Effect.tryPromise(() =>
-        db
-          .prepare(`UPDATE executions SET check_run_id = ? WHERE id = ?`)
-          .bind(checkRunId, payload.executionId)
-          .run(),
-      ).pipe(Effect.retry(Schedule.once.pipe(Schedule.addDelay(() => "500 millis"))), Effect.orDie);
+      const supersessions = makeRunSupersedeD1(db);
+      // The canceller waits for this id before terminating the Workflow.
+      // If cancellation won during creation, the opener concludes the check.
+      const active = yield* persistCheckRunId(checkRunId, {
+        persist: (id) => Effect.tryPromise(() =>
+          db.prepare(`UPDATE executions SET check_run_id = ? WHERE id = ?`)
+            .bind(id, payload.executionId).run(),
+        ).pipe(Effect.retry(Schedule.once.pipe(Schedule.addDelay(() => "500 millis"))), Effect.asVoid, Effect.orDie),
+        status: supersessions.status(payload.executionId),
+        cancel: (id) => checks.update({
+          repo: payload.github.repo,
+          checkRunId: id,
+          conclusion: "cancelled",
+          output: { title: checkRunTitle, summary: "⊘ Cancelled — execution was superseded." },
+        }),
+      });
+      if (!active) return;
+
+      // --- Supersession (children of a cancelled parent; runs that declare `supersede`) ---
+      //
+      // Before it queues for a slot, a child of a cancelled parent ends itself
+      // `cancelled`, a member below a live higher-ranked one ends itself, and a
+      // higher-ranked member cancels every lower one with its children — so
+      // the slots those held are free when it asks for one (supersede.ts).
+      const supersedeSpec = run.supersede?.(input);
+      const entered = yield* enterSupersession(
+        {
+          executionId: payload.executionId,
+          ...(payload.parentExecutionId !== undefined
+            ? { parentExecutionId: payload.parentExecutionId }
+            : {}),
+          ...(payload.retryOf !== undefined ? { retryOf: payload.retryOf } : {}),
+          spec: supersedeSpec,
+        },
+        {
+          stepDo,
+          store: supersessions,
+          cancelTree: (olderId) =>
+            cancelSupersededTree(olderId, payload.executionId, {
+              store: supersessions,
+              terminate: async (id) => {
+                const instance = await env.RUNS_WORKFLOW.get(id);
+                const { status } = await instance.status();
+                if (status !== "complete" && status !== "errored" && status !== "terminated") {
+                  await instance.terminate();
+                }
+              },
+              destroySandbox: (row) => {
+                const rowRun = lookupRun(row.run);
+                const substrate =
+                  env.SUBSTRATE_BACKEND === "on" && runsOnFacade(row.run)
+                    ? env.SUBSTRATE
+                    : undefined;
+                return substrate !== undefined
+                  ? substrate.abort(row.id).then(() => undefined)
+                  : getSandbox(
+                      selectSandboxNs(rowRun?.sandboxImage, {
+                        lean: env.RUNS_SANDBOX,
+                        browser: env.RUNS_SANDBOX_BROWSER,
+                        agent: env.RUNS_SANDBOX_AGENT,
+                        release: env.RUNS_SANDBOX_RELEASE,
+                      }),
+                      previewSafeSandboxId(row.id),
+                    ).destroy();
+              },
+              checks,
+            }),
+          concludeCancelled: (summary) =>
+            checks.update({
+              repo: payload.github.repo,
+              checkRunId,
+              conclusion: "cancelled",
+              ...(checkDetailsUrl !== undefined ? { detailsUrl: checkDetailsUrl } : {}),
+              output: { title: checkRunTitle, summary },
+            }),
+        },
+      );
+      if (entered === "stood-down") return;
 
       // --- Global run admission (the per-pool semaphore, issue #109) -------
       //
@@ -1036,7 +1106,13 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
                 ),
               );
             });
-      const exit = yield* Effect.exit(gated);
+      const exit = yield* Effect.exit(
+        withSupersessionRelease(gated, {
+          joined: supersedeSpec !== undefined,
+          release: supersessions.release(payload.executionId).pipe(Effect.ignore),
+          lost: engine.lost,
+        }),
+      );
       // The engine lost this instance mid-step and replays it from its last
       // checkpoint: nothing this invocation writes is the run's verdict, so it
       // writes nothing and ends here (core's engine-interruption.ts). The
@@ -1122,6 +1198,11 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
           ...(summaryJson !== undefined ? { summaryJson } : {}),
         }),
       );
+      if (Exit.isSuccess(recorded) && !recorded.value) {
+        // A replay after a prior finish may still need to publish its verdict.
+        // A superseding cancellation, however, owns the check-run from here.
+        if ((yield* supersessions.status(payload.executionId)) !== status) return;
+      }
       const unrecorded = Exit.isFailure(recorded);
       if (unrecorded) {
         yield* Effect.logError(

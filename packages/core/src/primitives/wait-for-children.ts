@@ -72,6 +72,59 @@ export const waitForChildrenDurably = (opts: {
 });
 
 /**
+ * Short status checkpoints and durable sleeps until at least one child in `ids`
+ * settles. Resolves to every record in input order — terminal and pending alike
+ * — so a sliding-window caller frees exactly the slots that settled.
+ *
+ * `expiresAt` is an absolute epoch-ms deadline the caller computes from its own
+ * checkpointed clock reads (a window's earliest per-child budget), so a resumed
+ * wait keeps the deadline it started with. Fails `ChildWaitTimeout` naming the
+ * still-pending ids once it passes with nothing settled. The poll count is
+ * bounded by `(expiresAt - first observation) / pollEvery`, never by a clock
+ * that may not advance.
+ */
+export const waitForAnyChildDurably = (opts: {
+  readonly name: string;
+  readonly ids: readonly string[];
+  readonly expiresAt: number;
+  readonly pollEvery?: Duration.DurationInput;
+}) => Effect.gen(function* () {
+  if (opts.ids.length === 0) return [] as readonly ChildStatusRecord[];
+  const pollMs = Math.max(1, Duration.toMillis(Duration.decode(opts.pollEvery ?? "1 minute")));
+  const children = yield* ChildRuns;
+  const runner = yield* StepRunner;
+  let firstObservedAt: number | undefined;
+  let attempts = 1;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const observed = yield* step(`${opts.name}-poll-${attempt}`, () => Effect.gen(function* () {
+      const before = yield* io.now;
+      const records = before > opts.expiresAt ? [] : yield* children.poll({ ids: opts.ids });
+      return { records, observedAt: yield* io.now };
+    }), { timeoutSec: 60 });
+    if (firstObservedAt === undefined) {
+      firstObservedAt = observed.observedAt;
+      attempts = Math.max(1, Math.ceil(Math.max(0, opts.expiresAt - firstObservedAt) / pollMs) + 1);
+    }
+    const ordered = opts.ids.map((id) => observed.records.find((record) => record.executionId === id)
+      ?? { executionId: id, status: "missing" as const });
+    if (observed.observedAt <= opts.expiresAt && ordered.some((record) => isTerminalChildStatus(record.status))) {
+      return ordered;
+    }
+    if (observed.observedAt >= opts.expiresAt || attempt === attempts - 1) {
+      return yield* Effect.fail(new ChildWaitTimeout({
+        pending: [...opts.ids],
+        waitedMs: Math.max(0, observed.observedAt - firstObservedAt),
+      }));
+    }
+    const delay = Math.min(pollMs, opts.expiresAt - observed.observedAt);
+    yield* runner.sleep !== undefined
+      ? runner.sleep(`${opts.name}-sleep-${attempt}`, delay)
+      : io.sleep(Duration.millis(delay));
+  }
+  return yield* Effect.fail(new ChildWaitTimeout({ pending: [...opts.ids], waitedMs: 0 }));
+});
+
+/**
  * Wait until every child in `ids` reaches a terminal status, returning their
  * status records (input order). Fails `ChildWaitTimeout` if the overall ceiling
  * elapses with children still pending.

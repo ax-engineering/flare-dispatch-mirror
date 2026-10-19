@@ -70,7 +70,12 @@ a gate timeout included — completes the check-run it opened.
 ```mermaid
 flowchart TB
   accTitle: One execution inside RunWorkflow
-  open["**check-run opens**<br/>in_progress"] --> ser{"run declares<br/>serialize?"}
+  open["**check-run opens**<br/>in_progress"] --> sup{"run declares<br/>supersede?"}
+  sup -->|yes| rank{"higher-ranked<br/>member live?"}
+  rank -->|yes| stood["**stand down**<br/>cancelled"]
+  rank -->|no| cancel["**supersede**<br/>cancel lower-ranked members"]
+  sup -->|no| ser{"run declares<br/>serialize?"}
+  cancel --> ser
   ser -->|yes| serial["**serial gate**<br/>one execution per group"]
   ser -->|no| adm
   serial --> adm["**admission**<br/>per-pool slot, FIFO"]

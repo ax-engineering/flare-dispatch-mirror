@@ -112,5 +112,7 @@ export const ensureWorkspace = (opts: {
       ...(opts.install !== undefined ? { install: opts.install } : {}),
       ...(opts.installEnv !== undefined ? { installEnv: opts.installEnv } : {}),
       ...(opts.redactValues !== undefined ? { redactValues: opts.redactValues } : {}),
+      // A keyed workspace rebuilds in its own container, never the execution's.
+      ...(opts.key !== undefined ? { key: opts.key } : {}),
     });
   });

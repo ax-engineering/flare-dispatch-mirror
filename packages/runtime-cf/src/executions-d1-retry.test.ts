@@ -18,7 +18,7 @@ const flakyDb = (failures: number) => {
     run: async () => {
       calls++;
       if (calls <= failures) throw new Error("D1_ERROR: Network connection lost.");
-      return { success: true, meta: {}, results: [] };
+      return { success: true, meta: { changes: 1 }, results: [] };
     },
   };
   return {
