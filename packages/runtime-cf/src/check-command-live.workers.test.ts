@@ -106,6 +106,81 @@ describe("durable command bounded log publication", () => {
     },
   );
 
+  it.each(["running", "exited"] as const)(
+    "an unreadable spool during a %s observation keeps the log offset for the next read",
+    async (state) => {
+      const advanced: unknown[] = [];
+      const owner: CheckCommandOwner = {
+        async prepare(candidate) { return candidate; },
+        async start() {},
+        async observe() {
+          return state === "running" ? { state } : { state, exitCode: 0, durationMs: 27 };
+        },
+        async read() {
+          throw new Error("check command spool unavailable (exit 137: Killed)");
+        },
+        async logs() {
+          return { stdoutOffset: 0, stderrOffset: 0, stdoutTail: "", stderrTail: "", chunks: [] };
+        },
+        async advanceLogs(_h, _expected, next) {
+          advanced.push(next);
+        },
+        async receipt() {
+          return undefined;
+        },
+        async finish() {
+          throw new Error("no finish during observation");
+        },
+      };
+      const service = makeCheckCommandService(
+        "spool-unavailable",
+        "box",
+        () => owner,
+        env.CHECK_COMMAND_LOGS,
+        async () => {},
+        (text) => text,
+      );
+      const opts = { command: "cargo test", timeoutSec: 1800, redactValues: [] };
+      const handle = await Effect.runPromise(service.prepare({ ...opts, stepName: "exec" }));
+      expect((await Effect.runPromise(service.observe(handle, opts))).state).toBe(state);
+      expect(advanced).toEqual([]);
+    },
+  );
+
+  it("a failure other than the spool still fails the observation", async () => {
+    const owner: CheckCommandOwner = {
+      async prepare(candidate) { return candidate; },
+      async start() {},
+      async observe() {
+        return { state: "running" };
+      },
+      async read() {
+        throw new Error("check command log exceeds bounded chunk count");
+      },
+      async logs() {
+        return { stdoutOffset: 0, stderrOffset: 0, stdoutTail: "", stderrTail: "", chunks: [] };
+      },
+      async advanceLogs() {},
+      async receipt() {
+        return undefined;
+      },
+      async finish() {
+        throw new Error("no finish during observation");
+      },
+    };
+    const service = makeCheckCommandService(
+      "other-failure",
+      "box",
+      () => owner,
+      env.CHECK_COMMAND_LOGS,
+      async () => {},
+      (text) => text,
+    );
+    const opts = { command: "cargo test", timeoutSec: 1800, redactValues: [] };
+    const handle = await Effect.runPromise(service.prepare({ ...opts, stepName: "exec" }));
+    await expect(Effect.runPromise(service.observe(handle, opts))).rejects.toThrow("bounded chunk");
+  });
+
   it("an explicit empty policy permits no-secret commands and cached receipt reuse", async () => {
     let starts = 0;
     const receipt = {

@@ -30,8 +30,19 @@ export interface CheckCommandBox {
   exec(
     command: string,
     options: { timeout: number },
-  ): Promise<{ exitCode: number; stdout: string }>;
+  ): Promise<{ exitCode: number; stdout: string; stderr?: string }>;
 }
+/**
+ * Prefix of every spool-read failure. A spool read is a short `node -e` inside a
+ * container the check itself may saturate, so its failure is the container's
+ * state, never the check's verdict.
+ */
+export const SPOOL_UNAVAILABLE = "check command spool unavailable";
+export const isSpoolUnavailable = (error: unknown): boolean =>
+  error instanceof Error && error.message.startsWith(SPOOL_UNAVAILABLE);
+/** Per-attempt exec ceilings: a loaded container starts `node` slowly. Worst case 63 s per read. */
+const SPOOL_READ_TIMEOUTS_MS = [10_000, 20_000, 30_000] as const;
+const SPOOL_READ_PAUSE_MS = 1_000;
 const Terminal = Schema.Struct({
   exitCode: Schema.NullOr(Schema.Number),
   signal: Schema.optional(Schema.NullOr(Schema.String)),
@@ -113,6 +124,7 @@ export function makeCheckCommandOwner(
   storage: CheckCommandStorage,
   box: CheckCommandBox,
   now = Date.now,
+  pause: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 ): CheckCommandOwner {
   const key = (h: CheckCommandHandle) => `check-command:${h.id}`;
   const load = async (raw: CheckCommandHandle) => {
@@ -142,9 +154,19 @@ export function makeCheckCommandOwner(
     }
   };
   const execJson = async (script: string): Promise<unknown> => {
-    const result = await box.exec(`node -e ${quote(script)}`, { timeout: 10000 });
-    if (result.exitCode !== 0) throw new Error("check command spool unavailable");
-    return JSON.parse(result.stdout);
+    let reason = "";
+    for (const [attempt, timeout] of SPOOL_READ_TIMEOUTS_MS.entries()) {
+      if (attempt > 0) await pause(SPOOL_READ_PAUSE_MS * attempt);
+      try {
+        const result = await box.exec(`node -e ${quote(script)}`, { timeout });
+        if (result.exitCode === 0) return JSON.parse(result.stdout);
+        const stderr = (result.stderr ?? "").trim().slice(-200);
+        reason = `exit ${result.exitCode}${stderr === "" ? "" : `: ${stderr}`}`;
+      } catch (error) {
+        reason = (error instanceof Error ? error.message : String(error)).slice(-200);
+      }
+    }
+    throw new Error(`${SPOOL_UNAVAILABLE} (${reason})`);
   };
   return {
     async prepare(candidate) {
@@ -223,11 +245,18 @@ export function makeCheckCommandOwner(
         return { state: now() >= h.deadline + 1500 ? "timeout" : "running" };
       // A process that ended without publishing — its supervisor killed with
       // the container — leaves no record, and no exit status to report.
-      const terminal = Schema.decodeUnknownSync(Schema.NullOr(Terminal))(
-        await execJson(
+      // A spool that stays unreadable across every attempt leaves no exit status
+      // to report — the same loss as a supervisor that never published.
+      let spool: unknown;
+      try {
+        spool = await execJson(
           `const fs=require('node:fs'),p=${JSON.stringify(path(h) + "/terminal.json")};process.stdout.write(fs.existsSync(p)?fs.readFileSync(p,'utf8'):'null')`,
-        ),
-      );
+        );
+      } catch (error) {
+        if (isSpoolUnavailable(error)) return { state: "missing" };
+        throw error;
+      }
+      const terminal = Schema.decodeUnknownSync(Schema.NullOr(Terminal))(spool);
       if (terminal === null) return { state: "missing" };
       if (terminal.logExceeded)
         throw new Error("check command output exceeds bounded spool; no verdict published");

@@ -10,7 +10,7 @@ import {
   type CheckCommandOpts,
   type ExecResult,
 } from "@fractalboxdev/flare-dispatch-core";
-import { commandFingerprint } from "./check-command";
+import { commandFingerprint, isSpoolUnavailable } from "./check-command";
 import { scrubLogPrefix } from "./check-command-log";
 import { checkChunkLogFile, checkHandleId, checkLogFile } from "./log-names";
 import { redactLongestFirst as redact } from "./sandbox-output";
@@ -141,7 +141,13 @@ export function makeCheckCommandService(
         try: async () => {
           await validate(handle, opts);
           const status = await ownerFor(handle.container).observe(handle);
-          await capture(handle, opts, status.state !== "running");
+          try {
+            await capture(handle, opts, status.state !== "running");
+          } catch (error) {
+            // Log progress is durable at its offset: the next observation or
+            // finalization reads on from it. Only the process state is a verdict.
+            if (!isSpoolUnavailable(error)) throw error;
+          }
           return status;
         },
         catch: failed(opts),
