@@ -223,7 +223,9 @@ jobs:
             echo "::error title=overlay missing::Set the WRANGLER_OVERLAY_B64 secret to the base64 of this deploy's wrangler.jsonc." >&2
             exit 1
           fi
+          cp wrangler.jsonc "$RUNNER_TEMP/wrangler.template.jsonc"
           printf '%s' "$WRANGLER_OVERLAY_B64" | base64 -d > wrangler.jsonc
+          node infra/overlay-limits.mjs "$RUNNER_TEMP/wrangler.template.jsonc" wrangler.jsonc
         env:
           WRANGLER_OVERLAY_B64: ${{ secrets.WRANGLER_OVERLAY_B64 }}
 

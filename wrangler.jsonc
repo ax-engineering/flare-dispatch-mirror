@@ -18,6 +18,14 @@
   "observability": { "enabled": true },
   "keep_vars": true,
 
+  // A Workflow instance's subrequests accumulate across its steps. A release
+  // cell polls a multi-hour cross-build across dozens of steps, each spending
+  // sandbox, R2 and D1 calls, so the Workers Paid default of 10,000 per
+  // instance ends a long build at its publish steps. 10,000,000 is the Workers
+  // Paid ceiling. The deploy merges this block into the operator overlay
+  // (infra/overlay-limits.mjs), so an overlay need not restate it.
+  "limits": { "subrequests": 10000000 },
+
   // Wall-clock dispatch. Each expression must match a registered run's
   // `schedules[].cron` EXACTLY — `schedulesByCron` (apps/dispatcher/src/registry.ts)
   // matches on the literal string, so a cosmetic difference silently fires
