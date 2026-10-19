@@ -1,6 +1,7 @@
 import { it } from "@effect/vitest";
-import { Effect, Exit } from "effect";
+import { Cause, Effect, Exit, Fiber, TestClock } from "effect";
 import { describe, expect } from "vitest";
+import { Sandbox, type CheckCommandService } from "@fractalboxdev/flare-dispatch-core";
 import { makeCFRuntimeTest } from "@fractalboxdev/flare-dispatch-core/testing";
 import { contextfulRelease, contextfulReleaseCell } from "./contextful-release";
 
@@ -34,11 +35,115 @@ describe("contextful-release", () => {
         profile, target, releaseId: 0, dryRun: true });
       expect(result.assets).toEqual([`${stem}.tar.gz`, `${stem}.tar.gz.sha256`, `${stem}.cdx.json`]);
       expect(result.imageLayer).toBeUndefined();
-      expect(handles.sandbox.execs[0]?.command).toContain("release --builder zigbuild");
+      expect(handles.sandbox.execs.map((exec) => exec.command)).toEqual(
+        expect.arrayContaining([expect.stringContaining("release --builder zigbuild")]));
       expect(handles.artifact.uploads).toHaveLength(3);
-      const buildStep = handles.executions.steps.find((entry) => entry.name === "build-and-upload");
-      expect(buildStep?.metadata?.["stepOpts.timeoutSec"]).toBe(14460);
-      expect(buildStep?.metadata?.["stepOpts.retries"]).toBe(0);
+      expect(handles.executions.steps.some((entry) => entry.name.startsWith("publish-"))).toBe(false);
+    }).pipe(Effect.provide(layer));
+  });
+
+  const cellFixture = () => {
+    const profile = "contextful-control";
+    const target = "aarch64-unknown-linux-musl";
+    const name = `contextful-control-0.5.0-${target}`;
+    const manifest = JSON.stringify({ profile, target, archive: `${name}.tar.gz`,
+      sha256: "a".repeat(64), sbom: `${name}.cdx.json` });
+    return { profile, target, name, runtime: makeCFRuntimeTest({
+      sandboxProgram: { "sha256sum": { exitCode: 0, stdout: `${"a".repeat(64)}  asset\n` } },
+      sandboxFiles: { [`/workspace/contextful/dist/${name}.release.json`]: manifest,
+        [`/workspace/contextful/dist/${name}.tar.gz.sha256`]: `${"a".repeat(64)}  ${name}.tar.gz\n` },
+    }) };
+  };
+  /** A durable owner whose build runs for `polls` observations, then exits 0. */
+  const durableBuild = (polls: number, calls: string[]): CheckCommandService => ({
+    prepare: (opts) => Effect.sync(() => {
+      calls.push(`prepare:${opts.stepName}`);
+      expect(opts.timeoutSec).toBe(14400);
+      return { id: opts.stepName, container: opts.container!, fingerprint: "f", startedAt: 0, deadline: 14400000 };
+    }),
+    start: (h) => Effect.sync(() => void calls.push(`start:${h.id}`)),
+    observe: (h) => Effect.sync(() => {
+      calls.push(`observe:${h.id}`);
+      return calls.filter((c) => c === `observe:${h.id}`).length < polls
+        ? { state: "running" as const }
+        : { state: "exited" as const, exitCode: 0, durationMs: 1 };
+    }),
+    finalize: (h) => Effect.sync(() => {
+      calls.push(`finalize:${h.id}`);
+      return { exitCode: 0, durationMs: 1, logPath: "logs/build.ndjson", stdout: "", stderr: "" };
+    }),
+  });
+
+  it.effect("a multi-hour build is a polled sandbox process: no step waits on the build, and assets publish one step each", () => {
+    const { profile, target, name, runtime: { layer, handles } } = cellFixture();
+    const calls: string[] = [];
+    return Effect.gen(function* () {
+      const original = yield* Sandbox;
+      const running = yield* Effect.fork(contextfulReleaseCell.run({ repo, tag: "v0.5.0", sha,
+        profile, target, releaseId: 7, dryRun: false })
+        .pipe(Effect.provideService(Sandbox, { ...original, checkCommand: durableBuild(40, calls) })));
+      yield* TestClock.adjust("1 hour");
+      const result = yield* Fiber.join(running);
+      expect(result.assets).toHaveLength(3);
+      expect(handles.sandbox.execs.map((exec) => exec.command).join("\n")).not.toContain("zigbuild");
+      expect(calls.filter((c) => c.startsWith("observe:"))).toHaveLength(40);
+      const names = handles.executions.steps.map((entry) => entry.name);
+      expect(names).toEqual(expect.arrayContaining(["checkout", "build-workspace", "build-prepare",
+        "build-start", "build-observe-39", "build-finalize", "collect",
+        `publish-${name}.tar.gz`, `publish-${name}.tar.gz.sha256`, `publish-${name}.cdx.json`]));
+      const longest = Math.max(...handles.executions.steps.map((entry) =>
+        Number(entry.metadata?.["stepOpts.timeoutSec"] ?? 0)));
+      expect(longest).toBeLessThanOrEqual(1800);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("collect retries a transient upload or read, and a lost build always fits one relaunch", () => {
+    const { profile, target, runtime: { layer, handles } } = cellFixture();
+    return Effect.gen(function* () {
+      yield* contextfulReleaseCell.run({ repo, tag: "v0.5.0", sha, profile, target, releaseId: 0, dryRun: true });
+      const collect = handles.executions.steps.find((entry) => entry.name === "collect");
+      expect(collect?.metadata?.["stepOpts.retryOn"]).toEqual(
+        expect.arrayContaining(["ExecFailed", "StepFailed", "ArtifactUploadFailed"]));
+      expect(contextfulReleaseCell.limits.maxDurationSec).toBeGreaterThanOrEqual(2 * 14400);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("a manifest read that fails is a retryable StepFailed, not a defect", () => {
+    const profile = "contextful-control";
+    const target = "aarch64-unknown-linux-musl";
+    const { layer } = makeCFRuntimeTest();
+    return Effect.gen(function* () {
+      const exit = yield* Effect.exit(contextfulReleaseCell.run({ repo, tag: "v0.5.0", sha,
+        profile, target, releaseId: 0, dryRun: true }));
+      expect(Exit.isFailure(exit)).toBe(true);
+      if (Exit.isFailure(exit)) expect(Cause.failureOption(exit.cause)).toMatchObject({
+        _tag: "Some", value: { _tag: "StepFailed", step: "collect" } });
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("outputs lost with a recycled container after the build rebuild before staging", () => {
+    const { profile, target, runtime: { layer, handles } } = cellFixture();
+    const calls: string[] = [];
+    let probes = 0;
+    return Effect.gen(function* () {
+      const original = yield* Sandbox;
+      // Probe 1 is the build's workspace check; probes 2 and 3 see the
+      // recycled container from `collect` and the rebuild's workspace check.
+      const recycled = { ...original, checkCommand: durableBuild(1, calls),
+        exec: (opts: Parameters<typeof original.exec>[0]) => {
+          const command = typeof opts.command === "string" ? opts.command : opts.command.join(" ");
+          if (command.startsWith("test -d") && ++probes >= 2 && probes <= 3) {
+            return Effect.succeed({ exitCode: 1, durationMs: 1, logPath: "logs/probe", stdout: "", stderr: "" });
+          }
+          return original.exec(opts);
+        } };
+      const result = yield* contextfulReleaseCell.run({ repo, tag: "v0.5.0", sha,
+        profile, target, releaseId: 0, dryRun: true }).pipe(Effect.provideService(Sandbox, recycled));
+      expect(result.assets).toHaveLength(3);
+      expect(calls.filter((c) => c.startsWith("prepare:"))).toEqual(["prepare:build", "prepare:build-rebuild-1"]);
+      expect(handles.sandbox.clones).toHaveLength(2);
+      expect(handles.executions.steps.map((entry) => entry.name)).toEqual(
+        expect.arrayContaining(["collect", "build-rebuild-1-finalize", "collect-rebuild-1"]));
     }).pipe(Effect.provide(layer));
   });
 

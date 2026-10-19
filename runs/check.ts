@@ -53,13 +53,10 @@ import {
   config,
   defineRun,
   io,
-  sandbox,
-  Sandbox,
-  checkpointSleep,
-  SandboxProcessLost,
   step,
 } from "@fractalboxdev/flare-dispatch-core";
 import {
+  durableExec,
   ensureWorkspace,
   loadSecrets,
   workspace,
@@ -158,47 +155,6 @@ type CheckI = Schema.Schema.Type<typeof CheckInput>;
 
 /** Default `exec` timeout — lint is usually fast; install + slow tools get headroom via `timeoutSec`. */
 const DEFAULT_TIMEOUT_SEC = 600;
-
-/**
- * Headroom added to the `exec` timeout to derive the Workflow STEP timeout, so
- * `sandbox.exec`'s own deadline fires first (a clean `ExecTimeout` with the
- * log streamed so far) instead of the platform hard-killing the step at the
- * same instant. Unclamped, same reasoning as offload-test's constant.
- */
-const STEP_TIMEOUT_HEADROOM_SEC = 120;
-
-/**
- * Platform-failure retries — see the `exec` step. A verdict is never retried:
- * a command that runs and exits non-zero is a normal `ExecResult`, so no class
- * here can reach one.
- *
- * `StepFailed` is included because a platform kill leaves no Effect `Cause` to
- * read a tag from, and the runner falls back to that name — so listing only
- * `ExecFailed` left the purely-platform failure as the one thing not retried.
- *
- * `CheckoutFailed` is included because `ensureWorkspace` re-clones inside this
- * step, in the same weather that destroyed the checkout. A transient clone
- * failure there would end the step non-retryably, one call short of the
- * recovery it was invoked to perform.
- */
-const PLATFORM_RETRIES = 3;
-const RETRY_ON = ["ExecFailed", "StepFailed", "CheckoutFailed"] as const;
-
-/**
- * Relaunches after the sandbox loses a long check's process. A container
- * recycled under a saturated pool takes its process table with it, and the
- * fresh container answers "not found"; that loss is the platform's, so the
- * command runs again rather than reporting a verdict it never produced. A
- * command killed by a signal still publishes its exit and is never relaunched.
- */
-const LOST_PROCESS_RELAUNCHES = 2;
-
-/**
- * Step ceiling for one launch or observation of a long check. Either call can
- * be the one that wakes a recycled container, and a cold start in a saturated
- * pool outlasts a minute; the poll loop's count, not this ceiling, bounds it.
- */
-const CONTAINER_CALL_STEP_TIMEOUT_SEC = 300;
 
 /** CONFIG_KV key — strictly per-repo (see header: no global fallback). */
 const commandKey = (repo: string): string => `check.command:${repo}`;
@@ -377,139 +333,38 @@ export const check = defineRun({
 
       // exec — run the check command. A non-zero exit is a normal ExecResult
       // here; the failOnNonZeroExit branch below decides whether it reds the
-      // check. `result` is the checkpointed step output — replay restores it
-      // identically, which is why `durationMs` is read from it.
-      // The STEP timeout derives from the exec's plus headroom — see the same
-      // note in `offload-test`. Two timeouts that must agree are one timeout
-      // with a bug in it: leave the step's unset and its 600s default silently
-      // wins over a configured `check.timeoutSec`, surfacing as
-      // `WorkflowTimeoutError` from a limit the repo's config never mentions.
-      // A red check is not a transient — but a PLATFORM failure is, and the two
-      // are different channels here. A command that runs and exits non-zero
-      // comes back as a normal `ExecResult` and is decided below; only
-      // `ExecFailed` / `ExecTimeout` fail the Effect. So `retryOn: ExecFailed`
-      // cannot retry a returned verdict. A lost synchronous response leaves
-      // the command outcome uncertain; long checks recover a durable intent.
-      //
-      // Which is not hypothetical. Observed on a consumer's PR: a 40-second
-      // check reported `ExecFailed: exec failed (exit -1): HTTP error! status:
-      // 500` — the container, not the code — and reported it as the repo's
-      // verdict. `retries: 0` made a platform hiccup indistinguishable from a
-      // lint error, on the run whose whole job is to be believed.
-      //
-      // `ExecTimeout` is deliberately NOT retryable: a command that outran its
-      // ceiling will outrun it again, and three more attempts cost the ceiling
-      // three more times.
-      const effectiveTimeoutSec = timeoutSec ?? DEFAULT_TIMEOUT_SEC;
-      const service = yield* Sandbox;
-      const durable = service.checkCommand;
-      const result =
-        durable !== undefined && effectiveTimeoutSec > DEFAULT_TIMEOUT_SEC
-          ? yield* Effect.gen(function* () {
-              let ws: { container: typeof container; dir: string } = { container, dir };
-              for (let launch = 0; launch <= LOST_PROCESS_RELAUNCHES; launch++) {
-                // The first launch keeps the step names an in-flight instance
-                // already checkpointed; each relaunch gets its own names and,
-                // through `stepName`, its own process identity.
-                const name = launch === 0 ? "exec" : `exec-relaunch-${launch}`;
-                if (launch > 0) {
-                  // A supervisor that died may leave its command's process group
-                  // running, so the relaunch starts from a destroyed container
-                  // and the workspace step re-clones onto its empty disk.
-                  const lost = ws.container;
-                  yield* step(`${name}-destroy`, () => sandbox.destroy({ container: lost }));
-                }
-                const current = ws;
-                ws = yield* step(`${name}-workspace`, () =>
-                  ensureWorkspace({
-                    current,
-                    repo: input.repo,
-                    sha: input.sha,
-                    ...(input.image !== undefined ? { image: input.image } : {}),
-                    install: input.install,
-                  }),
-                );
-                const opts = {
-                  cwd: ws.dir,
-                  container: ws.container,
-                  command,
-                  env: { ...secretEnv, ...input.env },
-                  redactValues: Object.values(secretEnv),
-                  timeoutSec: effectiveTimeoutSec,
-                };
-                const handle = yield* step(`${name}-prepare`, () =>
-                  durable.prepare({ ...opts, stepName: name }),
-                );
-                // Only the owner intent can authorize launch; retries recover this handle.
-                yield* step(`${name}-start`, () => durable.start(handle, opts), {
-                  timeoutSec: CONTAINER_CALL_STEP_TIMEOUT_SEC,
-                  retries: PLATFORM_RETRIES,
-                  retryOn: RETRY_ON,
-                });
-                const maxPolls = Math.ceil(effectiveTimeoutSec / 5) + 3;
-                let state: string = "running";
-                for (let i = 0; i < maxPolls; i++) {
-                  const status = yield* step(
-                    `${name}-observe-${i}`,
-                    () => durable.observe(handle, opts),
-                    {
-                      timeoutSec: CONTAINER_CALL_STEP_TIMEOUT_SEC,
-                      retries: PLATFORM_RETRIES,
-                      retryOn: RETRY_ON,
-                    },
-                  );
-                  state = status.state;
-                  if (state !== "running") break;
-                  yield* checkpointSleep(`${name}-sleep-${i}`, 5000);
-                }
-                // `missing`: the sandbox holds no process and no terminal record
-                // for this launch, so no exit status exists to report.
-                if (state === "missing") continue;
-                return yield* step(`${name}-finalize`, () => durable.finalize(handle, opts), {
-                  timeoutSec: 120,
-                  retries: PLATFORM_RETRIES,
-                  retryOn: RETRY_ON,
-                });
-              }
-              return yield* Effect.fail(
-                new SandboxProcessLost({ launches: LOST_PROCESS_RELAUNCHES + 1 }),
-              );
-            })
-          : yield* step(
-              "exec",
-              () =>
-                // The checkout is re-established INSIDE the retryable step, because a
-                // container recycled between steps takes it with it and the retry
-                // would otherwise re-run the command in a directory that is gone —
-                // three times, reporting the missing directory as the repo's verdict.
-                ensureWorkspace({
-                  current: { container, dir },
-                  repo: input.repo,
-                  sha: input.sha,
-                  ...(input.image !== undefined ? { image: input.image } : {}),
-                  install: input.install,
-                }).pipe(
-                  Effect.flatMap((ws) =>
-                    sandbox.exec({
-                      cwd: ws.dir,
-                      container: ws.container,
-                      command,
-                      // Per-dispatch `env` wins over a same-named Worker secret.
-                      env: { ...secretEnv, ...input.env },
-                      // Defense in depth (header): scrub secret VALUES from the
-                      // captured log before it's persisted, in case the command
-                      // echoes its env.
-                      redactValues: Object.values(secretEnv),
-                      timeoutSec: effectiveTimeoutSec,
-                    }),
-                  ),
-                ),
-              {
-                timeoutSec: effectiveTimeoutSec + STEP_TIMEOUT_HEADROOM_SEC,
-                retries: PLATFORM_RETRIES,
-                retryOn: RETRY_ON,
-              },
-            );
+      // check. `durableExec` retries only platform failures (`ExecFailed`,
+      // `StepFailed`, `CheckoutFailed`), never a returned verdict, and never
+      // `ExecTimeout`: a command that outran its ceiling will outrun it again.
+      // Observed on a consumer's PR: a 40-second check reported `ExecFailed:
+      // exec failed (exit -1): HTTP error! status: 500` — the container, not
+      // the code — as the repo's verdict, because the step did not retry.
+      const { result } = yield* durableExec({
+        name: "exec",
+        workspace: { container, dir },
+        // The checkout is re-established inside the retryable step: a container
+        // recycled between steps takes it with it, and a retry would otherwise
+        // re-run the command in a directory that is gone and report that as the
+        // repo's verdict.
+        ensure: (current) =>
+          ensureWorkspace({
+            current,
+            repo: input.repo,
+            sha: input.sha,
+            ...(input.image !== undefined ? { image: input.image } : {}),
+            install: input.install,
+          }),
+        exec: (ws) => ({
+          cwd: ws.dir,
+          command,
+          // Per-dispatch `env` wins over a same-named Worker secret.
+          env: { ...secretEnv, ...input.env },
+          // Defense in depth (header): scrub secret VALUES from the captured
+          // log before it's persisted, in case the command echoes its env.
+          redactValues: Object.values(secretEnv),
+          timeoutSec: timeoutSec ?? DEFAULT_TIMEOUT_SEC,
+        }),
+      });
 
       // upload-log — push the captured stdout/stderr to R2, get a signed URL.
       // 30-day TTL matches the catalog (`oxlint` / `offload-test` / …); operators

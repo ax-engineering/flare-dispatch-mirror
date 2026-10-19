@@ -1,6 +1,10 @@
 import { Effect, Schema } from "effect";
-import { artifact, defineRun, github, handoffChildAdmission, sandbox, step } from "@fractalboxdev/flare-dispatch-core";
-import { fanOut, waitForChildren, workspace } from "@fractalboxdev/flare-dispatch-core/primitives";
+import {
+  artifact, defineRun, github, handoffChildAdmission, sandbox, step, StepFailed,
+} from "@fractalboxdev/flare-dispatch-core";
+import {
+  DURABLE_EXEC_RETRY_ON, durableExec, ensureWorkspace, fanOut, waitForChildren, workspace, type Workspace,
+} from "@fractalboxdev/flare-dispatch-core/primitives";
 
 const REPO = "fractalboxdev/contextful";
 const VERSION_TAG = /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?$/;
@@ -8,8 +12,29 @@ const SHA = /^[a-f0-9]{40}$/;
 const PROFILES = ["contextful-control", "contextful-edge", "contextful-full"] as const;
 const LINUX = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"] as const;
 const DARWIN = ["x86_64-apple-darwin", "aarch64-apple-darwin"] as const;
+/** The build command's own deadline; the supervisor ends the process at it. */
 const RELEASE_BUILD_TIMEOUT_SEC = 14400;
-const RELEASE_STEP_HEADROOM_SEC = 60;
+/** Rebuilds after a recycled container takes finished outputs before they reach R2. */
+const OUTPUT_REBUILDS = 1;
+/**
+ * A relaunch after a lost process. One fits inside the run ceiling however
+ * late the loss strikes; a second could not, and would end as
+ * `RunDurationExceeded` hours later instead of `SandboxProcessLost` now.
+ */
+const BUILD_RELAUNCHES = 1;
+/**
+ * Two full builds, plus staging and publishing: a lost build always has room
+ * for its one relaunch or rebuild.
+ */
+const CELL_MAX_DURATION_SEC = 2 * RELEASE_BUILD_TIMEOUT_SEC + 3600;
+/**
+ * Platform failures `collect` retries. A retry re-probes the checkout, so a
+ * read or upload that failed because the container was recycled ends as
+ * `lost` and a rebuild, and a transient R2 error simply uploads again.
+ */
+const COLLECT_RETRY_ON = [...DURABLE_EXEC_RETRY_ON, "ArtifactUploadFailed"] as const;
+/** Digests, the image footprint and OCI layer (600 s each), and the R2 uploads. */
+const COLLECT_STEP_TIMEOUT_SEC = 1800;
 const CELLS = PROFILES.flatMap((profile) =>
   (profile === "contextful-control" ? LINUX : [...LINUX, ...DARWIN]).map((target) => ({
     profile,
@@ -69,100 +94,144 @@ const requireValidRequest = (repo: string, tag: string, sha: string): void => {
   }
 };
 
+type ImageLayer = { name: string; archiveName: string; size: number; digest: string; diffId: string };
+type StagedAsset = { name: string; sha256: string; contentType: string };
+type Collected =
+  | { kind: "lost" }
+  | { kind: "staged"; manifest: string; assets: readonly StagedAsset[]; imageLayer?: ImageLayer };
+
+const contentType = (name: string): string =>
+  name.endsWith(".json") ? "application/json" : name.endsWith(".gz") ? "application/gzip" : "text/plain";
+
+/**
+ * Verify a finished build's outputs and stage them in R2. Everything after this
+ * reads R2, not the container, so it is the last step that needs the build's
+ * disk. A checkout that is gone means the container was recycled after the
+ * build finished — `lost`, and the cell rebuilds; a checkout that is present
+ * without its manifest is a build defect.
+ */
+const collect = (input: { profile: string; target: string }, version: string, ws: Workspace) =>
+  Effect.gen(function* () {
+    const name = stem(input.profile, version, input.target);
+    const probe = yield* sandbox.exec({ container: ws.container,
+      command: ["test", "-d", `${ws.dir}/.git`], timeoutSec: 30 });
+    if (probe.exitCode !== 0) return { kind: "lost" } as Collected;
+    const manifestPath = `${ws.dir}/dist/${name}.release.json`;
+    // A read that fails is the container's, not the build's: `StepFailed`
+    // retries, and the retry's probe decides between staging and `lost`.
+    const readOutput = (path: string) => sandbox.readFile({ container: ws.container, path }).pipe(
+      Effect.mapError((cause) => new StepFailed({ step: "collect", cause })));
+    const manifest = yield* readOutput(manifestPath);
+    const parsed = JSON.parse(manifest) as { profile: string; target: string; archive: string; sha256: string; sbom: string };
+    if (parsed.profile !== input.profile || parsed.target !== input.target || parsed.archive !== `${name}.tar.gz` ||
+      parsed.sbom !== `${name}.cdx.json` || !/^[a-f0-9]{64}$/.test(parsed.sha256)) {
+      return yield* Effect.die(new Error("release cell manifest does not match its inputs"));
+    }
+    const checksum = yield* readOutput(`${ws.dir}/dist/${parsed.archive}.sha256`);
+    if (checksum.trim() !== `${parsed.sha256}  ${parsed.archive}`) {
+      return yield* Effect.die(new Error("release checksum file differs from its manifest"));
+    }
+    const assets: StagedAsset[] = [];
+    for (const asset of [parsed.archive, `${parsed.archive}.sha256`, parsed.sbom]) {
+      const path = `${ws.dir}/dist/${asset}`;
+      const digest = yield* sandbox.exec({ container: ws.container, command: ["sha256sum", path], timeoutSec: 120 });
+      const sha256 = digest.stdout.match(/^([a-f0-9]{64})\s/)?.[1];
+      if (digest.exitCode !== 0 || sha256 === undefined) return yield* Effect.die(new Error(`missing SHA-256 for ${asset}`));
+      if (asset === parsed.archive && sha256 !== parsed.sha256) {
+        return yield* Effect.die(new Error("release archive digest differs from its manifest"));
+      }
+      yield* artifact.upload({ name: asset, path, container: ws.container });
+      assets.push({ name: asset, sha256, contentType: contentType(asset) });
+    }
+    if (input.target !== "x86_64-unknown-linux-musl") return { kind: "staged", manifest, assets } as Collected;
+    const layerName = `${input.profile}-${version}-linux-amd64.layer.tar.gz`;
+    const archiveName = `${input.profile}-${version}-linux-amd64.oci.tar`;
+    const base = `${ws.dir}/dist/${input.profile}-${version}-image`;
+    const binary = `${ws.dir}/target/release-artifacts/${input.target}/release/contextful`;
+    const footprint = yield* sandbox.exec({ container: ws.container, cwd: ws.dir,
+      command: ["cargo", "run", "--locked", "-q", "-p", "contextful-ci", "--", "footprint",
+        "--profile", input.profile, binary], timeoutSec: 600 });
+    if (footprint.exitCode !== 0) return yield* Effect.die(new Error(`image footprint failed for ${input.profile}`));
+    const built = yield* sandbox.exec({ container: ws.container, cwd: ws.dir,
+      command: ["/opt/build-oci-layer.sh", binary, `${base}/root`,
+        `${ws.dir}/dist/${layerName}`, `${ws.dir}/dist/${archiveName}`, version],
+      timeoutSec: 600 });
+    const lines = built.stdout.trim().split("\n");
+    const diffId = lines[0]?.match(/^([a-f0-9]{64})\s/)?.[1];
+    const digest = lines[1]?.match(/^([a-f0-9]{64})\s/)?.[1];
+    const size = Number(lines[2]);
+    if (built.exitCode !== 0 || diffId === undefined || digest === undefined || !Number.isSafeInteger(size)) {
+      return yield* Effect.die(new Error("OCI image layer failed"));
+    }
+    yield* artifact.upload({ name: layerName, path: `${ws.dir}/dist/${layerName}`, container: ws.container });
+    yield* artifact.upload({ name: archiveName, path: `${ws.dir}/dist/${archiveName}`, container: ws.container });
+    return { kind: "staged", manifest, assets, imageLayer: { name: layerName, archiveName, size, digest, diffId } } as Collected;
+  });
+
 export const contextfulReleaseCell = defineRun({
   name: "contextful-release-cell",
-  version: "1.0.0",
+  version: "1.1.0",
   sandboxImage: "release",
   inputs: ReleaseCellInput,
   outputs: ReleaseCellOutput,
-  limits: { maxDurationSec: 21600, admissionMaxQueueAgeSec: 21600 },
+  limits: { maxDurationSec: CELL_MAX_DURATION_SEC, admissionMaxQueueAgeSec: 21600 },
   run: (input) =>
-    step("build-and-upload", () =>
-      Effect.gen(function* () {
-        requireValidRequest(input.repo, input.tag, input.sha);
-        if (!CELLS.some((cell) => cell.profile === input.profile && cell.target === input.target)) {
-          return yield* Effect.die(new Error("release cell is outside the ten-cell matrix"));
-        }
-        if (!Number.isSafeInteger(input.releaseId) || (!input.dryRun && input.releaseId <= 0)) {
-          return yield* Effect.die(new Error("release cell requires a valid draft release id"));
-        }
-        const checkout = yield* workspace({ repo: input.repo, sha: input.sha });
-        const version = input.tag.slice(1);
-        const name = stem(input.profile, version, input.target);
-        const result = yield* sandbox.exec({
-          container: checkout.container,
-          cwd: checkout.dir,
-          command: [
-            "cargo", "run", "--locked", "-q", "-p", "contextful-ci", "--", "release",
-            "--builder", "zigbuild", "--profile", input.profile,
-            "--target", input.target, "--target-dir", "target/release-artifacts", "--out", "dist",
-          ],
-          timeoutSec: RELEASE_BUILD_TIMEOUT_SEC,
+    Effect.gen(function* () {
+      requireValidRequest(input.repo, input.tag, input.sha);
+      if (!CELLS.some((cell) => cell.profile === input.profile && cell.target === input.target)) {
+        return yield* Effect.die(new Error("release cell is outside the ten-cell matrix"));
+      }
+      if (!Number.isSafeInteger(input.releaseId) || (!input.dryRun && input.releaseId <= 0)) {
+        return yield* Effect.die(new Error("release cell requires a valid draft release id"));
+      }
+      const version = input.tag.slice(1);
+      let ws = yield* step("checkout", () => workspace({ repo: input.repo, sha: input.sha }));
+      for (let rebuild = 0; rebuild <= OUTPUT_REBUILDS; rebuild++) {
+        const suffix = rebuild === 0 ? "" : `-rebuild-${rebuild}`;
+        // The build is a sandbox-owned process polled across short steps, so a
+        // multi-hour cross-build holds no step open and survives a recycled
+        // container by relaunching; see `durableExec`.
+        const built = yield* durableExec({
+          name: `build${suffix}`,
+          workspace: ws,
+          relaunches: BUILD_RELAUNCHES,
+          ensure: (current) => ensureWorkspace({ current, repo: input.repo, sha: input.sha }),
+          exec: (checkout) => ({
+            cwd: checkout.dir,
+            command: [
+              "cargo", "run", "--locked", "-q", "-p", "contextful-ci", "--", "release",
+              "--builder", "zigbuild", "--profile", input.profile,
+              "--target", input.target, "--target-dir", "target/release-artifacts", "--out", "dist",
+            ],
+            redactValues: [],
+            timeoutSec: RELEASE_BUILD_TIMEOUT_SEC,
+          }),
         });
-        if (result.exitCode !== 0) {
-          return yield* Effect.die(new Error(`release build failed for ${input.profile}/${input.target}: ${result.exitCode}`));
+        if (built.result.exitCode !== 0) {
+          return yield* Effect.die(new Error(`release build failed for ${input.profile}/${input.target}: ${built.result.exitCode}`));
         }
-        const manifestPath = `${checkout.dir}/dist/${name}.release.json`;
-        const manifest = yield* sandbox.readFile({ container: checkout.container, path: manifestPath }).pipe(Effect.orDie);
-        const parsed = JSON.parse(manifest) as { profile: string; target: string; archive: string; sha256: string; sbom: string };
-        if (parsed.profile !== input.profile || parsed.target !== input.target || parsed.archive !== `${name}.tar.gz` ||
-          parsed.sbom !== `${name}.cdx.json` || !/^[a-f0-9]{64}$/.test(parsed.sha256)) {
-          return yield* Effect.die(new Error("release cell manifest does not match its inputs"));
-        }
-        const checksum = yield* sandbox.readFile({ container: checkout.container,
-          path: `${checkout.dir}/dist/${parsed.archive}.sha256` }).pipe(Effect.orDie);
-        if (checksum.trim() !== `${parsed.sha256}  ${parsed.archive}`) {
-          return yield* Effect.die(new Error("release checksum file differs from its manifest"));
-        }
-        const assets = [parsed.archive, `${parsed.archive}.sha256`, parsed.sbom];
-        for (const name of assets) {
-          const path = `${checkout.dir}/dist/${name}`;
-          const digest = yield* sandbox.exec({ container: checkout.container, command: ["sha256sum", path], timeoutSec: 120 });
-          const sha256 = digest.stdout.match(/^([a-f0-9]{64})\s/)?.[1];
-          if (digest.exitCode !== 0 || sha256 === undefined) return yield* Effect.die(new Error(`missing SHA-256 for ${name}`));
-          if (name === parsed.archive && sha256 !== parsed.sha256) {
-            return yield* Effect.die(new Error("release archive digest differs from its manifest"));
+        ws = built.workspace;
+        const staged = built.workspace;
+        const collected = yield* step(`collect${suffix}`, () => collect(input, version, staged),
+          { timeoutSec: COLLECT_STEP_TIMEOUT_SEC, retries: 3, retryOn: COLLECT_RETRY_ON });
+        if (collected.kind === "lost") continue;
+        // Each asset publishes from R2 in its own step; an asset already
+        // uploaded with the same digest is kept, so a retry is a no-op.
+        if (!input.dryRun) {
+          for (const asset of collected.assets) {
+            yield* step(`publish-${asset.name}`, () => github.publishReleaseAsset({
+              repo: input.repo, releaseId: input.releaseId, artifactName: asset.name,
+              contentType: asset.contentType, sha256: asset.sha256,
+            }), { retries: 3, retryOn: ["GitHubApiError", "StepFailed"] });
           }
-          yield* artifact.upload({ name, path, container: checkout.container });
-          if (!input.dryRun) yield* github.publishReleaseAsset({
-            repo: input.repo, releaseId: input.releaseId, artifactName: name,
-            contentType: name.endsWith(".json") ? "application/json" : name.endsWith(".gz") ? "application/gzip" : "text/plain",
-            sha256,
-          });
         }
-        let imageLayer: { name: string; archiveName: string; size: number; digest: string; diffId: string } | undefined;
-        if (input.target === "x86_64-unknown-linux-musl") {
-          const layerName = `${input.profile}-${version}-linux-amd64.layer.tar.gz`;
-          const archiveName = `${input.profile}-${version}-linux-amd64.oci.tar`;
-          const base = `${checkout.dir}/dist/${input.profile}-${version}-image`;
-          const binary = `${checkout.dir}/target/release-artifacts/${input.target}/release/contextful`;
-          const footprint = yield* sandbox.exec({ container: checkout.container, cwd: checkout.dir,
-            command: ["cargo", "run", "--locked", "-q", "-p", "contextful-ci", "--", "footprint",
-              "--profile", input.profile, binary], timeoutSec: 600 });
-          if (footprint.exitCode !== 0) return yield* Effect.die(new Error(`image footprint failed for ${input.profile}`));
-          const built = yield* sandbox.exec({ container: checkout.container, cwd: checkout.dir,
-            command: ["/opt/build-oci-layer.sh", binary, `${base}/root`,
-              `${checkout.dir}/dist/${layerName}`, `${checkout.dir}/dist/${archiveName}`, version],
-            timeoutSec: 600 });
-          const lines = built.stdout.trim().split("\n");
-          const diffId = lines[0]?.match(/^([a-f0-9]{64})\s/)?.[1];
-          const digest = lines[1]?.match(/^([a-f0-9]{64})\s/)?.[1];
-          const size = Number(lines[2]);
-          if (built.exitCode !== 0 || diffId === undefined || digest === undefined || !Number.isSafeInteger(size)) {
-            return yield* Effect.die(new Error("OCI image layer failed"));
-          }
-          yield* artifact.upload({ name: layerName, path: `${checkout.dir}/dist/${layerName}`, container: checkout.container });
-          yield* artifact.upload({ name: archiveName, path: `${checkout.dir}/dist/${archiveName}`, container: checkout.container });
-          imageLayer = { name: layerName, archiveName, size, digest, diffId };
-        }
-        return { profile: input.profile, target: input.target, manifest, assets,
-          ...(imageLayer !== undefined ? { imageLayer } : {}) };
-      }),
-      // Some cross-target release builds exceed 30 minutes. Match the
-      // sandbox's bounded four-hour command timeout and leave upload headroom;
-      // retrying would restart an expensive build from scratch.
-      { timeoutSec: RELEASE_BUILD_TIMEOUT_SEC + RELEASE_STEP_HEADROOM_SEC, retries: 0 },
-    ),
+        return { profile: input.profile, target: input.target, manifest: collected.manifest,
+          assets: collected.assets.map((asset) => asset.name),
+          ...(collected.imageLayer !== undefined ? { imageLayer: collected.imageLayer } : {}) };
+      }
+      return yield* Effect.die(new Error(
+        `release outputs for ${input.profile}/${input.target} were lost with their container on each of ${OUTPUT_REBUILDS + 1} builds`));
+    }),
 });
 
 export const contextfulReleaseFormula = defineRun({

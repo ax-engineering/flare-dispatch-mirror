@@ -10,6 +10,15 @@
 // See specs/03-dsl.md § Primitives and ./README.md.
 
 export { ensureWorkspace, workspace, type Workspace } from "./workspace";
+export {
+  durableExec,
+  pollDelayMs,
+  DURABLE_EXEC_MIN_TIMEOUT_SEC,
+  DURABLE_EXEC_RETRY_ON,
+  type DurableExecCommand,
+  type DurableExecOpts,
+  type DurableExecResult,
+} from "./durable-exec";
 export { installCached } from "./install-cached";
 export { sharded, type Shard } from "./sharded";
 export { fanOut, type FanOutShard } from "./fan-out";

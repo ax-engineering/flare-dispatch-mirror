@@ -75,14 +75,14 @@ export const runDurationExceededMd = (e: RunDurationExceeded): string =>
   `this one ceiling; a suite that needs longer needs a larger \`maxDurationSec\`.`;
 
 /**
- * Render a `SandboxProcessLost`: the check command ran, but every launch's
+ * Render a `SandboxProcessLost`: the command ran, but every launch's
  * process vanished with its container, so no exit status exists to report.
  */
 export const sandboxProcessLostMd = (e: SandboxProcessLost): string =>
-  `🔌 **The sandbox lost the check process** on each of ${e.launches} launches ` +
+  `🔌 **The sandbox lost the command process** on each of ${e.launches} launches ` +
   `(container recycled or its supervisor gone).\n\n` +
   `No exit status was produced, so this is an infrastructure loss — **not a ` +
-  `check failure**. Re-run once the container pool drains.`;
+  `verdict on the code**. Re-run once the container pool drains.`;
 
 const execFailedMd = (e: ExecFailed): string =>
   `**Exec failed** (exit \`${e.exitCode}\`):\n\n\`\`\`\n${clip(e.stderrTail)}\n\`\`\``;

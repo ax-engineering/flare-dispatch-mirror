@@ -149,7 +149,7 @@ export class RunDurationExceeded extends Schema.TaggedError<RunDurationExceeded>
 }
 
 /**
- * A long check command's process vanished on every launch — the sandbox lost
+ * A long command's process vanished on every launch — the sandbox lost
  * it, the command never reported. A recycled container answers for a process
  * it never started with "not found"; a supervisor killed with its container
  * publishes no terminal record. Either way no exit status exists, so this is
@@ -165,7 +165,7 @@ export class SandboxProcessLost extends Schema.TaggedError<SandboxProcessLost>()
   // The Workflows attempt record persists only error.name + error.message (#88).
   override get message(): string {
     return (
-      `the sandbox lost the check process on each of ${this.launches} launches ` +
+      `the sandbox lost the command process on each of ${this.launches} launches ` +
       `(container recycled or supervisor gone) — no verdict was produced`
     );
   }
