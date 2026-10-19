@@ -56,6 +56,7 @@ import {
   sandbox,
   Sandbox,
   checkpointSleep,
+  SandboxProcessLost,
   step,
 } from "@fractalboxdev/flare-dispatch-core";
 import {
@@ -182,6 +183,22 @@ const STEP_TIMEOUT_HEADROOM_SEC = 120;
  */
 const PLATFORM_RETRIES = 3;
 const RETRY_ON = ["ExecFailed", "StepFailed", "CheckoutFailed"] as const;
+
+/**
+ * Relaunches after the sandbox loses a long check's process. A container
+ * recycled under a saturated pool takes its process table with it, and the
+ * fresh container answers "not found"; that loss is the platform's, so the
+ * command runs again rather than reporting a verdict it never produced. A
+ * command killed by a signal still publishes its exit and is never relaunched.
+ */
+const LOST_PROCESS_RELAUNCHES = 2;
+
+/**
+ * Step ceiling for one launch or observation of a long check. Either call can
+ * be the one that wakes a recycled container, and a cold start in a saturated
+ * pool outlasts a minute; the poll loop's count, not this ceiling, bounds it.
+ */
+const CONTAINER_CALL_STEP_TIMEOUT_SEC = 300;
 
 /** CONFIG_KV key — strictly per-repo (see header: no global fallback). */
 const commandKey = (repo: string): string => `check.command:${repo}`;
@@ -389,47 +406,74 @@ export const check = defineRun({
       const result =
         durable !== undefined && effectiveTimeoutSec > DEFAULT_TIMEOUT_SEC
           ? yield* Effect.gen(function* () {
-              const ws = yield* step("exec-workspace", () =>
-                ensureWorkspace({
-                  current: { container, dir },
-                  repo: input.repo,
-                  sha: input.sha,
-                  ...(input.image !== undefined ? { image: input.image } : {}),
-                  install: input.install,
-                }),
-              );
-              const opts = {
-                cwd: ws.dir,
-                container: ws.container,
-                command,
-                env: { ...secretEnv, ...input.env },
-                redactValues: Object.values(secretEnv),
-                timeoutSec: effectiveTimeoutSec,
-              };
-              const handle = yield* step("exec-prepare", () =>
-                durable.prepare({ ...opts, stepName: "exec" }),
-              );
-              // Only the owner intent can authorize launch; retries recover this handle.
-              yield* step("exec-start", () => durable.start(handle, opts), {
-                timeoutSec: 60,
-                retries: PLATFORM_RETRIES,
-                retryOn: RETRY_ON,
-              });
-              const maxPolls = Math.ceil(effectiveTimeoutSec / 5) + 3;
-              for (let i = 0; i < maxPolls; i++) {
-                const status = yield* step(
-                  `exec-observe-${i}`,
-                  () => durable.observe(handle, opts),
-                  { timeoutSec: 60, retries: PLATFORM_RETRIES, retryOn: RETRY_ON },
+              let ws: { container: typeof container; dir: string } = { container, dir };
+              for (let launch = 0; launch <= LOST_PROCESS_RELAUNCHES; launch++) {
+                // The first launch keeps the step names an in-flight instance
+                // already checkpointed; each relaunch gets its own names and,
+                // through `stepName`, its own process identity.
+                const name = launch === 0 ? "exec" : `exec-relaunch-${launch}`;
+                if (launch > 0) {
+                  // A supervisor that died may leave its command's process group
+                  // running, so the relaunch starts from a destroyed container
+                  // and the workspace step re-clones onto its empty disk.
+                  const lost = ws.container;
+                  yield* step(`${name}-destroy`, () => sandbox.destroy({ container: lost }));
+                }
+                const current = ws;
+                ws = yield* step(`${name}-workspace`, () =>
+                  ensureWorkspace({
+                    current,
+                    repo: input.repo,
+                    sha: input.sha,
+                    ...(input.image !== undefined ? { image: input.image } : {}),
+                    install: input.install,
+                  }),
                 );
-                if (status.state !== "running") break;
-                yield* checkpointSleep(`exec-sleep-${i}`, 5000);
+                const opts = {
+                  cwd: ws.dir,
+                  container: ws.container,
+                  command,
+                  env: { ...secretEnv, ...input.env },
+                  redactValues: Object.values(secretEnv),
+                  timeoutSec: effectiveTimeoutSec,
+                };
+                const handle = yield* step(`${name}-prepare`, () =>
+                  durable.prepare({ ...opts, stepName: name }),
+                );
+                // Only the owner intent can authorize launch; retries recover this handle.
+                yield* step(`${name}-start`, () => durable.start(handle, opts), {
+                  timeoutSec: CONTAINER_CALL_STEP_TIMEOUT_SEC,
+                  retries: PLATFORM_RETRIES,
+                  retryOn: RETRY_ON,
+                });
+                const maxPolls = Math.ceil(effectiveTimeoutSec / 5) + 3;
+                let state: string = "running";
+                for (let i = 0; i < maxPolls; i++) {
+                  const status = yield* step(
+                    `${name}-observe-${i}`,
+                    () => durable.observe(handle, opts),
+                    {
+                      timeoutSec: CONTAINER_CALL_STEP_TIMEOUT_SEC,
+                      retries: PLATFORM_RETRIES,
+                      retryOn: RETRY_ON,
+                    },
+                  );
+                  state = status.state;
+                  if (state !== "running") break;
+                  yield* checkpointSleep(`${name}-sleep-${i}`, 5000);
+                }
+                // `missing`: the sandbox holds no process and no terminal record
+                // for this launch, so no exit status exists to report.
+                if (state === "missing") continue;
+                return yield* step(`${name}-finalize`, () => durable.finalize(handle, opts), {
+                  timeoutSec: 120,
+                  retries: PLATFORM_RETRIES,
+                  retryOn: RETRY_ON,
+                });
               }
-              return yield* step("exec-finalize", () => durable.finalize(handle, opts), {
-                timeoutSec: 120,
-                retries: PLATFORM_RETRIES,
-                retryOn: RETRY_ON,
-              });
+              return yield* Effect.fail(
+                new SandboxProcessLost({ launches: LOST_PROCESS_RELAUNCHES + 1 }),
+              );
             })
           : yield* step(
               "exec",

@@ -15,6 +15,7 @@ import {
   ExecTimeout,
   RunDurationExceeded,
   RunSkipped,
+  SandboxProcessLost,
   SecretsMissing,
   SerialQueueTimedOut,
   StepFailed,
@@ -39,6 +40,12 @@ describe("failureSummaryMd", () => {
     expect(md).toContain("`limits.maxDurationSec: 1800`");
   });
 
+  it("renders a SandboxProcessLost as an infrastructure loss with no verdict", () => {
+    const md = failureSummaryMd(Exit.fail(new SandboxProcessLost({ launches: 3 })));
+    expect(md).toContain("lost the check process");
+    expect(md).toContain("3 launches");
+    expect(md).toContain("not a check failure");
+  });
   it("extracts the markdown from a failed Exit carrying AcceptanceFailed.summaryMd", () => {
     const exit = Exit.fail(
       new AcceptanceFailed({

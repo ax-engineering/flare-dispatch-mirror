@@ -267,4 +267,27 @@ describe("native check command supervisor", () => {
       await rm(commandSpool(handle), { recursive: true, force: true });
     }
   });
+  it("a command killed by a signal records the shell's 128+N exit and names the signal", async () => {
+    const handle = {
+      id: `native-${crypto.randomUUID()}`,
+      container: { id: "explicit" },
+      fingerprint: "native",
+      startedAt: Date.now(),
+      deadline: Date.now() + 5000,
+    };
+    try {
+      const child = spawn(process.execPath, ["-e", commandSupervisor(handle, "kill -KILL $$")]);
+      const actual = await new Promise<number | null>((resolve, reject) => {
+        child.on("error", reject);
+        child.on("exit", resolve);
+      });
+      expect(actual).toBe(137);
+      expect(
+        JSON.parse(await readFile(`${commandSpool(handle)}/terminal.json`, "utf8")),
+      ).toMatchObject({ exitCode: 137, signal: "SIGKILL", timedOut: false });
+      expect(await readFile(`${commandSpool(handle)}/stderr`, "utf8")).toContain("SIGKILL");
+    } finally {
+      await rm(commandSpool(handle), { recursive: true, force: true });
+    }
+  });
 });

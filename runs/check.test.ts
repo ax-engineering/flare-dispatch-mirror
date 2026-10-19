@@ -92,6 +92,86 @@ describe("check", () => {
       }).pipe(Effect.provide(layer));
     },
   );
+  const lossyDurable = (lostAttempts: number, calls: string[]): CheckCommandService => ({
+    prepare: (opts) =>
+      Effect.sync(() => {
+        calls.push(`prepare:${opts.stepName}`);
+        return {
+          id: `handle-${opts.stepName}`,
+          container: opts.container!,
+          fingerprint: "stable",
+          startedAt: 1000,
+          deadline: 1801000,
+        };
+      }),
+    start: (h) => Effect.sync(() => void calls.push(`start:${h.id}`)),
+    observe: (h) =>
+      Effect.sync(() => {
+        calls.push(`observe:${h.id}`);
+        const attempt = calls.filter((c) => c.startsWith("prepare:")).length;
+        return attempt <= lostAttempts
+          ? { state: "missing" as const }
+          : { state: "exited" as const, exitCode: 0, durationMs: 27 };
+      }),
+    finalize: (h) =>
+      Effect.sync(() => {
+        calls.push(`finalize:${h.id}`);
+        return { exitCode: 0, durationMs: 27, logPath: "logs/relaunched.ndjson", stdout: "", stderr: "" };
+      }),
+  });
+  it.effect(
+    "a long check whose process is lost with its container relaunches in a fresh container and reports that verdict",
+    () => {
+      const { layer, handles } = makeCFRuntimeTest();
+      const calls: string[] = [];
+      return Effect.gen(function* () {
+        const original = yield* Sandbox;
+        const result = yield* check
+          .run({ ...baseInput, timeoutSec: 1800, failOnNonZeroExit: true })
+          .pipe(
+            Effect.provideService(Sandbox, { ...original, checkCommand: lossyDurable(1, calls) }),
+          );
+        expect(result.exitCode).toBe(0);
+        expect(calls).toEqual([
+          "prepare:exec",
+          "start:handle-exec",
+          "observe:handle-exec",
+          "prepare:exec-relaunch-1",
+          "start:handle-exec-relaunch-1",
+          "observe:handle-exec-relaunch-1",
+          "finalize:handle-exec-relaunch-1",
+        ]);
+        expect(handles.sandbox.destroyed).toContain("fake-container");
+        expect(handles.executions.steps.map((s) => s.name)).toEqual(
+          expect.arrayContaining(["exec-observe-0", "exec-relaunch-1-observe-0", "exec-relaunch-1-finalize"]),
+        );
+      }).pipe(Effect.provide(layer));
+    },
+  );
+  it.effect(
+    "a long check that loses its process on every launch fails as a sandbox loss, never a command verdict",
+    () => {
+      const { layer } = makeCFRuntimeTest();
+      const calls: string[] = [];
+      return Effect.gen(function* () {
+        const original = yield* Sandbox;
+        const exit = yield* Effect.exit(
+          check
+            .run({ ...baseInput, timeoutSec: 1800, failOnNonZeroExit: true })
+            .pipe(
+              Effect.provideService(Sandbox, { ...original, checkCommand: lossyDurable(99, calls) }),
+            ),
+        );
+        expect(Exit.isFailure(exit)).toBe(true);
+        if (Exit.isFailure(exit)) {
+          const failure = Option.getOrUndefined(Cause.failureOption(exit.cause));
+          expect(failure).toMatchObject({ _tag: "SandboxProcessLost", launches: 3 });
+        }
+        expect(calls.filter((c) => c.startsWith("prepare:"))).toHaveLength(3);
+        expect(calls.some((c) => c.startsWith("finalize:"))).toBe(false);
+      }).pipe(Effect.provide(layer));
+    },
+  );
   it.effect("not configured — no per-repo command no-ops green: nothing cloned or exec'd", () => {
     const { layer, handles } = makeCFRuntimeTest({
       sandboxProgram: { [CHECK_CMD]: { exitCode: 0 } },

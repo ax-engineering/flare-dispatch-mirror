@@ -149,6 +149,29 @@ export class RunDurationExceeded extends Schema.TaggedError<RunDurationExceeded>
 }
 
 /**
+ * A long check command's process vanished on every launch — the sandbox lost
+ * it, the command never reported. A recycled container answers for a process
+ * it never started with "not found"; a supervisor killed with its container
+ * publishes no terminal record. Either way no exit status exists, so this is
+ * an infrastructure loss with no verdict, distinct from `AcceptanceFailed`.
+ */
+export class SandboxProcessLost extends Schema.TaggedError<SandboxProcessLost>()(
+  "SandboxProcessLost",
+  {
+    /** Launches whose process the sandbox lost, the first included. */
+    launches: Schema.Number,
+  },
+) {
+  // The Workflows attempt record persists only error.name + error.message (#88).
+  override get message(): string {
+    return (
+      `the sandbox lost the check process on each of ${this.launches} launches ` +
+      `(container recycled or supervisor gone) — no verdict was produced`
+    );
+  }
+}
+
+/**
  * A run declaring `serialize` waited its whole ceiling behind an in-flight
  * execution of the same group, which kept heartbeating the entire time. The
  * run **never started**. Distinct from `AdmissionTimedOut`: the pool may have
@@ -355,6 +378,7 @@ export type RunError =
   | AdmissionTimedOut
   | SerialQueueTimedOut
   | RunDurationExceeded
+  | SandboxProcessLost
   | PortNeverOpened
   | ExposePortFailed
   | BrowserUnavailable

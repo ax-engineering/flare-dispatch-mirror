@@ -34,6 +34,7 @@ export interface CheckCommandBox {
 }
 const Terminal = Schema.Struct({
   exitCode: Schema.NullOr(Schema.Number),
+  signal: Schema.optional(Schema.NullOr(Schema.String)),
   timedOut: Schema.Boolean,
   logExceeded: Schema.optional(Schema.Boolean),
   endedAt: Schema.Number,
@@ -84,8 +85,8 @@ export function commandSupervisor(handle: CheckCommandHandle, command: string): 
 const dir=${JSON.stringify(path(handle))};fs.mkdirSync(dir,{recursive:true});
 const out=fs.openSync(dir+'/stdout','a'),err=fs.openSync(dir+'/stderr','a');
 const child=spawn('/bin/sh',['-lc',${JSON.stringify(command)}],{detached: true,stdio:['ignore','pipe','pipe'],env:process.env});
-let timedOut=false,logExceeded=false,killTimer,bytes=0,cleanupComplete=false,closed=false,closeCode=null,endedAt;
-const publish=()=>{if(!closed||(killTimer&&!cleanupComplete))return;const value={exitCode:closeCode,timedOut,logExceeded,endedAt:endedAt??Date.now()};fs.writeFileSync(dir+'/terminal.tmp',JSON.stringify(value));fs.renameSync(dir+'/terminal.tmp',dir+'/terminal.json');process.exitCode=closeCode===null?1:closeCode;};
+let timedOut=false,logExceeded=false,killTimer,bytes=0,cleanupComplete=false,closed=false,closeCode=null,closeSignal=null,endedAt;
+const publish=()=>{if(!closed||(killTimer&&!cleanupComplete))return;const value={exitCode:closeCode,signal:closeSignal,timedOut,logExceeded,endedAt:endedAt??Date.now()};fs.writeFileSync(dir+'/terminal.tmp',JSON.stringify(value));fs.renameSync(dir+'/terminal.tmp',dir+'/terminal.json');process.exitCode=closeCode===null?1:closeCode;};
 const groupAbsent=()=>{try{process.kill(-child.pid,0);return false}catch(error){if(error.code==='ESRCH')return true;throw error}};
 const groupStopped=()=>{
 if(process.platform==='darwin'){
@@ -105,7 +106,7 @@ const capture=(fd,data)=>{const count=Math.min(data.length,Math.max(0,64*1024*10
 child.stdout.on('data',data=>capture(out,data));child.stderr.on('data',data=>capture(err,data));
 const timer=setTimeout(()=>{timedOut=true;stop()},Math.max(0,${handle.deadline}-Date.now()));
 child.on('exit',()=>{endedAt=Date.now();clearTimeout(timer);stop()});
-child.on('close',(code)=>{closed=true;closeCode=code;clearTimeout(timer);stop();publish()});`;
+child.on('close',(code,signal)=>{closed=true;closeCode=code;if(code===null&&signal){closeSignal=signal;closeCode=128+(require('node:os').constants.signals[signal]??0);fs.writeSync(err,'\\nflare-dispatch: check command terminated by '+signal+'\\n')}clearTimeout(timer);stop();publish()});`;
 }
 
 export function makeCheckCommandOwner(
@@ -129,6 +130,16 @@ export function makeCheckCommandOwner(
     if (JSON.stringify(entry.handle) !== JSON.stringify(h))
       throw new Error("check command identity changed");
     return entry;
+  };
+  // The pinned SDK throws `ProcessNotFoundError` for an id its container never
+  // started — what a recycled container answers — rather than returning null.
+  const processOf = async (id: string) => {
+    try {
+      return await box.getProcess(id);
+    } catch (error) {
+      if (error instanceof Error && error.name === "ProcessNotFoundError") return null;
+      throw error;
+    }
   };
   const execJson = async (script: string): Promise<unknown> => {
     const result = await box.exec(`node -e ${quote(script)}`, { timeout: 10000 });
@@ -179,13 +190,11 @@ export function makeCheckCommandOwner(
         const entry = await load(h);
         if (entry.receipt !== undefined) return;
         // An absent flag is an existing launch intent from an earlier schema.
-        if (entry.launched !== false) {
-          if ((await box.getProcess(h.id)) === null)
-          throw new Error(
-            "uncertain check command: launch response or process was lost; no relaunch",
-          );
-          return;
-        }
+        // A recorded launch is never launched again under this handle. If its
+        // process is gone — the container recycled after `startProcess`
+        // reached it — `observe` reports `missing`, and the run relaunches
+        // under a new identity in a destroyed container.
+        if (entry.launched !== false) return;
         if (!(await storage.save(key(h), { ...entry, launched: true }, entry)))
           throw new Error("check command launch reservation changed concurrently");
       }
@@ -208,15 +217,18 @@ export function makeCheckCommandOwner(
           exitCode: entry.receipt.exitCode,
           durationMs: entry.receipt.durationMs,
         };
-      const proc = await box.getProcess(h.id);
+      const proc = await processOf(h.id);
       if (proc === null) return { state: "missing" };
       if (proc.status === "running" || proc.status === "starting")
         return { state: now() >= h.deadline + 1500 ? "timeout" : "running" };
-      const terminal = Schema.decodeUnknownSync(Terminal)(
+      // A process that ended without publishing — its supervisor killed with
+      // the container — leaves no record, and no exit status to report.
+      const terminal = Schema.decodeUnknownSync(Schema.NullOr(Terminal))(
         await execJson(
-          `const fs=require('node:fs');process.stdout.write(fs.readFileSync(${JSON.stringify(path(h) + "/terminal.json")},'utf8'))`,
+          `const fs=require('node:fs'),p=${JSON.stringify(path(h) + "/terminal.json")};process.stdout.write(fs.existsSync(p)?fs.readFileSync(p,'utf8'):'null')`,
         ),
       );
+      if (terminal === null) return { state: "missing" };
       if (terminal.logExceeded)
         throw new Error("check command output exceeds bounded spool; no verdict published");
       if (terminal.timedOut || terminal.endedAt > h.deadline) return { state: "timeout" };

@@ -16,6 +16,7 @@ import type {
   ExecTimeout,
   RunDurationExceeded,
   RunError,
+  SandboxProcessLost,
   SecretsMissing,
   SerialQueueTimedOut,
   StepFailed,
@@ -73,6 +74,16 @@ export const runDurationExceededMd = (e: RunDurationExceeded): string =>
   `The run was stopped and its sandbox destroyed. Retries inside the run share ` +
   `this one ceiling; a suite that needs longer needs a larger \`maxDurationSec\`.`;
 
+/**
+ * Render a `SandboxProcessLost`: the check command ran, but every launch's
+ * process vanished with its container, so no exit status exists to report.
+ */
+export const sandboxProcessLostMd = (e: SandboxProcessLost): string =>
+  `🔌 **The sandbox lost the check process** on each of ${e.launches} launches ` +
+  `(container recycled or its supervisor gone).\n\n` +
+  `No exit status was produced, so this is an infrastructure loss — **not a ` +
+  `check failure**. Re-run once the container pool drains.`;
+
 const execFailedMd = (e: ExecFailed): string =>
   `**Exec failed** (exit \`${e.exitCode}\`):\n\n\`\`\`\n${clip(e.stderrTail)}\n\`\`\``;
 
@@ -127,7 +138,7 @@ export const runSkippedReason = (exit: Exit.Exit<unknown, RunError>): string | u
  * present. `undefined` on success, on a defect/interrupt (`Cause.failureOption`
  * is none — there is no typed failure to read), and on typed failures we have
  * not opted into rendering. `AcceptanceFailed` carries run-authored markdown;
- * `AdmissionTimedOut` / `RunDurationExceeded` / `ExecFailed` / `ExecTimeout` / `StepFailed` /
+ * `AdmissionTimedOut` / `RunDurationExceeded` / `SandboxProcessLost` / `ExecFailed` / `ExecTimeout` / `StepFailed` /
  * `SecretsMissing` render structured infra explanations so a red check is not
  * only a Cloudflare workflow link.
  *
@@ -148,6 +159,7 @@ export const failureSummaryMd = (exit: Exit.Exit<unknown, RunError>): string | u
             Match.tag("AdmissionTimedOut", (e) => admissionTimedOutMd(e)),
             Match.tag("SerialQueueTimedOut", (e) => serialQueueTimedOutMd(e)),
             Match.tag("RunDurationExceeded", (e) => runDurationExceededMd(e)),
+            Match.tag("SandboxProcessLost", (e) => sandboxProcessLostMd(e)),
             Match.tag("ExecFailed", (e) => execFailedMd(e)),
             Match.tag("ExecTimeout", (e) => execTimeoutMd(e)),
             Match.tag("StepFailed", (e) => stepFailedMd(e)),
