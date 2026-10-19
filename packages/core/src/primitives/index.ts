@@ -20,6 +20,20 @@ export {
   type DurableExecResult,
 } from "./durable-exec";
 export { installCached } from "./install-cached";
+export {
+  isRestorableEntry,
+  keyMaterialCommand,
+  parsePathPackages,
+  prebuildCargoBinary,
+  prebuiltCommand,
+  prebuiltEntry,
+  prebuiltKey,
+  restorePrebuilt,
+  KEY_FILES,
+  PREBUILT_ROOT,
+  type CacheEntry,
+  type PrebuiltBinary,
+} from "./prebuilt-binary";
 export { sharded, type Shard } from "./sharded";
 export { fanOut, type FanOutShard } from "./fan-out";
 export { waitForChildren, waitForChildrenDurably } from "./wait-for-children";

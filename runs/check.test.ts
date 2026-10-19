@@ -21,7 +21,12 @@ import { it } from "@effect/vitest";
 import { Cause, Effect, Either, Exit, Option, Schema } from "effect";
 import { describe, expect } from "vitest";
 import { makeCFRuntimeTest } from "@fractalboxdev/flare-dispatch-core/testing";
-import { Sandbox, type CheckCommandService } from "@fractalboxdev/flare-dispatch-core";
+import {
+  Cache,
+  Sandbox,
+  type CacheService,
+  type CheckCommandService,
+} from "@fractalboxdev/flare-dispatch-core";
 import { check } from "./check";
 
 const CHECK_CMD = "pnpm lint";
@@ -694,6 +699,108 @@ describe("check source determinism", () => {
       ]);
       expect(result.exitCode).toBe(0);
     }).pipe(Effect.provide(layer));
+  });
+});
+
+describe("check restore", () => {
+  const entry = {
+    key: `contextful-ci-${"c".repeat(64)}`,
+    base: "/tmp/flare-dispatch-prebuilt/contextful-ci",
+    paths: ["bin"],
+  };
+  const mkdirs = (commands: readonly string[]) =>
+    commands.filter((command) => command === `mkdir -p ${entry.base}`);
+  /** A cache answering every restore with `hit`, recording each request and each save. */
+  const recordingCache = (hit: boolean) => {
+    const calls: { key: string; base?: string; paths: readonly string[]; dir?: string }[] = [];
+    const saves: string[] = [];
+    const service: CacheService = {
+      restoreOr: (opts) =>
+        Effect.suspend(() => {
+          calls.push({ key: opts.key, base: opts.base, paths: opts.paths, dir: opts.dir });
+          return hit
+            ? Effect.void
+            : Effect.asVoid(opts.onMiss()).pipe(
+                Effect.tap(() => Effect.sync(() => saves.push(opts.key))),
+              );
+        }),
+      save: () => Effect.void,
+    };
+    return { service, calls, saves };
+  };
+  const requested = {
+    key: entry.key,
+    base: entry.base,
+    paths: entry.paths,
+    dir: "/workspace/name",
+  };
+
+  it.effect(
+    "restores each entry by its key, base and paths after the clone, before the command",
+    () => {
+      const { layer, handles } = makeCFRuntimeTest({
+        sandboxProgram: { [CHECK_CMD]: { exitCode: 0 } },
+      });
+      const cache = recordingCache(true);
+      return Effect.gen(function* () {
+        expect((yield* check.run({ ...baseInput, restore: [entry] })).exitCode).toBe(0);
+        expect(cache.calls).toEqual([requested]);
+        expect(cache.saves).toEqual([]);
+        const commands = handles.sandbox.execs.map((exec) => exec.command);
+        expect(mkdirs(commands)).toHaveLength(1);
+        expect(commands.indexOf(`mkdir -p ${entry.base}`)).toBeLessThan(
+          commands.indexOf(CHECK_CMD),
+        );
+        expect(handles.executions.steps.map((step) => step.name)).toEqual([
+          "resolve-config",
+          "checkout",
+          "exec",
+          "upload-log",
+        ]);
+      }).pipe(Effect.provideService(Cache, cache.service), Effect.provide(layer));
+    },
+  );
+
+  it.effect("restores again into a re-cloned container", () => {
+    const { layer, handles } = makeCFRuntimeTest({
+      sandboxProgram: {
+        "test -d /workspace/name/.git": { exitCode: 1 },
+        [CHECK_CMD]: { exitCode: 0 },
+      },
+    });
+    const cache = recordingCache(true);
+    return Effect.gen(function* () {
+      yield* check.run({ ...baseInput, restore: [entry] });
+      expect(handles.sandbox.clones).toHaveLength(2);
+      expect(mkdirs(handles.sandbox.execs.map((exec) => exec.command))).toHaveLength(2);
+      expect(cache.calls).toEqual([requested, requested]);
+    }).pipe(Effect.provideService(Cache, cache.service), Effect.provide(layer));
+  });
+
+  it.effect("runs the command and saves nothing when the entry is not in the cache", () => {
+    const { layer, handles } = makeCFRuntimeTest({
+      sandboxProgram: { [CHECK_CMD]: { exitCode: 0 } },
+    });
+    const cache = recordingCache(false);
+    return Effect.gen(function* () {
+      expect(
+        (yield* check.run({ ...baseInput, restore: [entry], failOnNonZeroExit: true })).exitCode,
+      ).toBe(0);
+      expect(cache.calls).toEqual([requested]);
+      expect(cache.saves).toEqual([]);
+      expect(handles.sandbox.execs.map((exec) => exec.command)).toContain(CHECK_CMD);
+    }).pipe(Effect.provideService(Cache, cache.service), Effect.provide(layer));
+  });
+
+  it("refuses an entry outside /tmp or with a path-shaped key at the input schema", () => {
+    const decode = Schema.decodeUnknownEither(check.inputs);
+    expect(Either.isRight(decode({ ...baseInput, restore: [entry] }))).toBe(true);
+    expect(
+      Either.isLeft(decode({ ...baseInput, restore: [{ ...entry, base: "/usr/local/cargo" }] })),
+    ).toBe(true);
+    expect(
+      Either.isLeft(decode({ ...baseInput, restore: [{ ...entry, key: "../owner/other" }] })),
+    ).toBe(true);
   });
 });
 

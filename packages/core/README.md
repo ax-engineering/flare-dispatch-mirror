@@ -45,6 +45,7 @@ The split keeps the layer boundary visible at the top of every recipe file. The 
 | --------------------------------------------------- | -------------------------------------------------------------- | -------------------------- | -------------------------- |
 | [`workspace`](src/primitives/workspace.ts)          | Acquire a container + clone a repo (+ optional cached install) | `sandbox`, `installCached` | every recipe               |
 | [`installCached`](src/primitives/install-cached.ts) | R2-backed dependency install, keyed on the lockfile hash       | `cache`, `sandbox`         | `workspace`, browser-tests |
+| [`prebuildCargoBinary` / `restorePrebuilt`](src/primitives/prebuilt-binary.ts) | One Cargo binary built once, keyed on its sources, lockfile and toolchain; restored restore-only | `cache`, `sandbox` | `contextful-gate`, `check` |
 | [`sharded`](src/primitives/sharded.ts)              | Count-and-index parallel fan-out                               | `Effect.forEach`           | test-matrix, browser-tests |
 | [`bootApp`](src/primitives/boot-app.ts)             | Start a detached process and wait for its port                 | `sandbox`                  | cdp-acceptance             |
 | [`probeHttp`](src/primitives/probe-http.ts)         | Hit a set of URLs and classify each healthy / failed           | `sandbox`                  | deploy-smoke               |

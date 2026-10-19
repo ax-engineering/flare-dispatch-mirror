@@ -9,13 +9,18 @@ import {
 import {
   ensureWorkspace,
   fanOut,
+  prebuildCargoBinary,
+  prebuiltCommand,
   waitForChildrenDurably,
   workspace,
+  type PrebuiltBinary,
 } from "@fractalboxdev/flare-dispatch-core/primitives";
 import { check } from "./check";
 
 const REPO = "fractalboxdev/contextful";
-const DISCOVER = "cargo run --locked -q -p contextful-ci -- stages --parts";
+const CI_PACKAGE = "contextful-ci";
+const CARGO_RUN_CI = `cargo run --locked -q -p ${CI_PACKAGE} --`;
+const DISCOVER = `${CARGO_RUN_CI} stages --parts`;
 const STAGE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
 const MAX_STAGES = 64;
 const MAX_STAGE_LIST_BYTES = 4096;
@@ -59,6 +64,21 @@ export const parseStages = (stdout: string): readonly string[] | undefined => {
   return stages;
 };
 
+/**
+ * One part's command: the binary the parent built when there is one, `cargo run`
+ * otherwise — and on the child too, when the restored binary is absent or broken.
+ */
+export const stageCommand = (
+  stage: string,
+  baseSha: string,
+  prebuilt: PrebuiltBinary | null,
+): string => {
+  const args = `gate --predecessors --stage ${stage} --base ${baseSha}`;
+  return prebuilt === null
+    ? `${CARGO_RUN_CI} ${args}`
+    : prebuiltCommand({ path: prebuilt.path, fallback: CARGO_RUN_CI, args });
+};
+
 /** Base-only checks remain required; complete base-aware parts refine their legacy whole check. */
 export const mergeStages = (
   head: readonly string[],
@@ -97,7 +117,7 @@ export const contextfulGate = defineRun({
   run: (input) =>
     Effect.gen(function* () {
       const { container, dir } = yield* step("checkout", () =>
-        workspace({ repo: input.repo, sha: input.sha }),
+        workspace({ repo: input.repo, sha: input.sha, install: true }),
       );
       const discovery = yield* step(
         "discover-stages",
@@ -131,6 +151,19 @@ export const contextfulGate = defineRun({
         { timeoutSec: 1920, retries: 3, retryOn: ["ExecFailed", "StepFailed", "CheckoutFailed"] },
       );
       const headStages = discovery.exitCode === 0 ? parseStages(discovery.stdout) : undefined;
+      // Discovery compiled the tool in this checkout; storing that one executable
+      // spares every part its own cold compile. `null` keeps the parts on cargo run.
+      const prebuilt =
+        headStages === undefined
+          ? null
+          : yield* step(
+              "prebuild-ci-binary",
+              () =>
+                ensureWorkspace({ current: { container, dir }, repo: input.repo, sha: input.sha, install: true }).pipe(
+                  Effect.flatMap((ws) => prebuildCargoBinary({ workspace: ws, pkg: CI_PACKAGE, bin: CI_PACKAGE })),
+                ),
+              { timeoutSec: 1920, retries: 1, retryOn: ["CheckoutFailed"] },
+            ).pipe(Effect.orElseSucceed((): PrebuiltBinary | null => null));
       const baseWorkspace = yield* step("checkout-base", () =>
         workspace({ repo: input.repo, sha: input.baseSha }),
       );
@@ -187,11 +220,14 @@ export const contextfulGate = defineRun({
               repo: input.repo,
               sha: input.sha,
               checkLabel: stage,
-              command: `cargo run --locked -q -p contextful-ci -- gate --predecessors --stage ${stage} --base ${input.baseSha}`,
+              command: stageCommand(stage, input.baseSha, prebuilt),
               failOnNonZeroExit: true,
               timeoutSec: STAGE_TIMEOUT_SEC,
               admissionMaxQueueAgeSec: STAGE_QUEUE_SEC,
-              install: false,
+              install: true,
+              ...(prebuilt === null
+                ? {}
+                : { restore: [{ key: prebuilt.key, base: prebuilt.base, paths: prebuilt.paths }] }),
               secrets: [],
             }),
           }),

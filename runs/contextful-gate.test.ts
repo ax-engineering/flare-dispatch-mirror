@@ -4,7 +4,7 @@ import { describe, expect } from "vitest";
 import { makeCFRuntimeTest } from "@fractalboxdev/flare-dispatch-core/testing";
 import { IO, StepFailed, StepRunner, type StepRunnerService } from "@fractalboxdev/flare-dispatch-core";
 import { check } from "./check";
-import { contextfulGate, mergeStages, parseStages } from "./contextful-gate";
+import { contextfulGate, mergeStages, parseStages, stageCommand } from "./contextful-gate";
 
 const SHA = "a".repeat(40);
 const BASE_SHA = "b".repeat(40);
@@ -110,7 +110,7 @@ describe("contextful-gate", () => {
       expect(handles.childRuns.spawned.map((spawn) => spawn.input)).toEqual([
         "pins", "test-first.validate", "test-first.contextful-core", "test-first.contextful-cli", "test-first.deleted-package", "formal",
       ].map((checkLabel) => expect.objectContaining({ checkLabel })));
-      expect(handles.sandbox.execs.filter((exec) => exec.command.startsWith("cargo ")).map((exec) => exec.command)).toEqual([DISCOVER_HEAD, DISCOVER]);
+      expect(handles.sandbox.execs.filter((exec) => exec.command.includes("stages --parts")).map((exec) => exec.command)).toEqual([DISCOVER_HEAD, DISCOVER]);
     }).pipe(Effect.provide(layer));
   });
 
@@ -153,7 +153,7 @@ describe("contextful-gate", () => {
     return Effect.gen(function* () {
       expect(yield* contextfulGate.run(input)).toEqual({ stages: 3, failed: [] });
       expect(handles.childRuns.spawned.map((spawn) => spawn.input)).toEqual(["pins", "test-first.validate", "test-first"].map((checkLabel) => expect.objectContaining({ checkLabel })));
-      expect(handles.sandbox.execs.filter((exec) => exec.command.startsWith("cargo ")).map((exec) => exec.command)).toEqual([DISCOVER_HEAD, DISCOVER, DISCOVER]);
+      expect(handles.sandbox.execs.filter((exec) => exec.command.includes("stages --parts")).map((exec) => exec.command)).toEqual([DISCOVER_HEAD, DISCOVER, DISCOVER]);
     }).pipe(Effect.provide(layer));
   });
 
@@ -251,6 +251,7 @@ describe("contextful-gate", () => {
       expect(handles.executions.steps.map((entry) => entry.name)).toEqual([
         "checkout",
         "discover-stages",
+        "prebuild-ci-binary",
         "checkout-base",
         "discover-base-stages",
         "release-discovery-container",
@@ -265,6 +266,81 @@ describe("contextful-gate", () => {
       expect(handles.sandbox.destroyed).toHaveLength(1);
       expect(handles.childRuns.admissionHandoffs).toBe(1);
     }).pipe(Effect.provide(layer));
+  });
+
+  describe("prebuilt contextful-ci", () => {
+    const DIGEST = "c".repeat(64);
+    const BIN = "/tmp/flare-dispatch-prebuilt/contextful-ci/bin/contextful-ci";
+    const CARGO_RUN = "cargo run --locked -q -p contextful-ci --";
+    const keyed = {
+      "cargo tree": {
+        stdout: "contextful-ci v0.16.0 (/workspace/contextful/tools/ci)\ncontextful-eval v0.16.0 (/workspace/contextful/tools/eval)\n",
+        exitCode: 0,
+      },
+      "sha256sum /tmp/flare-dispatch-prebuilt-key.txt": { stdout: `${DIGEST}  /tmp/flare-dispatch-prebuilt-key.txt\n`, exitCode: 0 },
+    };
+    const gate = (program: Record<string, { stdout?: string; exitCode: number }>) =>
+      makeCFRuntimeTest({
+        sandboxProgram: {
+          [DISCOVER_HEAD]: { stdout: "pins\nworkspace.compile\n", exitCode: 0 },
+          [DISCOVER]: { stdout: "pins\n", exitCode: 0 },
+          ...program,
+        },
+        childRuns: { pollFn: (ids) => ids.map((executionId) => ({ executionId, status: "success" })) },
+      });
+
+    it.effect("builds the tool once and runs every part through it, with the registry cache", () => {
+      const { layer, handles } = gate(keyed);
+      return Effect.gen(function* () {
+        expect(yield* contextfulGate.run(input)).toEqual({ stages: 2, failed: [] });
+        const builds = handles.sandbox.execs.filter((exec) => exec.command.includes("cargo build"));
+        expect(builds).toHaveLength(1);
+        const restore = [{ key: `contextful-ci-${DIGEST}`, base: "/tmp/flare-dispatch-prebuilt/contextful-ci", paths: ["bin"] }];
+        expect(handles.childRuns.spawned.map((spawn) => spawn.input)).toEqual(
+          ["pins", "workspace.compile"].map((stage) =>
+            expect.objectContaining({
+              checkLabel: stage,
+              install: true,
+              restore,
+              command: `if [ -x ${BIN} ] && ${BIN} --help >/dev/null 2>&1; then exec ${BIN} gate --predecessors --stage ${stage} --base ${BASE_SHA}; else exec ${CARGO_RUN} gate --predecessors --stage ${stage} --base ${BASE_SHA}; fi`,
+            }),
+          ),
+        );
+      }).pipe(Effect.provide(layer));
+    });
+
+    it.effect("keeps every part on cargo run when the tool cannot be built", () => {
+      const { layer, handles } = gate({ ...keyed, "cargo build": { exitCode: 101 } });
+      return Effect.gen(function* () {
+        expect(yield* contextfulGate.run(input)).toEqual({ stages: 2, failed: [] });
+        for (const spawn of handles.childRuns.spawned) {
+          const part = spawn.input as { checkLabel: string; command: string; install: boolean; restore?: unknown };
+          expect(part.command).toBe(`${CARGO_RUN} gate --predecessors --stage ${part.checkLabel} --base ${BASE_SHA}`);
+          expect(part.install).toBe(true);
+          expect(part.restore).toBeUndefined();
+        }
+      }).pipe(Effect.provide(layer));
+    });
+
+    it.effect("restores the cargo registry in the gate's own checkout", () => {
+      const { layer, handles } = gate({
+        ...keyed,
+        "test -f pnpm-lock.yaml": { exitCode: 1 },
+        "test -f package-lock.json": { exitCode: 1 },
+      });
+      return Effect.gen(function* () {
+        yield* contextfulGate.run(input);
+        const commands = handles.sandbox.execs.map((exec) => exec.command);
+        expect(commands.indexOf("sha256sum Cargo.lock")).toBeGreaterThanOrEqual(0);
+        expect(commands.indexOf("sha256sum Cargo.lock")).toBeLessThan(commands.indexOf(DISCOVER_HEAD));
+        expect(commands.indexOf("cargo fetch --locked")).toBeGreaterThanOrEqual(0);
+        expect(commands.indexOf("cargo fetch --locked")).toBeLessThan(commands.indexOf(DISCOVER_HEAD));
+      }).pipe(Effect.provide(layer));
+    });
+
+    it("names the cargo run command when no binary was stored", () => {
+      expect(stageCommand("pins", BASE_SHA, null)).toBe(`${CARGO_RUN} gate --predecessors --stage pins --base ${BASE_SHA}`);
+    });
   });
 
   it.effect("fails its own check when discovery fails", () => {
@@ -301,7 +377,7 @@ describe("contextful-gate", () => {
       expect(
         handles.sandbox.execs
           .map((exec) => exec.command)
-          .filter((command) => command.startsWith("cargo ")),
+          .filter((command) => command.includes("stages --parts")),
       ).toEqual([DISCOVER_HEAD, DISCOVER, DISCOVER]);
     }).pipe(Effect.provide(layer));
   });
@@ -319,7 +395,7 @@ describe("contextful-gate", () => {
       expect(
         handles.sandbox.execs
           .map((exec) => exec.command)
-          .filter((command) => command.startsWith("cargo ")),
+          .filter((command) => command.includes("stages --parts")),
       ).toEqual([DISCOVER_HEAD, DISCOVER]);
       expect(handles.childRuns.spawned).toHaveLength(0);
     }).pipe(Effect.provide(layer));

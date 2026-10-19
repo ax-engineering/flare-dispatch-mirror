@@ -58,8 +58,11 @@ import {
 import {
   durableExec,
   ensureWorkspace,
+  isRestorableEntry,
   loadSecrets,
+  restorePrebuilt,
   workspace,
+  type Workspace,
 } from "@fractalboxdev/flare-dispatch-core/primitives";
 
 const CheckInput = Schema.Struct({
@@ -106,6 +109,22 @@ const CheckInput = Schema.Struct({
   /** Run the R2-cached dependency install after the clone. */
   install: Schema.optionalWith(Schema.Boolean, { default: () => false }),
   /**
+   * R2 cache entries restored into the container after the clone, and again
+   * after a recycled container is re-cloned — e.g. a tool binary a parent run
+   * built once (`prebuildCargoBinary`). Restore-only: a miss or a failed restore
+   * leaves the paths absent, and the command decides what absence means. Each
+   * entry's base lies under `/tmp`, outside the checkout.
+   */
+  restore: Schema.optional(
+    Schema.Array(
+      Schema.Struct({
+        key: Schema.String,
+        base: Schema.String,
+        paths: Schema.Array(Schema.String),
+      }).pipe(Schema.filter(isRestorableEntry)),
+    ),
+  ),
+  /**
    * Non-sensitive env only. Dispatch inputs are persisted (executions row +
    * Workflow params) — never put credentials here. Same contract as
    * `offload-test` / `worker-deploy`; see `runs/README.md`.
@@ -140,6 +159,15 @@ const CheckInput = Schema.Struct({
     default: () => false,
   }),
 });
+
+/** Restore every requested cache entry into a fresh checkout's container. */
+const restoreEntries = (
+  ws: Workspace,
+  entries: Schema.Schema.Type<typeof CheckInput>["restore"],
+) =>
+  Effect.forEach(entries ?? [], (entry) =>
+    restorePrebuilt({ container: ws.container, dir: ws.dir, entry }),
+  ).pipe(Effect.as(ws));
 
 const CheckOutput = Schema.Struct({
   exitCode: Schema.Number,
@@ -212,7 +240,8 @@ export const check = defineRun({
   // 1.1.0 — additive: `checkLabel` + the labelled CONFIG_KV rung. An existing
   // unlabelled dispatch resolves the same key, names the same check-run, and
   // gets the same instance id as under 1.0.0.
-  version: "1.1.0",
+  // 1.2.0 — additive: `restore`. A dispatch without it runs as under 1.1.0.
+  version: "1.2.0",
 
   inputs: CheckInput,
   outputs: CheckOutput,
@@ -328,7 +357,7 @@ export const check = defineRun({
           sha: input.sha,
           image: input.image,
           install: input.install,
-        }),
+        }).pipe(Effect.flatMap((ws) => restoreEntries(ws, input.restore))),
       );
 
       // exec — run the check command. A non-zero exit is a normal ExecResult
@@ -353,7 +382,10 @@ export const check = defineRun({
             sha: input.sha,
             ...(input.image !== undefined ? { image: input.image } : {}),
             install: input.install,
-          }),
+          }).pipe(
+            // A re-cloned workspace lost what the checkout step restored.
+            Effect.flatMap((ws) => (ws === current ? Effect.succeed(ws) : restoreEntries(ws, input.restore))),
+          ),
         exec: (ws) => ({
           cwd: ws.dir,
           command,
