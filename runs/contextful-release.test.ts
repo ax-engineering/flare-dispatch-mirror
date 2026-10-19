@@ -313,7 +313,7 @@ describe("contextful-release", () => {
     }).pipe(Effect.provide(layer));
   });
 
-  it.effect("starts the eight longest cells at once and refills each freed slot, polling every 30 s", () => {
+  it.effect("starts the four longest cells at once and refills each freed slot, polling every 30 s", () => {
     // full x86_64 settles on the second poll; every other long cell on the fourth.
     const { layer, handles, sleeps, provideClock } = releaseFixture((cell, poll) =>
       cell.profile === "contextful-control" ? "success"
@@ -322,13 +322,13 @@ describe("contextful-release", () => {
     return Effect.gen(function* () {
       const result = yield* provideClock(contextfulRelease.run({ repo, tag: "v0.5.0", sha, dryRun: true }));
       expect(result).toMatchObject({ cells: 10, assets: 36 });
-      expect(RELEASE_WINDOW).toBe(8);
+      expect(RELEASE_WINDOW).toBe(4);
       expect(cellsOf(handles)).toEqual(SPAWN_ORDER.map((cell) => `${cell.profile}/${cell.target}`));
       expect(cellsOf(handles).slice(0, 8).some((cell) => cell.startsWith("contextful-control/"))).toBe(false);
       expect(cellsOf(handles).slice(8)).toEqual([
         "contextful-control/x86_64-unknown-linux-musl", "contextful-control/aarch64-unknown-linux-musl"]);
       expect(stepNames(handles).filter((name) => name.startsWith("spawn-cells-")))
-        .toEqual(["spawn-cells-0", "spawn-cells-8", "spawn-cells-9"]);
+        .toEqual(["spawn-cells-0", "spawn-cells-4", "spawn-cells-5", "spawn-cells-9"]);
       expect(handles.childRuns.admissionHandoffs).toBe(1);
       const cellSleeps = sleeps.filter((sleep) => sleep.name.startsWith("await-cells-"));
       expect(cellSleeps.length).toBeGreaterThan(0);
@@ -344,17 +344,18 @@ describe("contextful-release", () => {
   it.effect("a failed cell starts no further cell, lets the running ones settle, and names every failure", () => {
     const { layer, handles, provideClock } = releaseFixture((cell, poll) =>
       cell.profile === "contextful-full" && cell.target === "x86_64-unknown-linux-musl" ? "failure"
-        : cell.profile === "contextful-edge" && cell.target === "aarch64-apple-darwin" && poll >= 1 ? "failure"
+        : cell.profile === "contextful-full" && cell.target === "aarch64-apple-darwin" && poll >= 1 ? "failure"
           : poll >= 2 ? "success" : "running");
     return Effect.gen(function* () {
       const exit = yield* Effect.exit(provideClock(contextfulRelease.run({ repo, tag: "v0.5.0", sha, dryRun: true })));
       expect(Exit.isFailure(exit)).toBe(true);
       if (Exit.isFailure(exit)) {
         expect(String(Cause.squash(exit.cause))).toContain(
-          "release cells failed: contextful-edge/aarch64-apple-darwin, contextful-full/x86_64-unknown-linux-musl");
+          "release cells failed: contextful-full/x86_64-unknown-linux-musl, contextful-full/aarch64-apple-darwin; "
+          + "not started: contextful-edge/x86_64-unknown-linux-musl");
       }
-      expect(cellsOf(handles)).toHaveLength(8);
-      expect(cellsOf(handles).some((cell) => cell.startsWith("contextful-control/"))).toBe(false);
+      expect(cellsOf(handles)).toHaveLength(4);
+      expect(cellsOf(handles).every((cell) => cell.startsWith("contextful-full/"))).toBe(true);
       expect(handles.childRuns.spawned.some((child) => child.run === "contextful-release-formula")).toBe(false);
     }).pipe(Effect.provide(layer));
   });
@@ -378,15 +379,17 @@ describe("contextful-release", () => {
   it.effect("a cell that outlives its budget after another failed ends the release naming the failure, the hang and the unstarted cells", () => {
     const { layer, provideClock } = releaseFixture((cell, poll) =>
       cell.profile === "contextful-full" && cell.target === "x86_64-unknown-linux-musl" ? "failure"
-        : cell.profile === "contextful-edge" && cell.target === "aarch64-apple-darwin" ? "running"
+        : cell.profile === "contextful-full" && cell.target === "aarch64-apple-darwin" ? "running"
           : poll >= 2 ? "success" : "running");
     return Effect.gen(function* () {
       const exit = yield* Effect.exit(provideClock(contextfulRelease.run({ repo, tag: "v0.5.0", sha, dryRun: true })));
       expect(Exit.isFailure(exit)).toBe(true);
       if (Exit.isFailure(exit)) {
         expect(String(Cause.squash(exit.cause))).toContain("release cells failed: contextful-full/x86_64-unknown-linux-musl; "
-          + "timed out: contextful-edge/aarch64-apple-darwin; "
-          + "not started: contextful-control/x86_64-unknown-linux-musl, contextful-control/aarch64-unknown-linux-musl");
+          + "timed out: contextful-full/aarch64-apple-darwin; "
+          + "not started: contextful-edge/x86_64-unknown-linux-musl, contextful-edge/aarch64-unknown-linux-musl, "
+          + "contextful-edge/x86_64-apple-darwin, contextful-edge/aarch64-apple-darwin, "
+          + "contextful-control/x86_64-unknown-linux-musl, contextful-control/aarch64-unknown-linux-musl");
       }
     }).pipe(Effect.provide(layer));
   });

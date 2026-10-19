@@ -47,10 +47,12 @@ const CELLS = PROFILES.flatMap((profile) =>
 /** A cell's admission queue age: two concurrent releases share the release pool. */
 const CELL_QUEUE_SEC = 21600;
 /**
- * Cells in flight at once: the release pool's `max_instances` (wrangler.jsonc
- * `RunSandboxRelease`), which is also that pool's admission cap.
+ * Cells in flight at once, half the release pool's `max_instances` (wrangler.jsonc
+ * `RunSandboxRelease`). Eight concurrent cross-builds lost two cells' containers
+ * within minutes of launch, and one lost cell fails the whole release; four keep
+ * the release under the container capacity the gate pools share.
  */
-export const RELEASE_WINDOW = 8;
+export const RELEASE_WINDOW = 4;
 /** Status-poll cadence while the window is full. */
 const RELEASE_POLL_EVERY = "30 seconds";
 /**
