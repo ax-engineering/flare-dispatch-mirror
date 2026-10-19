@@ -1,5 +1,5 @@
 import { it } from "@effect/vitest";
-import { Cause, Effect, Exit, Fiber, TestClock } from "effect";
+import { Cause, Effect, Exit, Fiber, Option, TestClock } from "effect";
 import { describe, expect } from "vitest";
 import { ChildRuns, IO, Sandbox, StepRunner, type CheckCommandService } from "@fractalboxdev/flare-dispatch-core";
 import { makeCFRuntimeTest } from "@fractalboxdev/flare-dispatch-core/testing";
@@ -7,6 +7,19 @@ import { contextfulRelease, contextfulReleaseCell, contextfulReleaseFormula, REL
 
 const sha = "a".repeat(40);
 const repo = "fractalboxdev/contextful";
+
+/**
+ * The cell verdict a failed release reports: a typed `AcceptanceFailed` whose
+ * markdown the check-run renders, one bullet line per outcome.
+ */
+const verdictOf = (exit: Exit.Exit<unknown, unknown>): readonly string[] | undefined => {
+  if (!Exit.isFailure(exit)) return undefined;
+  const failure = Option.getOrUndefined(Cause.failureOption(exit.cause)) as
+    { _tag?: string; exitCode?: number; summaryMd?: string } | undefined;
+  expect(failure?._tag).toBe("AcceptanceFailed");
+  expect(failure?.exitCode).toBe(1);
+  return failure?.summaryMd?.split("\n").filter((line) => line.startsWith("- "));
+};
 
 describe("contextful-release", () => {
   it("subscribes only to live version-tag pushes from the release repository", () => {
@@ -349,11 +362,12 @@ describe("contextful-release", () => {
     return Effect.gen(function* () {
       const exit = yield* Effect.exit(provideClock(contextfulRelease.run({ repo, tag: "v0.5.0", sha, dryRun: true })));
       expect(Exit.isFailure(exit)).toBe(true);
-      if (Exit.isFailure(exit)) {
-        expect(String(Cause.squash(exit.cause))).toContain(
-          "release cells failed: contextful-full/x86_64-unknown-linux-musl, contextful-full/aarch64-apple-darwin; "
-          + "not started: contextful-edge/x86_64-unknown-linux-musl");
-      }
+      expect(verdictOf(exit)).toEqual([
+        "- Failed: `contextful-full/x86_64-unknown-linux-musl`, `contextful-full/aarch64-apple-darwin`",
+        "- Not started: `contextful-edge/x86_64-unknown-linux-musl`, `contextful-edge/aarch64-unknown-linux-musl`, "
+          + "`contextful-edge/x86_64-apple-darwin`, `contextful-edge/aarch64-apple-darwin`, "
+          + "`contextful-control/x86_64-unknown-linux-musl`, `contextful-control/aarch64-unknown-linux-musl`",
+      ]);
       expect(cellsOf(handles)).toHaveLength(4);
       expect(cellsOf(handles).every((cell) => cell.startsWith("contextful-full/"))).toBe(true);
       expect(handles.childRuns.spawned.some((child) => child.run === "contextful-release-formula")).toBe(false);
@@ -384,13 +398,13 @@ describe("contextful-release", () => {
     return Effect.gen(function* () {
       const exit = yield* Effect.exit(provideClock(contextfulRelease.run({ repo, tag: "v0.5.0", sha, dryRun: true })));
       expect(Exit.isFailure(exit)).toBe(true);
-      if (Exit.isFailure(exit)) {
-        expect(String(Cause.squash(exit.cause))).toContain("release cells failed: contextful-full/x86_64-unknown-linux-musl; "
-          + "timed out: contextful-full/aarch64-apple-darwin; "
-          + "not started: contextful-edge/x86_64-unknown-linux-musl, contextful-edge/aarch64-unknown-linux-musl, "
-          + "contextful-edge/x86_64-apple-darwin, contextful-edge/aarch64-apple-darwin, "
-          + "contextful-control/x86_64-unknown-linux-musl, contextful-control/aarch64-unknown-linux-musl");
-      }
+      expect(verdictOf(exit)).toEqual([
+        "- Failed: `contextful-full/x86_64-unknown-linux-musl`",
+        "- Timed out: `contextful-full/aarch64-apple-darwin`",
+        "- Not started: `contextful-edge/x86_64-unknown-linux-musl`, `contextful-edge/aarch64-unknown-linux-musl`, "
+          + "`contextful-edge/x86_64-apple-darwin`, `contextful-edge/aarch64-apple-darwin`, "
+          + "`contextful-control/x86_64-unknown-linux-musl`, `contextful-control/aarch64-unknown-linux-musl`",
+      ]);
     }).pipe(Effect.provide(layer));
   });
 

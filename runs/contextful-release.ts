@@ -1,6 +1,6 @@
 import { Effect, Schema } from "effect";
 import {
-  artifact, defineRun, github, handoffChildAdmission, io, isTerminalChildStatus, sandbox, step, StepFailed,
+  AcceptanceFailed, artifact, defineRun, github, handoffChildAdmission, io, isTerminalChildStatus, sandbox, step, StepFailed,
   type ChildStatusRecord,
 } from "@fractalboxdev/flare-dispatch-core";
 import {
@@ -433,16 +433,18 @@ export const contextfulRelease = defineRun({
       return child !== undefined && cellFailed(child);
     });
     if (failedCells.length > 0 || timedOut.size > 0) {
+      // A typed failure, not a defect: the check-run renders `summaryMd`, so
+      // the verdict names every failed, timed-out and unstarted cell there.
       const names = (cells: readonly { readonly profile: string; readonly target: string }[]) =>
-        cells.map((cell) => `${cell.profile}/${cell.target}`).join(", ");
+        cells.map((cell) => `\`${cell.profile}/${cell.target}\``).join(", ");
       const verdict = [
-        ["failed", failedCells],
-        ["timed out", CELLS.filter((_, index) => timedOut.has(index))],
-        ["not started", queue],
+        ["Failed", failedCells],
+        ["Timed out", CELLS.filter((_, index) => timedOut.has(index))],
+        ["Not started", queue],
       ] as const;
-      return yield* Effect.die(new Error(`release cells ${verdict
+      return yield* Effect.fail(new AcceptanceFailed({ exitCode: 1, summaryMd: `**Release cells**\n\n${verdict
         .filter(([, cells]) => cells.length > 0)
-        .map(([label, cells]) => `${label}: ${names(cells)}`).join("; ")}`));
+        .map(([label, cells]) => `- ${label}: ${names(cells)}`).join("\n")}` }));
     }
     // Matrix order, whatever order the cells settled in.
     const children = CELLS.flatMap((_, index) => settledByCell.get(index) ?? []);
