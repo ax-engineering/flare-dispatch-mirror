@@ -76,6 +76,10 @@
     // also set the AI_GATEWAY_AUTH_TOKEN secret. Operator overlay.
     "AI_GATEWAY_ID": "your-ai-gateway",
     "ADMISSION_CAP": "16",
+    // The agent and release pools admit at most RunSandboxAgent's and
+    // RunSandboxRelease's max_instances.
+    "ADMISSION_CAP_AGENT": "8",
+    "ADMISSION_CAP_RELEASE": "8",
     // Opt the human-facing viewer surfaces (incl. the GitHub App install flow)
     // out of the Cloudflare Access gate for the initial dogfood. Configure
     // ACCESS_AUD and drop this to re-gate them. NOTE: the viewer surfaces still

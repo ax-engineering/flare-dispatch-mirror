@@ -54,7 +54,6 @@ import { getSandbox } from "@cloudflare/sandbox";
 import { Duration, Effect, Exit, identity, Runtime, Schedule, Schema } from "effect";
 import {
   admissionAcquireAttempts,
-  type AdmissionPool,
   AdmissionTimedOut,
   Checks,
   decideAdmission,
@@ -85,7 +84,6 @@ import {
   makeWritebackTokenMinter,
   previewSafeSandboxId,
   recordExecutionCost,
-  resolveAdmissionCap,
   runSerialGate,
   runWriteback,
   type WritebackOutcome,
@@ -93,7 +91,7 @@ import {
 import { WRITEBACK_ARTIFACT } from "@fractalboxdev/flare-dispatch-core";
 import { lookupRun } from "./registry";
 import { preAssertedApproval, resolveTargets, runGrant, runsOnFacade } from "./grant-catalog";
-import { selectSandboxNs } from "./sandbox-routing";
+import { selectAdmission, selectSandboxNs } from "./sandbox-routing";
 import { queuedSummary, serialQueuedSummary } from "./admission-summary";
 import {
   appendFailureSummary,
@@ -354,19 +352,14 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
     });
 
     // The admission-semaphore pool key — the SAME routing rule as the binding
-    // selection above (browser/agent image without a bound container degrades to
-    // lean), so a run is always metered against the pool whose container it will
-    // actually consume.
-    const admissionPool = selectSandboxNs<AdmissionPool>(run.sandboxImage, {
-      lean: "lean",
-      browser: this.env.RUNS_SANDBOX_BROWSER !== undefined ? "browser" : undefined,
-      agent: this.env.RUNS_SANDBOX_AGENT !== undefined ? "agent" : undefined,
-      release: this.env.RUNS_SANDBOX_RELEASE !== undefined ? "release" : undefined,
-    });
-    // The per-pool slot cap, from the plain `ADMISSION_CAP` wrangler var
-    // (one var for both pools; keep it ≤ each container's `max_instances` —
-    // see the paired comments in wrangler.jsonc). Unset/unparsable → 16.
-    const admissionCap = resolveAdmissionCap(this.env.ADMISSION_CAP);
+    // selection above (browser/agent/release image without a bound container
+    // degrades to lean), so a run is always metered against the pool whose
+    // container it will actually consume — and that pool's slot cap: the plain
+    // `ADMISSION_CAP` wrangler var (unset/unparsable → 16), and for the agent
+    // and release pools the smaller of that and `ADMISSION_CAP_AGENT` /
+    // `ADMISSION_CAP_RELEASE` (unset → 8). Keep every cap ≤ its container's
+    // `max_instances` (sandbox-routing.test.ts reads wrangler.jsonc to check).
+    const { pool: admissionPool, cap: admissionCap } = selectAdmission(run.sandboxImage, this.env);
 
     // Build the per-execution live runtime: D1 + R2 + Containers + Checks, with
     // `StepRunner` bound to *this* Workflow's `step` so each `step(...)` in the

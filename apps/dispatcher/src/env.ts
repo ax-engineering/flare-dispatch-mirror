@@ -443,6 +443,22 @@ export interface Env {
   readonly ADMISSION_CAP?: string;
 
   /**
+   * The release pool's admission slots — a var, carried as a string. The
+   * release pool admits at most the smaller of this and `ADMISSION_CAP`; keep
+   * it ≤ `RunSandboxRelease`'s `max_instances`. Absent / unparsable → 8
+   * (`RELEASE_ADMISSION_CAP_DEFAULT`).
+   */
+  readonly ADMISSION_CAP_RELEASE?: string;
+
+  /**
+   * The agent pool's admission slots — a var, carried as a string. The agent
+   * pool admits at most the smaller of this and `ADMISSION_CAP`; keep it ≤
+   * `RunSandboxAgent`'s `max_instances`. Absent / unparsable → 8
+   * (`AGENT_ADMISSION_CAP_DEFAULT`).
+   */
+  readonly ADMISSION_CAP_AGENT?: string;
+
+  /**
    * Cloudflare account id (the 32-hex id in the dashboard URL) — a var, not a
    * secret. When set, `RunWorkflow` builds a `details_url` on the GitHub
    * check-run pointing at the Cloudflare Workflows instance page

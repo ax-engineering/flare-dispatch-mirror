@@ -24,6 +24,9 @@ import {
   ADMISSION_WAITER_TTL_MS,
   makeRunAdmissionD1,
   resolveAdmissionCap,
+  resolvePoolAdmissionCap,
+  RELEASE_ADMISSION_CAP_DEFAULT,
+  AGENT_ADMISSION_CAP_DEFAULT,
 } from "./run-admission-d1";
 import { makeTestBindings, type TestBindings } from "./test-support-workers";
 
@@ -295,6 +298,15 @@ describe("makeRunAdmissionD1 — atomic admission against real D1", () => {
     const admitted = await Effect.runPromise(storeDefault.attempt(A, "lean", enqueuedAt));
     expect(admitted.admitted).toBe(true);
   });
+
+  it("a second release's cells queue once eight release cells are admitted", async () => {
+    const cap = resolvePoolAdmissionCap("release", { ADMISSION_CAP: "16" });
+    expect(cap).toBe(8);
+    for (let i = 0; i < cap; i++) await seed(`cell-${i}`, "release", "admitted", T0 - 1_000, T0);
+    const store = makeRunAdmissionD1(bindings.db, () => T0, cap);
+    const { enqueuedAt } = await Effect.runPromise(store.enqueue(A, "release"));
+    expect(await Effect.runPromise(store.attempt(A, "release", enqueuedAt))).toMatchObject({ admitted: false, poolBusy: cap });
+  });
 });
 
 describe("resolveAdmissionCap — the ADMISSION_CAP wrangler var", () => {
@@ -311,5 +323,33 @@ describe("resolveAdmissionCap — the ADMISSION_CAP wrangler var", () => {
     expect(resolveAdmissionCap("")).toBe(ADMISSION_CAP_DEFAULT);
     expect(resolveAdmissionCap("0")).toBe(ADMISSION_CAP_DEFAULT);
     expect(resolveAdmissionCap("-3")).toBe(ADMISSION_CAP_DEFAULT);
+  });
+});
+
+describe("resolvePoolAdmissionCap — one cap per pool", () => {
+  it("caps the release pool at its eight containers under the shared cap of 16", () => {
+    expect(RELEASE_ADMISSION_CAP_DEFAULT).toBe(8);
+    expect(resolvePoolAdmissionCap("release", { ADMISSION_CAP: "16" })).toBe(8);
+    expect(resolvePoolAdmissionCap("release", { ADMISSION_CAP: "16", ADMISSION_CAP_RELEASE: "10" })).toBe(10);
+    expect(resolvePoolAdmissionCap("release", { ADMISSION_CAP: "16", ADMISSION_CAP_RELEASE: "eight" })).toBe(8);
+  });
+
+  it("never lets the release cap exceed the shared cap", () => {
+    expect(resolvePoolAdmissionCap("release", { ADMISSION_CAP: "4" })).toBe(4);
+    expect(resolvePoolAdmissionCap("release", { ADMISSION_CAP: "4", ADMISSION_CAP_RELEASE: "12" })).toBe(4);
+  });
+
+  it("caps the agent pool at its eight containers under the shared cap of 16", () => {
+    expect(AGENT_ADMISSION_CAP_DEFAULT).toBe(8);
+    expect(resolvePoolAdmissionCap("agent", { ADMISSION_CAP: "16" })).toBe(8);
+    expect(resolvePoolAdmissionCap("agent", { ADMISSION_CAP: "16", ADMISSION_CAP_AGENT: "6" })).toBe(6);
+    expect(resolvePoolAdmissionCap("agent", { ADMISSION_CAP: "4", ADMISSION_CAP_AGENT: "12" })).toBe(4);
+  });
+
+  it("leaves the lean and browser pools on the shared cap", () => {
+    for (const pool of ["lean", "browser"] as const) {
+      expect(resolvePoolAdmissionCap(pool, { ADMISSION_CAP: "16", ADMISSION_CAP_AGENT: "8", ADMISSION_CAP_RELEASE: "8" })).toBe(16);
+      expect(resolvePoolAdmissionCap(pool, {})).toBe(ADMISSION_CAP_DEFAULT);
+    }
   });
 });

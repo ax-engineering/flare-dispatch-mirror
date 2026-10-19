@@ -53,6 +53,46 @@ export const resolveAdmissionCap = (raw: string | undefined): number => {
 };
 
 /**
+ * The release pool's slot cap when `ADMISSION_CAP_RELEASE` is unset — the
+ * `RunSandboxRelease` container's `max_instances: 8` in wrangler.jsonc. Under
+ * the shared cap of 16, two concurrent releases admit 16 cells onto 8
+ * containers and the excess fail `ContainerLaunchFailed`.
+ */
+export const RELEASE_ADMISSION_CAP_DEFAULT = 8;
+
+/**
+ * The agent pool's slot cap when `ADMISSION_CAP_AGENT` is unset — the
+ * `RunSandboxAgent` container's `max_instances: 8` in wrangler.jsonc.
+ */
+export const AGENT_ADMISSION_CAP_DEFAULT = 8;
+
+/** The admission vars a pool's cap reads. */
+export type AdmissionCapVars = {
+  readonly ADMISSION_CAP?: string;
+  readonly ADMISSION_CAP_AGENT?: string;
+  readonly ADMISSION_CAP_RELEASE?: string;
+};
+
+/**
+ * The slot cap for one pool. `ADMISSION_CAP` bounds every pool; the agent and
+ * release pools, whose containers are fewer, are further bounded by
+ * `ADMISSION_CAP_AGENT` and `ADMISSION_CAP_RELEASE` (defaults
+ * {@link AGENT_ADMISSION_CAP_DEFAULT}, {@link RELEASE_ADMISSION_CAP_DEFAULT}),
+ * so their cap is the smaller of the two. Lean and browser keep
+ * `ADMISSION_CAP` alone. Garbage degrades to the default, as in
+ * {@link resolveAdmissionCap}.
+ */
+export const resolvePoolAdmissionCap = (pool: AdmissionPool, vars: AdmissionCapVars): number => {
+  const shared = resolveAdmissionCap(vars.ADMISSION_CAP);
+  const own = pool === "release" ? { raw: vars.ADMISSION_CAP_RELEASE, fallback: RELEASE_ADMISSION_CAP_DEFAULT }
+    : pool === "agent" ? { raw: vars.ADMISSION_CAP_AGENT, fallback: AGENT_ADMISSION_CAP_DEFAULT }
+    : undefined;
+  if (own === undefined) return shared;
+  const parsed = own.raw === undefined ? NaN : Number.parseInt(own.raw, 10);
+  return Math.min(shared, Number.isInteger(parsed) && parsed > 0 ? parsed : own.fallback);
+};
+
+/**
  * Delay between claim attempts while the pool is full. Each wait is a
  * durable `step.sleep`, so a queued run costs nothing while it waits; 20s
  * keeps the loop ≤270 claim steps + 270 sleeps over the largest run override

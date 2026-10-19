@@ -1,9 +1,11 @@
 import { Effect, Schema } from "effect";
 import {
-  artifact, defineRun, github, handoffChildAdmission, sandbox, step, StepFailed,
+  artifact, defineRun, github, handoffChildAdmission, io, isTerminalChildStatus, sandbox, step, StepFailed,
+  type ChildStatusRecord,
 } from "@fractalboxdev/flare-dispatch-core";
 import {
-  DURABLE_EXEC_RETRY_ON, durableExec, ensureWorkspace, fanOut, waitForChildren, workspace, type Workspace,
+  DURABLE_EXEC_RETRY_ON, durableExec, ensureWorkspace, fanOut, waitForAnyChildDurably, waitForChildren, workspace,
+  type Workspace,
 } from "@fractalboxdev/flare-dispatch-core/primitives";
 
 const REPO = "fractalboxdev/contextful";
@@ -41,6 +43,30 @@ const CELLS = PROFILES.flatMap((profile) =>
     target,
   })),
 );
+/** A cell's admission queue age: two concurrent releases share the release pool. */
+const CELL_QUEUE_SEC = 21600;
+/**
+ * Cells in flight at once: the release pool's `max_instances` (wrangler.jsonc
+ * `RunSandboxRelease`), which is also that pool's admission cap.
+ */
+export const RELEASE_WINDOW = 8;
+/** Status-poll cadence while the window is full. */
+const RELEASE_POLL_EVERY = "30 seconds";
+/**
+ * What a cell spends outside its queue age and run ceiling: the 600 s
+ * container-lease wait before its ceiling starts, then teardown and the
+ * terminal-row write after it ends, and the parent's next poll.
+ */
+const CELL_SETTLE_MARGIN_SEC = 1800;
+/** A spawned cell's whole budget: queue age, run ceiling, and the settle margin. */
+const CELL_BUDGET_MS = (CELL_QUEUE_SEC + CELL_MAX_DURATION_SEC + CELL_SETTLE_MARGIN_SEC) * 1000;
+/**
+ * Spawn order, longest cells first: `full` links DuckDB and wasmtime, `edge`
+ * DuckDB, `control` neither. The two short `control` cells take the first
+ * slots that free, so the last cell to finish is a long one started at once.
+ */
+export const SPAWN_ORDER = (["contextful-full", "contextful-edge", "contextful-control"] as const)
+  .flatMap((profile) => CELLS.filter((cell) => cell.profile === profile));
 
 const ReleaseInput = Schema.Struct({
   repo: Schema.String,
@@ -174,7 +200,7 @@ export const contextfulReleaseCell = defineRun({
   sandboxImage: "release",
   inputs: ReleaseCellInput,
   outputs: ReleaseCellOutput,
-  limits: { maxDurationSec: CELL_MAX_DURATION_SEC, admissionMaxQueueAgeSec: 21600 },
+  limits: { maxDurationSec: CELL_MAX_DURATION_SEC, admissionMaxQueueAgeSec: CELL_QUEUE_SEC },
   run: (input) =>
     Effect.gen(function* () {
       requireValidRequest(input.repo, input.tag, input.sha);
@@ -269,8 +295,12 @@ export const contextfulReleaseFormula = defineRun({
 
 export const contextfulRelease = defineRun({
   name: "contextful-release",
-  version: "1.0.0",
-  sandboxImage: "lean",
+  // 1.1.0 — release pool, sliding window of cells.
+  version: "1.1.0",
+  // The parent makes no sandbox call and hands its admission row off after
+  // its first spawn. On the release pool it queues only behind other
+  // releases, never behind pull-request gates on the lean pool.
+  sandboxImage: "release",
   inputs: ReleaseInput,
   outputs: ReleaseOutput,
   limits: { maxDurationSec: 259200, admissionMaxQueueAgeSec: 21600 },
@@ -310,23 +340,86 @@ export const contextfulRelease = defineRun({
         name: input.tag, body: `Release ${input.tag}`, draft: true });
     }));
     if (!dryRun && release.id <= 0) return yield* Effect.die(new Error("draft release was not created"));
-    const children: Array<{ executionId: string; status: string; summaryJson?: string }> = [];
-    for (let offset = 0; offset < CELLS.length; offset += 3) {
-      const batch = CELLS.slice(offset, offset + 3);
-      const handles = yield* step(`spawn-release-cells-${offset}`, () => fanOut({
-        run: contextfulReleaseCell.name,
-        items: batch,
-        toInput: (cell) => ({ ...cell, repo: input.repo, tag: input.tag, sha: tag.commitSha, releaseId: release.id, dryRun }),
-      }));
-      if (offset === 0) yield* step("handoff-admission", () => handoffChildAdmission());
-      const settled = yield* step(`await-release-cells-${offset}`, () => waitForChildren({
-        ids: handles.map((handle) => handle.executionId), timeout: "12 hours", pollEvery: "30 seconds",
-      }));
-      children.push(...settled);
-      if (settled.some((child) => child.status !== "success" || !child.summaryJson)) {
-        return yield* Effect.die(new Error(`release cell batch ${offset / 3 + 1} failed`));
+    // Sliding window: the next cell spawns as soon as any running cell
+    // settles. Every spawn and every observation is a checkpoint, so a replay
+    // walks the same spawns and slot frees. The `-cells-` step names share no
+    // checkpoint with the fixed batches' `-release-cells-` steps, so a release
+    // in flight across a deploy re-spawns under new names; a child's instance
+    // id derives from its input, so the re-spawn finds the same children.
+    const queue = [...SPAWN_ORDER];
+    const running: { readonly index: number; readonly id: string; readonly expiresAt: number }[] = [];
+    const settledByCell = new Map<number, ChildStatusRecord>();
+    const timedOut = new Set<number>();
+    const cellFailed = (child: ChildStatusRecord) => child.status !== "success" || !child.summaryJson;
+    let spawned = 0;
+    for (let round = 0; queue.length > 0 || running.length > 0; round++) {
+      const failed = timedOut.size > 0 || [...settledByCell.values()].some(cellFailed);
+      const free = RELEASE_WINDOW - running.length;
+      // After a failure no further cell starts; the running ones settle or
+      // outlive their budget, so the verdict names every failed cell. They
+      // write to the same draft release, so the parent never ends before them.
+      if (!failed && queue.length > 0 && free > 0) {
+        const batch = queue.splice(0, free);
+        const { handles, spawnedAt } = yield* step(`spawn-cells-${spawned}`, () => Effect.gen(function* () {
+          const handles = yield* fanOut({
+            run: contextfulReleaseCell.name,
+            items: batch,
+            concurrency: batch.length,
+            toInput: (cell) => ({ ...cell, repo: input.repo, tag: input.tag, sha: tag.commitSha, releaseId: release.id, dryRun }),
+          });
+          return { handles, spawnedAt: yield* io.now };
+        }));
+        if (spawned === 0) yield* step("handoff-admission", () => handoffChildAdmission());
+        batch.forEach((cell, index) => running.push({
+          index: CELLS.indexOf(cell),
+          id: handles[index]!.executionId,
+          expiresAt: spawnedAt + CELL_BUDGET_MS,
+        }));
+        spawned += batch.length;
+      } else if (failed && running.length === 0) {
+        break;
+      }
+      const expiresAt = Math.min(...running.map((cell) => cell.expiresAt));
+      const records = yield* waitForAnyChildDurably({
+        name: `await-cells-${round}`,
+        ids: running.map((cell) => cell.id),
+        expiresAt,
+        pollEvery: RELEASE_POLL_EVERY,
+      }).pipe(Effect.catchTag("ChildWaitTimeout", () => Effect.succeed(undefined)));
+      if (records === undefined) {
+        // The cells whose budget ended this wait count as failed; the rest keep running.
+        for (let slot = running.length - 1; slot >= 0; slot--) {
+          if (running[slot]!.expiresAt > expiresAt) continue;
+          timedOut.add(running[slot]!.index);
+          running.splice(slot, 1);
+        }
+        continue;
+      }
+      for (let slot = running.length - 1; slot >= 0; slot--) {
+        const record = records.find((child) => child.executionId === running[slot]!.id);
+        if (record === undefined || !isTerminalChildStatus(record.status)) continue;
+        settledByCell.set(running[slot]!.index, record);
+        running.splice(slot, 1);
       }
     }
+    const failedCells = CELLS.filter((_, index) => {
+      const child = settledByCell.get(index);
+      return child !== undefined && cellFailed(child);
+    });
+    if (failedCells.length > 0 || timedOut.size > 0) {
+      const names = (cells: readonly { readonly profile: string; readonly target: string }[]) =>
+        cells.map((cell) => `${cell.profile}/${cell.target}`).join(", ");
+      const verdict = [
+        ["failed", failedCells],
+        ["timed out", CELLS.filter((_, index) => timedOut.has(index))],
+        ["not started", queue],
+      ] as const;
+      return yield* Effect.die(new Error(`release cells ${verdict
+        .filter(([, cells]) => cells.length > 0)
+        .map(([label, cells]) => `${label}: ${names(cells)}`).join("; ")}`));
+    }
+    // Matrix order, whatever order the cells settled in.
+    const children = CELLS.flatMap((_, index) => settledByCell.get(index) ?? []);
     if (children.length !== CELLS.length || children.some((child) => child.status !== "success" || !child.summaryJson)) {
       return yield* Effect.die(new Error("one or more release cells failed"));
     }

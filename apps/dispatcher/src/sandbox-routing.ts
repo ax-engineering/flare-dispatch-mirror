@@ -10,7 +10,8 @@
 // Browser Rendering CDP slot (the run connects *out* to a CF-managed browser and
 // stays on the lean image); `sandboxImage` picks the image the container boots.
 
-import type { SandboxImage } from "@fractalboxdev/flare-dispatch-core";
+import type { AdmissionPool, SandboxImage } from "@fractalboxdev/flare-dispatch-core";
+import { resolvePoolAdmissionCap, type AdmissionCapVars } from "@fractalboxdev/flare-dispatch-runtime-cf/admission-cap";
 
 /**
  * Pick the Container binding for a run's declared `sandboxImage`. Generic over
@@ -49,4 +50,27 @@ export const selectSandboxNs = <T>(
     return bindings.release;
   }
   return bindings.lean;
+};
+
+/**
+ * The admission pool a run is metered against and that pool's slot cap. The
+ * pool follows {@link selectSandboxNs}'s routing (an image whose container is
+ * unbound degrades to lean), so a run holds a slot in the pool whose container
+ * it consumes; the cap is {@link resolvePoolAdmissionCap}'s for that pool.
+ */
+export const selectAdmission = (
+  sandboxImage: SandboxImage | undefined,
+  env: AdmissionCapVars & {
+    readonly RUNS_SANDBOX_BROWSER?: unknown;
+    readonly RUNS_SANDBOX_AGENT?: unknown;
+    readonly RUNS_SANDBOX_RELEASE?: unknown;
+  },
+): { readonly pool: AdmissionPool; readonly cap: number } => {
+  const pool = selectSandboxNs<AdmissionPool>(sandboxImage, {
+    lean: "lean",
+    browser: env.RUNS_SANDBOX_BROWSER !== undefined ? "browser" : undefined,
+    agent: env.RUNS_SANDBOX_AGENT !== undefined ? "agent" : undefined,
+    release: env.RUNS_SANDBOX_RELEASE !== undefined ? "release" : undefined,
+  });
+  return { pool, cap: resolvePoolAdmissionCap(pool, env) };
 };

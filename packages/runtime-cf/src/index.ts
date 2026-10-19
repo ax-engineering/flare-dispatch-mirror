@@ -61,11 +61,15 @@ export {
 export {
   makeRunAdmissionD1,
   resolveAdmissionCap,
+  resolvePoolAdmissionCap,
   ADMISSION_CAP_DEFAULT,
+  RELEASE_ADMISSION_CAP_DEFAULT,
+  AGENT_ADMISSION_CAP_DEFAULT,
   ADMISSION_POLL_EVERY_MS,
   ADMISSION_MAX_QUEUE_AGE_MS,
   ADMISSION_TTL_MS,
   ADMISSION_WAITER_TTL_MS,
+  type AdmissionCapVars,
   type RunAdmissionStore,
 } from "./run-admission-d1";
 export {
