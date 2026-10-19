@@ -211,6 +211,12 @@
       "image_build_context": ".",
       "instance_type": "standard-4",
       "max_instances": 8,
+      // Every deploy pushes a new image and rolls every container. A rollout
+      // replaces an active instance once this grace has passed, and a
+      // replaced release container loses its build (`SandboxProcessLost`):
+      // the grace spans the 14400 s build ceiling, the 1800 s collect step
+      // and 600 s of checkout. A cell started in the grace keeps its image.
+      "rollout_active_grace_period": 16800,
     },
   ],
 

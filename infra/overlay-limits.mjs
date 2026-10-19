@@ -1,8 +1,10 @@
-// Merge the committed wrangler.jsonc's `limits` into the operator overlay.
+// Merge the committed wrangler.jsonc's `limits`, and each container's
+// `rollout_*` settings, into the operator overlay.
 //
 // The deploy writes the overlay over the committed file, so a setting with no
-// account-specific value reaches production only through this merge. A limit
-// the overlay sets wins; one it omits comes from the template.
+// account-specific value reaches production only through this merge. A value
+// the overlay sets wins; one it omits comes from the template. Rollout
+// settings join by `class_name`; a container the template lacks is unchanged.
 //
 // Usage: node infra/overlay-limits.mjs <template.jsonc> <overlay.jsonc>
 // rewrites <overlay.jsonc> in place as JSON.
@@ -26,6 +28,14 @@ export const mergeOverlayLimits = (templateText, overlayText) => {
   if (template.limits !== undefined) {
     overlay.limits = { ...template.limits, ...overlay.limits };
   }
+  if (Array.isArray(template.containers) && Array.isArray(overlay.containers)) {
+    overlay.containers = overlay.containers.map((container) => {
+      const own = template.containers.find((entry) => entry.class_name === container.class_name);
+      if (own === undefined) return container;
+      const rollout = Object.fromEntries(Object.entries(own).filter(([key]) => key.startsWith("rollout_")));
+      return { ...container, ...rollout, ...container };
+    });
+  }
   return `${JSON.stringify(overlay, null, 2)}\n`;
 };
 
@@ -37,5 +47,10 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   }
   const merged = mergeOverlayLimits(readFileSync(templatePath, "utf8"), readFileSync(overlayPath, "utf8"));
   writeFileSync(overlayPath, merged);
-  console.log(`limits: ${JSON.stringify(JSON.parse(merged).limits ?? null)}`);
+  const config = JSON.parse(merged);
+  console.log(`limits: ${JSON.stringify(config.limits ?? null)}`);
+  for (const container of config.containers ?? []) {
+    const rollout = Object.entries(container).filter(([key]) => key.startsWith("rollout_"));
+    if (rollout.length > 0) console.log(`${container.class_name}: ${JSON.stringify(Object.fromEntries(rollout))}`);
+  }
 }
