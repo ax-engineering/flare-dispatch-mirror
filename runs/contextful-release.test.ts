@@ -251,13 +251,15 @@ describe("contextful-release", () => {
       manifest: JSON.stringify({ ...cell, archive: "archive.tar.gz", sha256: "a".repeat(64), sbom: "sbom.cdx.json" }),
       ...(imageLayer === undefined ? {} : { imageLayer }) });
   };
+  /** A child's poll verdict; `{ failure }` is a failure that recorded that error tag. */
+  type Verdict = "running" | "success" | "failure" | { readonly failure: string };
   /**
-   * A release whose cell children report `status(cell, poll)`, read from the
-   * spawned input, and whose formula child succeeds. Sleeps advance a clock
-   * and are recorded, so a wait's cadence is observable.
+   * A release whose cell children report `status(cell, poll, now, attempt)`,
+   * read from the spawned input, and whose formula child succeeds. Sleeps
+   * advance a clock and are recorded, so a wait's cadence is observable.
    */
   const releaseFixture = (
-    status: (cell: Cell, poll: number, now: number) => "running" | "success" | "failure",
+    status: (cell: Cell, poll: number, now: number, attempt: number) => Verdict,
     existing: readonly string[] = [],
   ) => {
     let spawned: readonly { readonly input: unknown; readonly instanceId: string }[] = [];
@@ -269,12 +271,14 @@ describe("contextful-release", () => {
           return { executionId: id, status: "success", summaryJson: JSON.stringify({ assets: FORMULA_ASSETS,
             notes: "## Consumer compatibility\n" }) };
         }
-        const { profile, target } = spawned.find((child) => child.instanceId === id)!.input as Cell;
+        const { profile, target, attempt } = spawned.find((child) => child.instanceId === id)!.input as Cell & { attempt?: number };
         const cell = { profile, target };
-        const verdict = status(cell, poll, now);
-        return verdict === "success"
-          ? { executionId: id, status: verdict, summaryJson: cellOutput(cell) }
-          : { executionId: id, status: verdict };
+        const verdict = status(cell, poll, now, attempt ?? 0);
+        return typeof verdict === "object"
+          ? { executionId: id, status: "failure", failureTag: verdict.failure }
+          : verdict === "success"
+            ? { executionId: id, status: verdict, summaryJson: cellOutput(cell) }
+            : { executionId: id, status: verdict };
       }) },
     });
     spawned = runtime.handles.childRuns.spawned;
@@ -371,6 +375,59 @@ describe("contextful-release", () => {
       expect(cellsOf(handles)).toHaveLength(4);
       expect(cellsOf(handles).every((cell) => cell.startsWith("contextful-full/"))).toBe(true);
       expect(handles.childRuns.spawned.some((child) => child.run === "contextful-release-formula")).toBe(false);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("a cell the platform lost respawns as a fresh child, at most twice, and the release completes", () => {
+    const lost = (cell: Cell, tag: string, attempts: number) => (c: Cell, attempt: number) =>
+      c.profile === cell.profile && c.target === cell.target && attempt < attempts ? { failure: tag } : undefined;
+    const rules = [
+      lost({ profile: "contextful-full", target: "x86_64-unknown-linux-musl" }, "SandboxProcessLost", 2),
+      lost({ profile: "contextful-edge", target: "aarch64-apple-darwin" }, "ContainerLaunchFailed", 1),
+      lost({ profile: "contextful-control", target: "x86_64-unknown-linux-musl" }, "AdmissionTimedOut", 1),
+    ];
+    const { layer, handles, provideClock } = releaseFixture((cell, poll, _now, attempt) =>
+      rules.map((rule) => rule(cell, attempt)).find((verdict) => verdict !== undefined)
+        ?? (poll >= 1 ? "success" : "running"));
+    return Effect.gen(function* () {
+      const result = yield* provideClock(contextfulRelease.run({ repo, tag: "v0.5.0", sha, dryRun: true }));
+      expect(result).toMatchObject({ cells: 10, assets: 36 });
+      const cells = handles.childRuns.spawned.filter((child) => child.run === "contextful-release-cell");
+      expect(cells).toHaveLength(14);
+      expect(new Set(cells.map((child) => child.instanceId)).size).toBe(14);
+      const attemptsOf = (profile: string, target: string) => cells
+        .map((child) => child.input as Cell & { attempt?: number })
+        .filter((input) => input.profile === profile && input.target === target)
+        .map((input) => input.attempt);
+      // The first attempt keeps the input a release in flight spawned with.
+      expect(attemptsOf("contextful-full", "x86_64-unknown-linux-musl")).toEqual([undefined, 1, 2]);
+      expect(attemptsOf("contextful-edge", "aarch64-apple-darwin")).toEqual([undefined, 1]);
+      expect(attemptsOf("contextful-control", "x86_64-unknown-linux-musl")).toEqual([undefined, 1]);
+      const spawns = stepNames(handles).filter((name) => name.startsWith("spawn-cells-"));
+      expect(new Set(spawns).size).toBe(spawns.length);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("a cell lost on every attempt fails the release after two retries and starts nothing more", () => {
+    const { layer, handles, provideClock } = releaseFixture((cell, poll) =>
+      cell.profile === "contextful-full" && cell.target === "x86_64-unknown-linux-musl" ? { failure: "SandboxProcessLost" }
+        : poll >= 2 ? "success" : "running");
+    return Effect.gen(function* () {
+      const exit = yield* Effect.exit(provideClock(contextfulRelease.run({ repo, tag: "v0.5.0", sha, dryRun: true })));
+      expect(verdictOf(exit)?.[0]).toBe("- Failed: `contextful-full/x86_64-unknown-linux-musl`");
+      expect(cellsOf(handles).filter((cell) => cell === "contextful-full/x86_64-unknown-linux-musl")).toHaveLength(3);
+      expect(handles.childRuns.spawned.some((child) => child.run === "contextful-release-formula")).toBe(false);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("a build failure is a verdict: the cell is not respawned", () => {
+    const { layer, handles, provideClock } = releaseFixture((cell, poll) =>
+      cell.profile === "contextful-full" && cell.target === "x86_64-unknown-linux-musl" ? { failure: "StepFailed" }
+        : poll >= 2 ? "success" : "running");
+    return Effect.gen(function* () {
+      const exit = yield* Effect.exit(provideClock(contextfulRelease.run({ repo, tag: "v0.5.0", sha, dryRun: true })));
+      expect(verdictOf(exit)?.[0]).toBe("- Failed: `contextful-full/x86_64-unknown-linux-musl`");
+      expect(cellsOf(handles).filter((cell) => cell === "contextful-full/x86_64-unknown-linux-musl")).toHaveLength(1);
     }).pipe(Effect.provide(layer));
   });
 

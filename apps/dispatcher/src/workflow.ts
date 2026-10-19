@@ -110,6 +110,7 @@ import {
   failingStepMd,
   failureSummaryMd,
   runSkippedReason,
+  unrecordedFailureTag,
 } from "./failure-summary";
 import { renderResultEmail } from "./notify";
 import { workflowDashboardUrl } from "./dashboard-url";
@@ -1279,6 +1280,27 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
         [failingStepMd(exit, failedStep ?? undefined), failureSummaryMd(exit)]
           .filter((part): part is string => part !== undefined && part.trim() !== "")
           .join("\n\n") || undefined;
+
+      // A typed failure raised outside any step leaves no tag on a `steps`
+      // row. Record it as a `run` step before the terminal row, so a parent
+      // polling this child reads why it failed. Best-effort, like the read.
+      const runFailureTag = unrecordedFailureTag(exit, failedStep ?? undefined);
+      if (runFailureTag !== undefined) {
+        yield* Effect.gen(function* () {
+          yield* executions.startStep({ executionId: payload.executionId, name: "run", startedAt });
+          yield* executions.finishStep({
+            executionId: payload.executionId,
+            name: "run",
+            completedAt,
+            status: "failure",
+            errorTag: runFailureTag,
+          });
+        }).pipe(
+          Effect.catchAllCause((cause) =>
+            Effect.logWarning(`run failure tag not recorded for ${payload.executionId} — ${cause}`),
+          ),
+        );
+      }
 
       // Persist the run output as JSON so `io.priorExecution` can recover it
       // on the next execution in the semantic family. A failed Exit has no

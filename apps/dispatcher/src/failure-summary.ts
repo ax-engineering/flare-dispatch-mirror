@@ -173,6 +173,29 @@ export const failureSummaryMd = (exit: Exit.Exit<unknown, RunError>): string | u
 export type FailedStepRow = { readonly name: string; readonly errorTag: string | null };
 
 /**
+ * The tag of a typed run failure that no `steps` row carries — a failure
+ * raised outside any step, such as `SandboxProcessLost` from `durableExec`.
+ * The dispatcher records it as a `run` step so a fan-out parent reads it as
+ * `ChildStatusRecord.failureTag`. Absent for a success, a skip and a defect.
+ */
+export const unrecordedFailureTag = (
+  exit: Exit.Exit<unknown, RunError>,
+  failedStep: FailedStepRow | undefined,
+): string | undefined =>
+  Exit.match(exit, {
+    onSuccess: () => undefined,
+    onFailure: (cause) =>
+      Option.match(Cause.failureOption(cause), {
+        onNone: () => undefined,
+        onSome: (failure) => {
+          const tag = (failure as { _tag?: unknown })._tag;
+          if (typeof tag !== "string" || tag === "RunSkipped") return undefined;
+          return failedStep?.errorTag === tag ? undefined : tag;
+        },
+      }),
+  });
+
+/**
  * Name the step a failed run died in and the tag it failed with — the line a
  * scheduled run's check-run carries in place of a row only D1 holds. The tag is
  * the run's typed failure; the step is the one a `StepFailed` names, else the

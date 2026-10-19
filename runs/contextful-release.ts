@@ -53,6 +53,16 @@ const CELL_QUEUE_SEC = 21600;
  * the release under the container capacity the gate pools share.
  */
 export const RELEASE_WINDOW = 4;
+/**
+ * Respawns of a cell the platform lost: its container, its launch, or its
+ * admission. Each is a fresh child instance; a build that ran and failed is a
+ * verdict and never respawns.
+ */
+const CELL_RETRIES = 2;
+/** Failure tags a cell child ends with when the platform, not the build, failed it. */
+const INFRASTRUCTURE_FAILURES: ReadonlySet<string> = new Set([
+  "SandboxProcessLost", "ContainerLaunchFailed", "AdmissionTimedOut",
+]);
 /** Status-poll cadence while the window is full. */
 const RELEASE_POLL_EVERY = "30 seconds";
 /**
@@ -86,6 +96,8 @@ const ReleaseCellInput = Schema.Struct({
   target: Schema.String,
   releaseId: Schema.Number,
   dryRun: Schema.Boolean,
+  /** A respawn after the platform lost the cell; absent on the first attempt. */
+  attempt: Schema.optional(Schema.Number),
 });
 
 const ReleaseCellOutput = Schema.Struct({
@@ -372,8 +384,11 @@ export const contextfulRelease = defineRun({
     // checkpoint with the fixed batches' `-release-cells-` steps, so a release
     // in flight across a deploy re-spawns under new names; a child's instance
     // id derives from its input, so the re-spawn finds the same children.
-    const queue = [...SPAWN_ORDER];
-    const running: { readonly index: number; readonly id: string; readonly expiresAt: number }[] = [];
+    // A respawn's input carries its `attempt`, so its instance id differs from
+    // every earlier attempt's; the first attempt's input is unchanged.
+    type Queued = { readonly cell: (typeof CELLS)[number]; readonly attempt: number };
+    const queue: Queued[] = SPAWN_ORDER.map((cell) => ({ cell, attempt: 0 }));
+    const running: { readonly index: number; readonly id: string; readonly expiresAt: number; readonly attempt: number }[] = [];
     const settledByCell = new Map<number, ChildStatusRecord>();
     const timedOut = new Set<number>();
     const cellFailed = (child: ChildStatusRecord) => child.status !== "success" || !child.summaryJson;
@@ -391,15 +406,17 @@ export const contextfulRelease = defineRun({
             run: contextfulReleaseCell.name,
             items: batch,
             concurrency: batch.length,
-            toInput: (cell) => ({ ...cell, repo: input.repo, tag: input.tag, sha: tag.commitSha, releaseId: release.id, dryRun }),
+            toInput: ({ cell, attempt }) => ({ ...cell, repo: input.repo, tag: input.tag, sha: tag.commitSha,
+              releaseId: release.id, dryRun, ...(attempt > 0 ? { attempt } : {}) }),
           });
           return { handles, spawnedAt: yield* io.now };
         }));
         if (spawned === 0) yield* step("handoff-admission", () => handoffChildAdmission());
-        batch.forEach((cell, index) => running.push({
+        batch.forEach(({ cell, attempt }, index) => running.push({
           index: CELLS.indexOf(cell),
           id: handles[index]!.executionId,
           expiresAt: spawnedAt + CELL_BUDGET_MS,
+          attempt,
         }));
         spawned += batch.length;
       } else if (failed && running.length === 0) {
@@ -424,8 +441,15 @@ export const contextfulRelease = defineRun({
       for (let slot = running.length - 1; slot >= 0; slot--) {
         const record = records.find((child) => child.executionId === running[slot]!.id);
         if (record === undefined || !isTerminalChildStatus(record.status)) continue;
-        settledByCell.set(running[slot]!.index, record);
+        const { index, attempt } = running[slot]!;
         running.splice(slot, 1);
+        // A cell the platform lost takes the next free slot ahead of the queue.
+        if (record.status === "failure" && record.failureTag !== undefined &&
+          INFRASTRUCTURE_FAILURES.has(record.failureTag) && attempt < CELL_RETRIES) {
+          queue.unshift({ cell: CELLS[index]!, attempt: attempt + 1 });
+          continue;
+        }
+        settledByCell.set(index, record);
       }
     }
     const failedCells = CELLS.filter((_, index) => {
@@ -440,7 +464,7 @@ export const contextfulRelease = defineRun({
       const verdict = [
         ["Failed", failedCells],
         ["Timed out", CELLS.filter((_, index) => timedOut.has(index))],
-        ["Not started", queue],
+        ["Not started", queue.map(({ cell }) => cell)],
       ] as const;
       return yield* Effect.fail(new AcceptanceFailed({ exitCode: 1, summaryMd: `**Release cells**\n\n${verdict
         .filter(([, cells]) => cells.length > 0)

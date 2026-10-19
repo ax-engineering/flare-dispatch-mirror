@@ -28,6 +28,7 @@ import {
   failingStepMd,
   failureSummaryMd,
   runSkippedReason,
+  unrecordedFailureTag,
 } from "./failure-summary";
 
 describe("failureSummaryMd", () => {
@@ -309,5 +310,28 @@ describe("failingStepMd", () => {
 
   it("is undefined for a success Exit", () => {
     expect(failingStepMd(Exit.succeed(1), undefined)).toBeUndefined();
+  });
+});
+
+describe("unrecordedFailureTag", () => {
+  it("names the tag of a typed failure no step row recorded", () => {
+    const exit = Exit.fail(new SandboxProcessLost({ launches: 2 }));
+    expect(unrecordedFailureTag(exit, undefined)).toBe("SandboxProcessLost");
+  });
+
+  it("names it when the last failed step recorded a different tag", () => {
+    const exit = Exit.fail(new SandboxProcessLost({ launches: 2 }));
+    expect(unrecordedFailureTag(exit, { name: "collect", errorTag: "StepFailed" })).toBe("SandboxProcessLost");
+  });
+
+  it("is absent when the failed step already carries the tag", () => {
+    const exit = Exit.fail(new ExecFailed({ exitCode: 1, stderrTail: "x" }));
+    expect(unrecordedFailureTag(exit, { name: "measure", errorTag: "ExecFailed" })).toBeUndefined();
+  });
+
+  it("is absent for a success, a skip and a defect", () => {
+    expect(unrecordedFailureTag(Exit.succeed(1), undefined)).toBeUndefined();
+    expect(unrecordedFailureTag(Exit.fail(new RunSkipped({ reason: "no command" })), undefined)).toBeUndefined();
+    expect(unrecordedFailureTag(Exit.die(new Error("boom")), undefined)).toBeUndefined();
   });
 });
