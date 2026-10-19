@@ -2,7 +2,15 @@ import { it } from "@effect/vitest";
 import { Cause, Duration, Effect, Exit } from "effect";
 import { describe, expect } from "vitest";
 import { makeCFRuntimeTest } from "@fractalboxdev/flare-dispatch-core/testing";
-import { IO, StepFailed, StepRunner, type StepRunnerService } from "@fractalboxdev/flare-dispatch-core";
+import {
+  DEPLOYED_VERSION_ENV,
+  EXECUTION_CREATED_AT_ENV,
+  IO,
+  StepFailed,
+  StepRunner,
+  type CommitPullRequest,
+  type StepRunnerService,
+} from "@fractalboxdev/flare-dispatch-core";
 import { check } from "./check";
 import {
   contextfulGate,
@@ -12,7 +20,9 @@ import {
   parseStages,
   parseWindow,
   planStages,
+  prLiveness,
   stageCommand,
+  unrunSummary,
   WINDOW_DEFAULT,
   WINDOW_MAX,
 } from "./contextful-gate";
@@ -267,6 +277,8 @@ describe("contextful-gate", () => {
         "spawn-parts-3",
         "await-parts-2-poll-0",
       ]);
+      // No seeded answer: every lookup fails, and the gate spawns as before.
+      expect(handles.github.commitPullRequestsCalls).toHaveLength(3);
       expect(handles.sandbox.destroyed).toEqual(["fake-container"]);
       expect(handles.childRuns.admissionHandoffs).toBe(1);
     }).pipe(Effect.provide(layer));
@@ -704,5 +716,192 @@ describe("contextful-gate", () => {
       expect(handles.childRuns.spawned).toHaveLength(1);
       expect(handles.childRuns.admissionHandoffs).toBe(1);
     }).pipe(Effect.provide(layer));
+  });
+  describe("liveness and admission backlog", () => {
+    const REPO = input.repo;
+    const KEY = `${REPO}:${SHA}`;
+    const pr = (over: Partial<CommitPullRequest> = {}): CommitPullRequest => ({
+      number: 42, state: "open", merged: false, headSha: SHA, headRepo: REPO, ...over,
+    });
+    const three = { [DISCOVER_HEAD]: { stdout: "pins\nworkspace.compile\nformal\n", exitCode: 0 }, [DISCOVER]: { stdout: "pins\nworkspace.compile\nformal\n", exitCode: 0 } };
+    const cancelledChecks = (handles: ReturnType<typeof makeCFRuntimeTest>["handles"]) =>
+      handles.checks.updates.map((update) => ({
+        name: handles.checks.creates.find((create) => create.checkRunId === update.checkRunId)?.name,
+        conclusion: update.conclusion,
+        summary: update.output?.summary,
+      }));
+
+    it("decides liveness from the gated pull request's state and head", () => {
+      const withPr = { repo: REPO, sha: SHA, pr: 42 };
+      expect(prLiveness(withPr, [pr()])).toEqual({ live: true });
+      expect(prLiveness(withPr, [pr({ headSha: "c".repeat(40) })])).toEqual({ live: false, reason: "head superseded" });
+      expect(prLiveness(withPr, [pr({ state: "closed", merged: true })])).toEqual({ live: false, reason: "pull request closed" });
+      expect(prLiveness(withPr, [pr({ state: "closed" })])).toEqual({ live: false, reason: "pull request closed" });
+      // Another PR's state says nothing about the gated one; no answer is live.
+      expect(prLiveness(withPr, [pr({ number: 7, state: "closed" })])).toEqual({ live: true });
+      expect(prLiveness(withPr, [])).toEqual({ live: true });
+      // An input without `pr` gates every PR headed in the repository.
+      const bare = { repo: REPO, sha: SHA };
+      // `commits/{sha}/pulls` answers [] for a commit force-pushed off every branch.
+      expect(prLiveness(bare, [])).toEqual({ live: false, reason: "head superseded" });
+      expect(prLiveness(bare, [pr({ headSha: "c".repeat(40) })])).toEqual({ live: false, reason: "head superseded" });
+      expect(prLiveness(bare, [pr({ state: "closed", merged: true })])).toEqual({ live: false, reason: "pull request closed" });
+      expect(prLiveness(bare, [pr({ state: "closed" }), pr({ number: 43 })])).toEqual({ live: true });
+      expect(prLiveness(bare, [pr({ headRepo: "fork/contextful", state: "closed" })])).toEqual({ live: true });
+    });
+
+    it.effect("spawns nothing for a merged pull request and posts every part cancelled", () => {
+      // An input started before gates carried `pr` resolves its PR from the commit.
+      const { layer, handles } = makeCFRuntimeTest({
+        sandboxProgram: three,
+        github: { commitPullRequests: { [KEY]: [pr({ state: "closed", merged: true })] } },
+      });
+      return Effect.gen(function* () {
+        const exit = yield* Effect.exit(contextfulGate.run(input));
+        expect(Exit.isFailure(exit)).toBe(true);
+        if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("pull request closed — 3 of 3 parts not run");
+        expect(handles.childRuns.spawned).toHaveLength(0);
+        expect(handles.childRuns.admissionHandoffs).toBe(0);
+        expect(cancelledChecks(handles)).toEqual(["pins", "workspace.compile", "formal"].map((stage) => ({
+          name: `flare-dispatch/check:${stage}`, conclusion: "cancelled", summary: "not run — pull request closed",
+        })));
+      }).pipe(Effect.provide(layer));
+    });
+
+    it.effect("stops spawning once the pull request's head moves past the gated commit", () => {
+      // A gate that knows its PR reads it directly: `commits/{sha}/pulls` loses
+      // a force-pushed head, `pulls/{pr}` does not.
+      const { layer, handles } = makeCFRuntimeTest({
+        config: { "contextful-gate.window:fractalboxdev/contextful": "1" },
+        sandboxProgram: three,
+        github: { pullRequests: { [`${REPO}#42`]: pr() }, commitPullRequests: { [KEY]: [] } },
+        childRuns: {
+          pollFn: (ids) => {
+            handles.github.pullRequests[`${REPO}#42`] = pr({ headSha: "c".repeat(40) });
+            return ids.map((executionId) => ({ executionId, status: "success" }));
+          },
+        },
+      });
+      return Effect.gen(function* () {
+        const exit = yield* Effect.exit(contextfulGate.run({ ...input, pr: 42 }));
+        expect(Exit.isFailure(exit)).toBe(true);
+        if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("head superseded — 2 of 3 parts not run");
+        expect(handles.childRuns.spawned.map((spawn) => (spawn.input as { checkLabel: string }).checkLabel)).toEqual(["pins"]);
+        expect(cancelledChecks(handles).map((check) => check.name)).toEqual([
+          "flare-dispatch/check:workspace.compile", "flare-dispatch/check:formal",
+        ]);
+        expect(handles.github.pullRequestCalls).toEqual([{ repo: REPO, number: 42 }, { repo: REPO, number: 42 }]);
+        expect(handles.github.commitPullRequestsCalls).toEqual([]);
+      }).pipe(Effect.provide(layer));
+    });
+
+    it.effect("spawns nothing for an input without `pr` whose commit no pull request holds", () => {
+      const { layer, handles } = makeCFRuntimeTest({
+        sandboxProgram: three,
+        github: { commitPullRequests: { [KEY]: [] } },
+      });
+      return Effect.gen(function* () {
+        const exit = yield* Effect.exit(contextfulGate.run(input));
+        expect(Exit.isFailure(exit)).toBe(true);
+        if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("head superseded — 3 of 3 parts not run");
+        expect(handles.childRuns.spawned).toHaveLength(0);
+      }).pipe(Effect.provide(layer));
+    });
+
+    it.effect("reads liveness inside each spawn checkpoint, never in a step of its own", () => {
+      // An instance whose `spawn-parts-0` was cached before the read existed
+      // replays that spawn before any fresh read, so a stop never re-posts a
+      // part it already spawned as not run.
+      const { layer, handles } = makeCFRuntimeTest({
+        config: { "contextful-gate.window:fractalboxdev/contextful": "1" },
+        sandboxProgram: three,
+        github: { pullRequests: { [`${REPO}#42`]: pr() } },
+        childRuns: {
+          pollFn: (ids) => {
+            handles.github.pullRequests[`${REPO}#42`] = pr({ state: "closed", merged: true });
+            return ids.map((executionId) => ({ executionId, status: "success" }));
+          },
+        },
+      });
+      return Effect.gen(function* () {
+        yield* Effect.exit(contextfulGate.run({ ...input, pr: 42 }));
+        const names = handles.executions.steps.map((record) => record.name);
+        expect(names.filter((name) => name.startsWith("spawn-parts-"))).toEqual(["spawn-parts-0", "spawn-parts-1"]);
+        expect(names.some((name) => name.startsWith("check-liveness-"))).toBe(false);
+        expect(handles.childRuns.spawned).toHaveLength(1);
+        expect(cancelledChecks(handles).map((check) => check.name)).toEqual([
+          "flare-dispatch/check:workspace.compile", "flare-dispatch/check:formal",
+        ]);
+      }).pipe(Effect.provide(layer));
+    });
+
+    it("keys a reopen apart from the gate the close ended, and a redelivery onto the same key", () => {
+      const trigger = contextfulGate.triggers![0]!;
+      const payload = (action: string, updatedAt: string) => ({
+        action,
+        pull_request: { number: 42, updated_at: updatedAt, head: { sha: SHA }, base: { sha: BASE_SHA } },
+      });
+      const synchronize = trigger.idempotencyKey({ payload: payload("synchronize", "2026-10-19T10:00:00Z") });
+      const reopened = trigger.idempotencyKey({ payload: payload("reopened", "2026-10-19T11:00:00Z") });
+      expect(synchronize).toBe(`contextful-gate:42:${SHA}:${BASE_SHA}`);
+      expect(reopened).toBe(`contextful-gate:42:${SHA}:${BASE_SHA}:reopened:2026-10-19T11:00:00Z`);
+      expect(trigger.idempotencyKey({ payload: payload("reopened", "2026-10-19T11:00:00Z") })).toBe(reopened);
+    });
+
+    it.effect("spawns no further parts after one times out in the admission queue", () => {
+      const { layer, handles } = makeCFRuntimeTest({
+        config: { "contextful-gate.window:fractalboxdev/contextful": "1" },
+        sandboxProgram: three,
+        childRuns: {
+          pollFn: (ids) => ids.map((executionId) => ({ executionId, status: "failure", failureTag: "AdmissionTimedOut" })),
+        },
+      });
+      return Effect.gen(function* () {
+        const exit = yield* Effect.exit(contextfulGate.run(input));
+        expect(Exit.isFailure(exit)).toBe(true);
+        if (Exit.isFailure(exit)) {
+          const pretty = Cause.pretty(exit.cause);
+          expect(pretty).toContain("Admission backlog: pins waited past the 90-minute queue age");
+          expect(pretty).toContain("Not run: workspace.compile, formal");
+        }
+        expect(handles.childRuns.spawned).toHaveLength(1);
+        expect(cancelledChecks(handles)).toEqual(["workspace.compile", "formal"].map((stage) => ({
+          name: `flare-dispatch/check:${stage}`, conclusion: "cancelled", summary: unrunSummary("admission backlog", ["pins"]),
+        })));
+        expect(unrunSummary("admission backlog", ["pins"])).toContain("admission backlog");
+      }).pipe(Effect.provide(layer));
+    });
+
+    it.effect("keeps spawning after an ordinary red part", () => {
+      const { layer, handles } = makeCFRuntimeTest({
+        config: { "contextful-gate.window:fractalboxdev/contextful": "1" },
+        sandboxProgram: three,
+        childRuns: {
+          pollFn: (ids) => ids.map((executionId) => ({ executionId, status: "failure", failureTag: "ExecFailed" })),
+        },
+      });
+      return Effect.gen(function* () {
+        const exit = yield* Effect.exit(contextfulGate.run(input));
+        if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("Gate stages failed: pins, workspace.compile, formal");
+        expect(handles.childRuns.spawned).toHaveLength(3);
+        expect(handles.checks.updates).toEqual([]);
+      }).pipe(Effect.provide(layer));
+    });
+
+    it.effect("logs the execution's creation time and the deployed version at each spawn", () => {
+      const { layer, handles } = makeCFRuntimeTest({
+        io: { vars: { [EXECUTION_CREATED_AT_ENV]: "2026-10-18T09:00:00.000Z", [DEPLOYED_VERSION_ENV]: "v-abc" } },
+        config: { "contextful-gate.window:fractalboxdev/contextful": "2" },
+        sandboxProgram: three,
+        childRuns: { pollFn: (ids) => ids.map((executionId) => ({ executionId, status: "success" })) },
+      });
+      return Effect.gen(function* () {
+        yield* contextfulGate.run(input);
+        expect(handles.io.logs.filter((log) => log.msg.startsWith("spawn-parts-")).map((log) => log.msg)).toEqual([
+          "spawn-parts-0: execution created 2026-10-18T09:00:00.000Z, deployed version v-abc",
+          "spawn-parts-2: execution created 2026-10-18T09:00:00.000Z, deployed version v-abc",
+        ]);
+      }).pipe(Effect.provide(layer));
+    });
   });
 });

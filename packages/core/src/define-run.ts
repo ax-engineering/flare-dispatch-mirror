@@ -190,6 +190,13 @@ export type RunSpec<I, O, IEnc, OEnc> = {
    * cancels nothing. See `SupersedeSpec`.
    */
   readonly supersede?: (input: I) => SupersedeSpec | undefined;
+  /**
+   * This run joins every child it spawns, so a child still waiting for an
+   * admission slot once this run's row has ended has no reader for its verdict:
+   * it leaves the queue `cancelled`. A run that spawns children without
+   * waiting on them leaves this unset, and its children outlive it.
+   */
+  readonly joinsChildren?: boolean;
   readonly run: (input: I) => Effect.Effect<O, RunError, RunContext>;
 };
 

@@ -112,6 +112,32 @@ describe("makeRunSupersedeD1: supersession against real D1", () => {
     });
   });
 
+  it("a close marker ranked at the close ends the group's gates; only a reopen outranks it", async () => {
+    await run(store.register("gate-push", G, { supersedeOlder: true, rank: 1_000 }));
+    clock += 1;
+    // The close lands at the PR's `updated_at`, after the landing push.
+    expect(await superseded("pr-closed:1500:g", G, { supersedeOlder: true, rank: 1_500 })).toEqual(["gate-push"]);
+    clock += 1;
+    // A gate for the closed head that registers late stands itself down.
+    expect(await run(store.register("gate-late", G, { supersedeOlder: true, rank: 1_000 }))).toEqual({
+      superseded: [],
+      supersededBy: "pr-closed:1500:g",
+    });
+    clock += 1;
+    // A reopen's revision ranks above the close and supersedes the marker.
+    expect(await superseded("gate-reopen", G, { supersedeOlder: true, rank: 2_000 })).toContain("pr-closed:1500:g");
+  });
+
+  it("a gate at the close's own second ranks below the marker even when it registers later", async () => {
+    // The marker ranks one millisecond after the close's `updated_at` (pr-close.ts).
+    expect(await superseded("pr-closed:1001:g", G, { supersedeOlder: true, rank: 1_001 })).toEqual([]);
+    clock += 1;
+    expect(await run(store.register("gate-same-second", G, { supersedeOlder: true, rank: 1_000 }))).toEqual({
+      superseded: [],
+      supersededBy: "pr-closed:1001:g",
+    });
+  });
+
   it("a re-run with a lower rank joins without standing down", async () => {
     await run(store.register("gate-h2", G, { supersedeOlder: true, rank: 2_000 }));
     clock += 1;
@@ -125,6 +151,14 @@ describe("makeRunSupersedeD1: supersession against real D1", () => {
     await run(store.register("gate-a", G, { supersedeOlder: true, rank: 5_000 }));
     clock += 1;
     expect(await superseded("gate-b", G, { supersedeOlder: true, rank: 5_000 })).toEqual(["gate-a"]);
+  });
+
+  it("reads an execution's status and run name", async () => {
+    await insertExecution("parent", "success");
+    await insertExecution("child", "running", "parent");
+    expect(await run(store.row("parent"))).toEqual({ status: "success", run: "contextful-gate" });
+    expect(await run(store.row("child"))).toEqual({ status: "running", run: "check" });
+    expect(await run(store.row("absent"))).toBeUndefined();
   });
 
   it("reads the open tree, cancels it and frees its admission slots", async () => {

@@ -65,6 +65,11 @@
   // for parity with the run set).
   "browser": { "binding": "BROWSER" },
 
+  // The deployed version's id — logged by a run at each spawn beside its
+  // execution's creation time, so an instance created before a deploy shows
+  // whether it runs the deployed code.
+  "version_metadata": { "binding": "VERSION_METADATA" },
+
   "vars": {
     // Operator overlay.
     "CLOUDFLARE_ACCOUNT_ID": "00000000000000000000000000000000",

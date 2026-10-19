@@ -38,6 +38,12 @@ export interface Env {
   readonly SUBSTRATE_BACKEND?: string;
 
   /**
+   * `version_metadata` binding — the deployed Worker version, answered to runs
+   * as `io.env(DEPLOYED_VERSION_ENV)`. Absent → `unknown`.
+   */
+  readonly VERSION_METADATA?: WorkerVersionMetadata;
+
+  /**
    * `"off"` stops the container-stop records being written to R2 (the log line
    * is unaffected). Anything else, including absent, leaves them on.
    *

@@ -2,7 +2,9 @@
 //
 // A run that declares `supersede` (core define-run.ts) registers in its group
 // before admission; every older live member it supersedes is cancelled here,
-// wherever it stands: queued for a slot, running, or joined on children.
+// wherever it stands: queued for a slot, running, or joined on children. A
+// pull request's close supersedes its group's members the same way, through a
+// close marker (pr-close.ts).
 //
 // Order, per superseded root:
 //   1. mark the root row 'cancelled' — a child whose row is not yet visible
@@ -20,6 +22,7 @@
 import { Effect } from "effect";
 import type { ChecksService, SupersedeSpec } from "@fractalboxdev/flare-dispatch-core";
 import type { RunSupersedeStore, SupersededRow } from "@fractalboxdev/flare-dispatch-runtime-cf";
+import { isCloseMarker } from "./pr-close";
 
 /** The no-op sentinel a degraded `checks.create` returns — no check-run to conclude. */
 const NOOP_CHECK_RUN_ID = "noop";
@@ -34,7 +37,12 @@ export type SupersedePorts = {
 };
 
 export const supersededSummary = (supersededBy: string): string =>
-  `⊘ Cancelled — execution \`${supersededBy}\` superseded this run for a newer revision of the same group.`;
+  isCloseMarker(supersededBy)
+    ? "⊘ Cancelled — pull request closed."
+    : `⊘ Cancelled — execution \`${supersededBy}\` superseded this run for a newer revision of the same group.`;
+
+const supersededTitle = (supersededBy: string): string =>
+  isCloseMarker(supersededBy) ? "Pull request closed" : "Superseded";
 
 const bestEffort = (label: string, thunk: () => Promise<void>): Effect.Effect<void> =>
   Effect.tryPromise(thunk).pipe(
@@ -113,7 +121,7 @@ export const cancelSupersededTree = (
             repo: row.repo,
             checkRunId,
             conclusion: "cancelled",
-            output: { title: "Superseded", summary: supersededSummary(supersededBy) },
+            output: { title: supersededTitle(supersededBy), summary: supersededSummary(supersededBy) },
           });
         }).pipe(
           Effect.catchAllCause((cause) =>

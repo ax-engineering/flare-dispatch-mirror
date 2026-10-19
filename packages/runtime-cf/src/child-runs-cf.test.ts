@@ -294,6 +294,23 @@ describe("makeChildRunsLive.poll (live D1 via Miniflare)", () => {
     expect(rec).toEqual({ executionId: "c-checked", status: "failure", checkRunId: "4242" });
   });
 
+  it("carries the error tag of a failed child's last failed step", async () => {
+    await insertRow({ id: "c-queued-out", status: "failure" });
+    await insertRow({ id: "c-green", status: "success" });
+    await bindings.db
+      .prepare(
+        `INSERT INTO steps (id, execution_id, name, status, started_at, completed_at, attempt, error_tag)
+         VALUES (?1, ?2, 'admission', 'failure', 0, 5, 1, 'AdmissionTimedOut'),
+                (?3, ?4, 'flaky', 'failure', 0, 5, 1, 'ExecFailed')`,
+      )
+      .bind("c-queued-out:admission:1", "c-queued-out", "c-green:flaky:1", "c-green")
+      .run();
+    expect(await poll(["c-queued-out", "c-green"])).toEqual([
+      { executionId: "c-queued-out", status: "failure", failureTag: "AdmissionTimedOut" },
+      { executionId: "c-green", status: "success" },
+    ]);
+  });
+
   it("treats an unrecognized status (queued) as non-terminal running", async () => {
     await insertRow({ id: "c-queued", status: "queued" });
     const [rec] = await poll(["c-queued"]);

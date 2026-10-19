@@ -46,6 +46,8 @@ export type IOFakeOptions = {
    * run that reads `io.executionId` sees the same id steps record under.
    */
   readonly executionId?: string;
+  /** Values `io.env` returns, by key; an absent key is `undefined`. */
+  readonly vars?: Readonly<Record<string, string>>;
 };
 
 /**
@@ -74,7 +76,7 @@ export const makeIOFake = (
       return `00000000-0000-4000-8000-${n}`;
     }),
     executionId: Effect.succeed(opts.executionId ?? ""),
-    env: () => Effect.succeed(undefined),
+    env: (key) => Effect.succeed(opts.vars?.[key]),
     viewerUrl: Effect.succeed(Option.fromNullable(opts.viewerUrl)),
     sleep: () => Effect.void,
     log: (level, msg, attrs) =>

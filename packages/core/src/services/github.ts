@@ -406,6 +406,20 @@ export type PullRequestHistoryRef = {
  * a run can leave an always-visible PR comment (on success AND failure), which
  * the read-only check-run summary alone does not guarantee.
  */
+/**
+ * One pull request GitHub associates with a commit — what a gate reads to
+ * learn whether the PR it gates is still open and still at that commit.
+ */
+export type CommitPullRequest = {
+  readonly number: number;
+  readonly state: "open" | "closed";
+  readonly merged: boolean;
+  /** The PR's current head commit. */
+  readonly headSha: string;
+  /** `owner/name` of the head repository; `""` when unknown. */
+  readonly headRepo: string;
+};
+
 export type PullReviewRequest = {
   /** "owner/name". */
   readonly repo: string;
@@ -514,6 +528,27 @@ export interface GithubService {
     branch: string;
     installationId?: number;
   }) => Effect.Effect<string, GitHubApiError>;
+
+  /**
+   * The pull requests associated with a commit (`commits/{sha}/pulls`). Fails
+   * on any unreadable answer and on an uncredentialed deploy: an empty list is
+   * a real answer here, so no degraded read may stand in for it.
+   */
+  readonly commitPullRequests: (req: {
+    repo: string;
+    sha: string;
+    installationId?: number;
+  }) => Effect.Effect<readonly CommitPullRequest[], GitHubApiError>;
+
+  /**
+   * One pull request's state and current head (`pulls/{number}`). Fails on
+   * any unreadable answer and on an uncredentialed deploy.
+   */
+  readonly pullRequest: (req: {
+    repo: string;
+    number: number;
+    installationId?: number;
+  }) => Effect.Effect<CommitPullRequest, GitHubApiError>;
 
   /** Append one JSON report to a commit's refs/notes/measures note. */
   readonly appendMeasureNote: (req: {
@@ -711,6 +746,10 @@ export const github = {
   readTextFile: (req: ReadTextFileRequest) => Effect.flatMap(Github, (g) => g.readTextFile(req)),
   branchHead: (req: { repo: string; branch: string; installationId?: number }) =>
     Effect.flatMap(Github, (g) => g.branchHead(req)),
+  commitPullRequests: (req: { repo: string; sha: string; installationId?: number }) =>
+    Effect.flatMap(Github, (g) => g.commitPullRequests(req)),
+  pullRequest: (req: { repo: string; number: number; installationId?: number }) =>
+    Effect.flatMap(Github, (g) => g.pullRequest(req)),
   appendMeasureNote: (req: {
     repo: string;
     commit: string;

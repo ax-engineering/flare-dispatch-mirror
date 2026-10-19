@@ -73,6 +73,8 @@ export interface RunSupersedeStore {
   readonly openTree: (executionId: string) => Effect.Effect<readonly SupersededRow[], Error>;
   /** The status recorded on an execution's row, or `undefined` with no row. */
   readonly status: (executionId: string) => Effect.Effect<string | undefined, Error>;
+  /** An execution's status and run name, or `undefined` with no row. */
+  readonly row: (executionId: string) => Effect.Effect<{ readonly status: string; readonly run: string } | undefined, Error>;
   /**
    * End every row in `ids` as 'cancelled' (rows already ended keep their
    * status), and delete their admission, serial-queue and supersession rows.
@@ -193,6 +195,14 @@ export const makeRunSupersedeD1 = (
         .first<{ status: string }>(),
     ).pipe(Effect.map((row) => row?.status));
 
+  const row = (executionId: string) =>
+    d1(() =>
+      db
+        .prepare(`SELECT status, run FROM executions WHERE id = ?`)
+        .bind(executionId)
+        .first<{ status: string; run: string }>(),
+    ).pipe(Effect.map((found) => (found === null ? undefined : { status: found.status, run: found.run })));
+
   const cancel = (ids: readonly string[]): Effect.Effect<void, Error> => {
     if (ids.length === 0) return Effect.void;
     const marks = ids.map(() => "?").join(", ");
@@ -223,5 +233,5 @@ export const makeRunSupersedeD1 = (
       ]),
     ).pipe(Effect.asVoid);
 
-  return { register, markCancelled, openTree, status, cancel, release };
+  return { register, markCancelled, openTree, status, row, cancel, release };
 };

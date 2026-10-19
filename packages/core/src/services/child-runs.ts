@@ -93,6 +93,12 @@ export type ChildStatusRecord = {
    * Absent until the child opens its check-run, and for a child that posts none.
    */
   readonly checkRunId?: string;
+  /**
+   * The error tag of the child's last failed step, for a `failure` child that
+   * recorded one — `AdmissionTimedOut` for a child that never left the
+   * admission queue. Absent otherwise.
+   */
+  readonly failureTag?: string;
 };
 
 /** Terminal child statuses — `waitForChildren` stops polling once all reach one. */

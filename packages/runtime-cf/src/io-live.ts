@@ -40,6 +40,12 @@ export type IOLiveOptions = {
    * `Option.none()`.
    */
   readonly logsViewerBase?: string;
+  /**
+   * Values `io.env` answers, by key — the dispatcher's per-execution facts
+   * (`EXECUTION_CREATED_AT_ENV`, `DEPLOYED_VERSION_ENV`). Any other key is
+   * `undefined`.
+   */
+  readonly vars?: Readonly<Record<string, string>>;
 };
 
 /** Build the live `IO` Layer. */
@@ -56,9 +62,9 @@ export const makeIOLive = (opts: IOLiveOptions = {}): Layer.Layer<IO> =>
     // release-PR approval marker. `""` on a bare stand-alone IO layer.
     executionId: Effect.succeed(opts.currentExecutionId ?? ""),
 
-    // V0 runs are dispatched with explicit inputs, not env reads — there is no
-    // per-run env surface yet. Honest `undefined` keeps `io.env` total.
-    env: () => Effect.succeed(undefined),
+    // Runs are dispatched with explicit inputs; `io.env` answers only the
+    // dispatcher's per-execution facts in `vars`, and `undefined` otherwise.
+    env: (key) => Effect.succeed(opts.vars?.[key]),
 
     // The readable log/artifact surface for this execution. `none` when the
     // deploy lacks a public origin or log-link key (the dispatcher then passes

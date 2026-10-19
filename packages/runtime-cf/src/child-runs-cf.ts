@@ -209,9 +209,12 @@ export const makeChildRunsLive = (cfg: ChildRunsLiveConfig): Layer.Layer<ChildRu
       const readRows = async (wanted: readonly string[]) => {
         const { results } = await cfg.db
           .prepare(
-            `SELECT id, status, summary_json, check_run_id
-               FROM executions
-              WHERE id IN (${wanted.map(() => "?").join(", ")})`,
+            `SELECT e.id, e.status, e.summary_json, e.check_run_id,
+                    (SELECT s.error_tag FROM steps AS s
+                      WHERE s.execution_id = e.id AND s.status = 'failure' AND s.error_tag IS NOT NULL
+                      ORDER BY s.completed_at DESC LIMIT 1) AS failure_tag
+               FROM executions AS e
+              WHERE e.id IN (${wanted.map(() => "?").join(", ")})`,
           )
           .bind(...wanted)
           .all<{
@@ -219,6 +222,7 @@ export const makeChildRunsLive = (cfg: ChildRunsLiveConfig): Layer.Layer<ChildRu
             status: string;
             summary_json: string | null;
             check_run_id: number | string | null;
+            failure_tag: string | null;
           }>();
         const byId = new Map(results.map((r) => [r.id, r]));
         // Preserve input order; an id with no row yet is `missing`.
@@ -230,6 +234,9 @@ export const makeChildRunsLive = (cfg: ChildRunsLiveConfig): Layer.Layer<ChildRu
             status: toChildStatus(row.status),
             ...(row.summary_json !== null ? { summaryJson: row.summary_json } : {}),
             ...(row.check_run_id !== null ? { checkRunId: String(row.check_run_id) } : {}),
+            ...(row.status === "failure" && row.failure_tag !== null
+              ? { failureTag: row.failure_tag }
+              : {}),
           };
         });
       };

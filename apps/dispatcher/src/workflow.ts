@@ -47,7 +47,14 @@
 import { checkConclusion } from "./terminal-verdict";
 import { openCheckRun, persistCheckRunId } from "./check-run-open";
 import { concludeOpenChildCheckRuns, readChildCheckRuns } from "./child-check-runs";
-import { cancelSupersededTree, enterSupersession, withSupersessionRelease } from "./supersede";
+import {
+  cancelSupersededTree,
+  enterSupersession,
+  type SupersedePorts,
+  withSupersessionRelease,
+} from "./supersede";
+import { closeGroup, isCloseGroupPayload } from "./pr-close";
+import { claimUnlessParentEnded, isParentEnded, leaveQueueForEndedParent } from "./admission-parent";
 import { WorkflowEntrypoint } from "cloudflare:workers";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import { getSandbox } from "@cloudflare/sandbox";
@@ -57,12 +64,15 @@ import {
   AdmissionTimedOut,
   Checks,
   decideAdmission,
+  DEPLOYED_VERSION_ENV,
   Email,
+  EXECUTION_CREATED_AT_ENV,
   Executions,
   EngineInterrupted,
   isEngineInterruptedCause,
   isEngineInterruption,
   withRunCeiling,
+  type RunSkipped,
   type RunContext,
   type RunError,
 } from "@fractalboxdev/flare-dispatch-core";
@@ -77,6 +87,7 @@ import {
   instanceForSandboxImage,
   LEASE_HEARTBEAT_EVERY_MS,
   makeCFRuntimeLive,
+  makeChecksGithubLive,
   makeContainerLeaseD1,
   makeRunAdmissionD1,
   makeRunSupersedeD1,
@@ -286,6 +297,43 @@ const resolveEmailConfig = (env: Env): EmailCloudflareConfig | undefined => {
 };
 
 /**
+ * The live ports `cancelSupersededTree` stops a tree through: the Workflow
+ * binding, the container (or substrate) each row's run uses, and the
+ * check-runs service.
+ */
+const liveSupersedePorts = (
+  env: Env,
+  store: SupersedePorts["store"],
+  checks: SupersedePorts["checks"],
+): SupersedePorts => ({
+  store,
+  terminate: async (id) => {
+    const instance = await env.RUNS_WORKFLOW.get(id);
+    const { status } = await instance.status();
+    if (status !== "complete" && status !== "errored" && status !== "terminated") {
+      await instance.terminate();
+    }
+  },
+  destroySandbox: (row) => {
+    const rowRun = lookupRun(row.run);
+    const substrate =
+      env.SUBSTRATE_BACKEND === "on" && runsOnFacade(row.run) ? env.SUBSTRATE : undefined;
+    return substrate !== undefined
+      ? substrate.abort(row.id).then(() => undefined)
+      : getSandbox(
+          selectSandboxNs(rowRun?.sandboxImage, {
+            lean: env.RUNS_SANDBOX,
+            browser: env.RUNS_SANDBOX_BROWSER,
+            agent: env.RUNS_SANDBOX_AGENT,
+            release: env.RUNS_SANDBOX_RELEASE,
+          }),
+          previewSafeSandboxId(row.id),
+        ).destroy();
+  },
+  checks,
+});
+
+/**
  * The Cloudflare Workflows name backing `RUNS_WORKFLOW` — the dashboard
  * URL segment. MUST stay in sync with `wrangler.jsonc` → `workflows[0].name`.
  */
@@ -295,6 +343,36 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
     // runtime, and the dispatcher's own — goes through one engine, so one
     // engine rejection ends all of them (runtime-cf's workflow-engine.ts).
     const engine = Effect.runSync(makeWorkflowEngine(platformStep));
+    // A pull request's close: cancel its group's live members (pr-close.ts).
+    // No execution row, no admission — the instance holds no container.
+    if (isCloseGroupPayload(event.payload)) {
+      const close = event.payload.closeGroup;
+      const env = this.env;
+      const store = makeRunSupersedeD1(env.RUNS_METADATA);
+      const stepDo = <T>(name: string, body: () => Promise<T>): Effect.Effect<T> =>
+        engine.do(name, body, identity).pipe(Effect.orDie);
+      const checksConfig = resolveChecksConfig(env, {
+        repo: close.repo,
+        ref: "refs/heads/main",
+        sha: "",
+        ...(close.installation_id !== undefined ? { installation_id: close.installation_id } : {}),
+      });
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const checks = yield* Checks;
+          const cancelled = yield* closeGroup(close, {
+            stepDo,
+            store,
+            cancelTree: (rootId, markerId) =>
+              cancelSupersededTree(rootId, markerId, liveSupersedePorts(env, store, checks)),
+          });
+          yield* Effect.logInfo(
+            `pull request closed: ${close.group} — cancelled ${cancelled.length} execution(s)${cancelled.length > 0 ? `: ${cancelled.join(", ")}` : ""}`,
+          );
+        }).pipe(Effect.provide(makeChecksGithubLive(checksConfig))),
+      );
+      return;
+    }
     // Decode the dispatch payload — a malformed event is a hard failure.
     const payload: DispatchPayload = Schema.decodeUnknownSync(DispatchPayload)(event.payload);
 
@@ -618,6 +696,13 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
         : {}),
       ...(publicOrigin !== undefined ? { publicOrigin } : {}),
       ...(logsBaseUrl !== undefined ? { logsViewerBase: logsBaseUrl } : {}),
+      // When the engine created this instance, and which Worker version runs
+      // this invocation: a replay after a deploy reports the new version
+      // beside the original creation time.
+      ioVars: {
+        [EXECUTION_CREATED_AT_ENV]: event.timestamp.toISOString(),
+        [DEPLOYED_VERSION_ENV]: this.env.VERSION_METADATA?.id ?? "unknown",
+      },
       // Wire the live OIDC signing Layer when both the JWK + issuer URL are
       // configured. Subject defaults to `<run>:<execution-id>` so an IAM
       // trust policy can scope a role to a single run+execution.
@@ -730,35 +815,7 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
           stepDo,
           store: supersessions,
           cancelTree: (olderId) =>
-            cancelSupersededTree(olderId, payload.executionId, {
-              store: supersessions,
-              terminate: async (id) => {
-                const instance = await env.RUNS_WORKFLOW.get(id);
-                const { status } = await instance.status();
-                if (status !== "complete" && status !== "errored" && status !== "terminated") {
-                  await instance.terminate();
-                }
-              },
-              destroySandbox: (row) => {
-                const rowRun = lookupRun(row.run);
-                const substrate =
-                  env.SUBSTRATE_BACKEND === "on" && runsOnFacade(row.run)
-                    ? env.SUBSTRATE
-                    : undefined;
-                return substrate !== undefined
-                  ? substrate.abort(row.id).then(() => undefined)
-                  : getSandbox(
-                      selectSandboxNs(rowRun?.sandboxImage, {
-                        lean: env.RUNS_SANDBOX,
-                        browser: env.RUNS_SANDBOX_BROWSER,
-                        agent: env.RUNS_SANDBOX_AGENT,
-                        release: env.RUNS_SANDBOX_RELEASE,
-                      }),
-                      previewSafeSandboxId(row.id),
-                    ).destroy();
-              },
-              checks,
-            }),
+            cancelSupersededTree(olderId, payload.executionId, liveSupersedePorts(env, supersessions, checks)),
           concludeCancelled: (summary) =>
             checks.update({
               repo: payload.github.repo,
@@ -800,7 +857,27 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
         throw new Error(`Invalid admission queue age for run ${run.name}`);
       }
       const admissionMaxQueueAgeMs = admissionMaxQueueAgeSec * 1000;
-      const admissionGate: Effect.Effect<void, AdmissionTimedOut> = Effect.gen(function* () {
+      // A queued admission timeout records an `admission` step failed
+      // `AdmissionTimedOut`, so a fan-out parent polling this child reads why
+      // it failed (`ChildStatusRecord.failureTag`) and stops spawning into a
+      // saturated pool.
+      const admissionTimedOut = (
+        error: AdmissionTimedOut,
+        enqueuedAt: number,
+        completedAt: number,
+      ): Effect.Effect<never, AdmissionTimedOut> =>
+        Effect.gen(function* () {
+          yield* executions.startStep({ executionId: payload.executionId, name: "admission", startedAt: enqueuedAt });
+          yield* executions.finishStep({
+            executionId: payload.executionId,
+            name: "admission",
+            completedAt,
+            status: "failure",
+            errorTag: error._tag,
+          });
+          return yield* Effect.fail(error);
+        });
+      const admissionGate: Effect.Effect<void, AdmissionTimedOut | RunSkipped> = Effect.gen(function* () {
         // Enqueue — the row's `enqueued_at` (FIFO key + dispatch-age basis)
         // is read inside the step, so a replay sees the SAME timestamp.
         const { enqueuedAt } = yield* stepDo("admission-enqueue", () =>
@@ -818,9 +895,44 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
         let lastReportedPosition: number | undefined;
 
         for (let i = 0; i < maxAttempts; i++) {
+          // A child reads its parent's row before each claim: once a parent
+          // that joins its children has ended, the child leaves the queue
+          // instead (admission-parent.ts).
           const observed = yield* stepDo(`admission-claim-${i}`, () =>
-            Effect.runPromise(admissions.attempt(payload.executionId, admissionPool, enqueuedAt)),
+            claimUnlessParentEnded({
+              parentExecutionId: payload.parentExecutionId,
+              parentRow: (id) => Effect.runPromise(supersessions.row(id)),
+              joinsChildren: (name) => lookupRun(name)?.joinsChildren === true,
+              claim: () => Effect.runPromise(admissions.attempt(payload.executionId, admissionPool, enqueuedAt)),
+            }),
           );
+          if (isParentEnded(observed)) {
+            return yield* leaveQueueForEndedParent(
+              {
+                executionId: payload.executionId,
+                parentExecutionId: payload.parentExecutionId ?? "",
+                parentStatus: observed.parentEnded,
+              },
+              {
+                stepDo,
+                store: supersessions,
+                concludeCancelled: (summary) =>
+                  checks
+                    .update({
+                      repo: payload.github.repo,
+                      checkRunId,
+                      conclusion: "cancelled",
+                      ...(checkDetailsUrl !== undefined ? { detailsUrl: checkDetailsUrl } : {}),
+                      output: { title: checkRunTitle, summary },
+                    })
+                    .pipe(
+                      Effect.catchAllCause((cause) =>
+                        Effect.logWarning(`admission: parent-ended conclusion failed — ${cause}`),
+                      ),
+                    ),
+              },
+            );
+          }
           const decision = decideAdmission(
             observed,
             enqueuedAt,
@@ -830,12 +942,14 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
 
           if (decision._kind === "admit") return;
           if (decision._kind === "timeout") {
-            return yield* Effect.fail(
+            return yield* admissionTimedOut(
               new AdmissionTimedOut({
                 queuedForMs: decision.queuedForMs,
                 position: decision.position,
                 poolBusy: decision.poolBusy,
               }),
+              enqueuedAt,
+              observed.now,
             );
           }
 
@@ -872,12 +986,14 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
           if (i < maxAttempts - 1) {
             yield* stepSleep(`admission-wait-${i}`, ADMISSION_POLL_EVERY_MS);
           } else {
-            return yield* Effect.fail(
+            return yield* admissionTimedOut(
               new AdmissionTimedOut({
                 queuedForMs: Math.max(0, observed.now - enqueuedAt),
                 position: decision.position,
                 poolBusy: decision.poolBusy,
               }),
+              enqueuedAt,
+              observed.now,
             );
           }
         }

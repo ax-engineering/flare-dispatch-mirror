@@ -125,7 +125,15 @@ export {
 export { browser, Browser, type BrowserService, type CDPSession } from "./services/browser";
 export { cache, Cache, type CacheService } from "./services/cache";
 export { artifact, Artifact, type ArtifactService, type ArtifactInfo } from "./services/artifact";
-export { io, IO, type IOService, type LogLevel, type PriorExecution } from "./services/io";
+export {
+  DEPLOYED_VERSION_ENV,
+  EXECUTION_CREATED_AT_ENV,
+  io,
+  IO,
+  type IOService,
+  type LogLevel,
+  type PriorExecution,
+} from "./services/io";
 export { config, Config, type ConfigService } from "./services/config";
 export { secrets, Secrets, type SecretsService } from "./services/secrets";
 export {
@@ -174,6 +182,7 @@ export {
   github,
   Github,
   type GithubService,
+  type CommitPullRequest,
   type IssueCreated,
   type IssueRef,
   type PullRequestHistoryRef,

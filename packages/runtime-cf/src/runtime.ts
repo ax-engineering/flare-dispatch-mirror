@@ -202,6 +202,8 @@ export type CFRuntimeLiveOptions<T extends Sandbox = Sandbox> = {
    * the historical message.
    */
   readonly logsViewerBase?: string;
+  /** Values `io.env` answers for this execution (io-live.ts). */
+  readonly ioVars?: Readonly<Record<string, string>>;
   /**
    * OIDC signing config for the `oidc` capability — the ES256 private JWK
    * (`OIDC_SIGNING_JWK` secret) + the issuer URL the IdP's trust policy
@@ -289,6 +291,7 @@ export const makeCFRuntimeLive = <T extends Sandbox>(
     db: opts.db,
     currentExecutionId: opts.executionId,
     ...(opts.logsViewerBase !== undefined ? { logsViewerBase: opts.logsViewerBase } : {}),
+    ...(opts.ioVars !== undefined ? { vars: opts.ioVars } : {}),
   });
   const executions = makeD1ExecutionsLive(opts.db, opts.execution);
   const artifact = makeR2ArtifactLive(

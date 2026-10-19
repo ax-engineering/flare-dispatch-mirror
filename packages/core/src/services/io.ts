@@ -11,6 +11,15 @@ import { Context, type Duration, Effect, type Option, type Schema } from "effect
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
+/**
+ * `io.env` keys the dispatcher answers for every execution: when the Workflow
+ * engine created this instance (ISO 8601), and the Worker version running this
+ * invocation. Comparing the two tells an operator whether an instance created
+ * before a deploy runs the deployed code.
+ */
+export const EXECUTION_CREATED_AT_ENV = "FLARE_DISPATCH_EXECUTION_CREATED_AT";
+export const DEPLOYED_VERSION_ENV = "FLARE_DISPATCH_DEPLOYED_VERSION";
+
 /** The most recent terminal execution in a run's semantic family. */
 export type PriorExecution<O> = {
   readonly executionId: string;

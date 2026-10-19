@@ -2,11 +2,16 @@ import { Effect, Schema } from "effect";
 import {
   AcceptanceFailed,
   checks,
+  type CommitPullRequest,
   config,
   defineRun,
+  DEPLOYED_VERSION_ENV,
+  EXECUTION_CREATED_AT_ENV,
+  github,
   handoffChildAdmission,
   io,
   isTerminalChildStatus,
+  RunSkipped,
   sandbox,
   step,
 } from "@fractalboxdev/flare-dispatch-core";
@@ -78,6 +83,62 @@ export const parseWindow = (raw: string | undefined): number => {
  */
 export const partCheckName = (stage: string): string => `flare-dispatch/check:${stage}`;
 export const NOT_AFFECTED_SUMMARY = "not affected by this change";
+
+/** Why a gate stops spawning before every part has run. */
+export type StopReason = "head superseded" | "pull request closed" | "admission backlog";
+
+/** Whether the gated pull request is still open at the gated commit. */
+export type Liveness = { readonly live: true } | { readonly live: false; readonly reason: StopReason };
+
+const LIVE: Liveness = { live: true };
+
+/**
+ * Decide liveness from the gated pull request's state. An input naming `pr`
+ * passes that PR (`pulls/{pr}`); an input naming none passes the PRs GitHub
+ * associates with the gated commit (`commits/{sha}/pulls`) and gates every one
+ * headed in the gated repository. A gated PR open at `sha` is live; one open at
+ * another head is superseded; one closed or merged is closed. An input without
+ * `pr` was started by a pull request event, so a commit no PR holds any longer —
+ * force-pushed off its branch — is superseded. An input with `pr` and no answer
+ * for it is unknown, and unknown is live.
+ */
+export const prLiveness = (
+  input: { readonly repo: string; readonly sha: string; readonly pr?: number | undefined },
+  prs: readonly CommitPullRequest[],
+): Liveness => {
+  const gated = prs.filter((pr) =>
+    input.pr !== undefined ? pr.number === input.pr : pr.headRepo === input.repo,
+  );
+  if (gated.length === 0) {
+    return input.pr === undefined && prs.length === 0 ? { live: false, reason: "head superseded" } : LIVE;
+  }
+  const open = gated.filter((pr) => pr.state === "open");
+  if (open.some((pr) => pr.headSha.toLowerCase() === input.sha.toLowerCase())) return LIVE;
+  return { live: false, reason: open.length > 0 ? "head superseded" : "pull request closed" };
+};
+
+/**
+ * The gated pull request's liveness: `pulls/{pr}` when the input names it,
+ * `commits/{sha}/pulls` otherwise. An unreadable answer is live.
+ */
+export const readLiveness = (input: {
+  readonly repo: string;
+  readonly sha: string;
+  readonly pr?: number | undefined;
+}) =>
+  (input.pr !== undefined
+    ? github.pullRequest({ repo: input.repo, number: input.pr }).pipe(Effect.map((pr) => [pr]))
+    : github.commitPullRequests({ repo: input.repo, sha: input.sha })
+  ).pipe(
+    Effect.map((prs) => prLiveness(input, prs)),
+    Effect.orElseSucceed((): Liveness => LIVE),
+  );
+
+/** The summary on the check of a part the gate did not run. */
+export const unrunSummary = (reason: StopReason, timedOut: readonly string[]): string =>
+  reason === "admission backlog"
+    ? `not run — admission backlog: ${timedOut.join(", ")} waited past the ${STAGE_QUEUE_SEC / 60}-minute queue age, so the gate spawns no further parts into a saturated pool`
+    : `not run — ${reason}`;
 
 const Input = Schema.Struct({
   repo: Schema.Literal(REPO),
@@ -196,16 +257,21 @@ export const planStages = (
 
 export const contextfulGate = defineRun({
   name: "contextful-gate",
-  // 1.1.0 — `pr` input, `--affected` selection, sliding window, supersession.
-  version: "1.1.0",
+  // 1.2.0 — a liveness check before each spawn; an admission timeout stops spawning.
+  version: "1.2.0",
   inputs: Input,
   outputs: Output,
   triggers: [
     {
       event: "pull_request",
       actions: ["opened", "synchronize", "reopened", "ready_for_review"],
+      // A reopen keys on its own `updated_at`: the close terminated the gate
+      // keyed on this head and base, and a reopen without a push must start a
+      // new one rather than collapse onto it.
       idempotencyKey: ({ payload }) =>
-        `contextful-gate:${String(payload.pull_request?.number ?? "")}:${String(payload.pull_request?.head?.sha ?? "")}:${String(payload.pull_request?.base?.sha ?? "")}`,
+        `contextful-gate:${String(payload.pull_request?.number ?? "")}:${String(payload.pull_request?.head?.sha ?? "")}:${String(payload.pull_request?.base?.sha ?? "")}${
+          payload.action === "reopened" ? `:reopened:${String(payload.pull_request?.updated_at ?? "")}` : ""
+        }`,
       gate: ({ payload }) =>
         payload.repository?.full_name === REPO &&
         payload.pull_request?.head?.repo?.full_name === REPO,
@@ -223,7 +289,8 @@ export const contextfulGate = defineRun({
     },
   ],
   // One gate run per pull request is live: a newer revision cancels the older
-  // run, its children and their checks (apps/dispatcher/src/supersede.ts).
+  // run, its children and their checks (apps/dispatcher/src/supersede.ts), and
+  // the pull request's close cancels the live one (apps/dispatcher/src/pr-close.ts).
   supersede: (input) =>
     input.pr === undefined
       ? undefined
@@ -231,6 +298,9 @@ export const contextfulGate = defineRun({
           group: `contextful-gate:${input.repo}#${input.pr}`,
           ...(input.revisedAt !== undefined ? { order: input.revisedAt } : {}),
         },
+  // The gate reads every part's verdict: a part still queued once the gate
+  // has ended leaves the admission queue (apps/dispatcher/src/admission-parent.ts).
+  joinsChildren: true,
   limits: { maxDurationSec: 30 * 3600, admissionMaxQueueAgeSec: 90 * 60 },
   run: (input) =>
     Effect.gen(function* () {
@@ -379,16 +449,38 @@ export const contextfulGate = defineRun({
       // a gate in flight across a deploy re-spawns under new names; a child's
       // instance id derives from its input, so the re-spawn finds the same
       // children.
+      //
+      // Each spawn step first asks GitHub whether the pull request is still
+      // open at this commit, and spawns nothing when it is not; an unreadable
+      // answer spawns as before. The read lives inside the spawn checkpoint, so
+      // an instance replaying spawns cached before the read existed replays
+      // them all before the first fresh read. A part that times out in the
+      // admission queue also stops it: the pool is saturated, and further
+      // windows would only queue behind the backlog.
       const queue = [...plan.dispatch];
       const running: { readonly stage: string; readonly id: string; readonly expiresAt: number }[] = [];
       const failed = new Set<string>();
+      const timedOut: string[] = [];
+      let stopped: StopReason | undefined;
       let spawned = 0;
-      for (let round = 0; queue.length > 0 || running.length > 0; round++) {
+      const createdAt = (yield* io.env(EXECUTION_CREATED_AT_ENV)) ?? "unknown";
+      const deployedVersion = (yield* io.env(DEPLOYED_VERSION_ENV)) ?? "unknown";
+      for (let round = 0; stopped === undefined && (queue.length > 0 || running.length > 0); round++) {
         const free = window - running.length;
         if (queue.length > 0 && free > 0) {
-          const batch = queue.splice(0, free);
-          const { handles, spawnedAt } = yield* step(`spawn-parts-${spawned}`, () =>
+          // Logged on every invocation that reaches a spawn, replays included:
+          // an instance created before a deploy that logs this line runs the
+          // deployed code.
+          yield* io.log("info", `spawn-parts-${spawned}: execution created ${createdAt}, deployed version ${deployedVersion}`, {
+            step: `spawn-parts-${spawned}`,
+            executionCreatedAt: createdAt,
+            deployedVersion,
+          });
+          const batch = queue.slice(0, free);
+          const spawn = yield* step(`spawn-parts-${spawned}`, () =>
             Effect.gen(function* () {
+              const liveness = yield* readLiveness(input);
+              if (!liveness.live) return { stopped: liveness.reason };
               const handles = yield* fanOut({
                 run: "check",
                 items: batch,
@@ -411,6 +503,12 @@ export const contextfulGate = defineRun({
               return { handles, spawnedAt: yield* io.now };
             }),
           );
+          if ("stopped" in spawn) {
+            stopped = spawn.stopped;
+            break;
+          }
+          const { handles, spawnedAt } = spawn;
+          queue.splice(0, batch.length);
           if (spawned === 0) {
             yield* step("handoff-admission", () => handoffChildAdmission());
           }
@@ -434,15 +532,57 @@ export const contextfulGate = defineRun({
         const settled = new Map(
           records
             .filter((record) => isTerminalChildStatus(record.status))
-            .map((record) => [record.executionId, record.status]),
+            .map((record) => [record.executionId, record]),
         );
         for (let index = running.length - 1; index >= 0; index--) {
           const part = running[index]!;
-          const status = settled.get(part.id);
-          if (status === undefined) continue;
-          if (status !== "success") failed.add(part.stage);
+          const record = settled.get(part.id);
+          if (record === undefined) continue;
+          if (record.status !== "success") failed.add(part.stage);
+          if (record.failureTag === "AdmissionTimedOut") timedOut.push(part.stage);
           running.splice(index, 1);
         }
+        if (timedOut.length > 0 && queue.length > 0) stopped = "admission backlog";
+      }
+      if (stopped !== undefined) {
+        // Branch protection requires every part's check: each part never
+        // spawned is posted cancelled, naming why. A part still running or
+        // queued ends on its own; a queued one leaves the queue once this
+        // gate has ended.
+        const reason = stopped;
+        const unrun = [...queue];
+        const timedOutInOrder = plan.dispatch.filter((stage) => timedOut.includes(stage));
+        yield* Effect.forEach(
+          unrun,
+          (stage) =>
+            Effect.gen(function* () {
+              const name = partCheckName(stage);
+              const output = { title: name, summary: unrunSummary(reason, timedOutInOrder) };
+              const checkRunId = yield* step(`open-unrun-${stage}`, () =>
+                checks.create({ repo: input.repo, sha: input.sha, name, output }),
+              );
+              yield* step(`conclude-unrun-${stage}`, () =>
+                checks.update({ repo: input.repo, checkRunId, conclusion: "cancelled", output }),
+              );
+            }),
+          { concurrency: 4, discard: true },
+        );
+        if (reason !== "admission backlog") {
+          return yield* Effect.fail(
+            new RunSkipped({ reason: `${reason} — ${unrun.length} of ${plan.dispatch.length} parts not run` }),
+          );
+        }
+        const failedParts = plan.dispatch.filter((stage) => failed.has(stage));
+        return yield* Effect.fail(
+          new AcceptanceFailed({
+            exitCode: 1,
+            summaryMd: [
+              `Admission backlog: ${timedOutInOrder.join(", ")} waited past the ${STAGE_QUEUE_SEC / 60}-minute queue age; the gate spawned no further parts.`,
+              `Not run: ${unrun.join(", ")}`,
+              ...(failedParts.length > 0 ? [`Gate stages failed: ${failedParts.join(", ")}`] : []),
+            ].join("\n\n"),
+          }),
+        );
       }
       const failedInOrder = plan.dispatch.filter((stage) => failed.has(stage));
       if (failedInOrder.length > 0) {

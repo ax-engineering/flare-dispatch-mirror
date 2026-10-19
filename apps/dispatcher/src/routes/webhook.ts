@@ -35,6 +35,7 @@
 import { checkAndArmCooldown } from "../cooldown";
 import { verify } from "../hmac";
 import { toInstanceId } from "../instance-id";
+import { closedGroups, closeInstanceId, type CloseGroupPayload } from "../pr-close";
 import { triggersByEvent } from "../registry";
 import { resolveReleaseApproval } from "../release-approval";
 import { decodeRerequest, handleRerequest } from "../rerequest";
@@ -242,6 +243,30 @@ export const handleGithubWebhook = async (request: Request, env: Env): Promise<R
     );
   }
 
+  // 7a. A closed pull request ends every superseding run of its groups
+  //     (pr-close.ts): one RunWorkflow instance per group cancels the live
+  //     members. A close never also starts a run — no trigger's `actions`
+  //     names `closed`.
+  const closed: Array<{ group: string; instanceId: string }> = [];
+  for (const { group, rank } of closedGroups(event, payload, matches, Date.now())) {
+    const id = closeInstanceId(group, rank);
+    const { repo, installation_id } = synthesizeGithubBlock(payload);
+    const params: CloseGroupPayload = {
+      closeGroup: { group, rank, repo, ...(installation_id !== undefined ? { installation_id } : {}) },
+    };
+    try {
+      await env.RUNS_WORKFLOW.create({ id, params });
+      closed.push({ group, instanceId: id });
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      if (/already exists|duplicate/i.test(message)) {
+        closed.push({ group, instanceId: id });
+        continue;
+      }
+      console.error(`[webhook] close create failed group="${group}" id="${id}": ${message}`);
+    }
+  }
+
   const dispatched: Array<{ run: string; executionId: string }> = [];
   const skipped: Array<{
     run: string;
@@ -331,6 +356,7 @@ export const handleGithubWebhook = async (request: Request, env: Env): Promise<R
       dispatched,
       // Shape-stable: `skipped` appears only when a cooldown actually fired.
       ...(skipped.length > 0 ? { skipped } : {}),
+      ...(closed.length > 0 ? { closed } : {}),
     },
     202,
   );

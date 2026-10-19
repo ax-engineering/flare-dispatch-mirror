@@ -290,3 +290,17 @@ describe("IOLive.viewerUrl", () => {
     expect(Option.isNone(result)).toBe(true);
   });
 });
+
+describe("IOLive io.env", () => {
+  it("answers the dispatcher's per-execution vars and nothing else", async () => {
+    const read = (key: string) =>
+      Effect.runPromise(
+        Effect.flatMap(IO, (io) => io.env(key)).pipe(
+          Effect.provide(makeIOLive({ vars: { FLARE_DISPATCH_DEPLOYED_VERSION: "v-1" } })),
+        ),
+      );
+    expect(await read("FLARE_DISPATCH_DEPLOYED_VERSION")).toBe("v-1");
+    expect(await read("HOME")).toBeUndefined();
+  });
+});
+

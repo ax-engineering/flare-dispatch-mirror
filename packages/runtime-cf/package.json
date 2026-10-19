@@ -9,7 +9,8 @@
     ".": "./src/index.ts",
     "./model-gateway": "./src/model-gateway-cf.ts",
     "./log-names": "./src/log-names.ts",
-    "./admission-cap": "./src/run-admission-d1.ts"
+    "./admission-cap": "./src/run-admission-d1.ts",
+    "./run-supersede": "./src/run-supersede-d1.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
