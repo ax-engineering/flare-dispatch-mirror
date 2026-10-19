@@ -89,6 +89,7 @@ export const makeFakeWorkflow = (
 type StoredObject = {
   readonly body: Uint8Array;
   readonly contentType: string;
+  readonly uploaded: Date;
 };
 
 /** A fake `RUNS_STORAGE` (R2) backed by an in-memory Map. */
@@ -101,6 +102,8 @@ export interface FakeR2 {
 export const makeFakeR2 = (): FakeR2 => {
   const store = new Map<string, StoredObject>();
   const encoder = new TextEncoder();
+  // Each put lands one millisecond after the last, so `uploaded` follows write order.
+  let clock = 0;
 
   const binding = {
     get: async (key: string) => {
@@ -122,7 +125,8 @@ export const makeFakeR2 = (): FakeR2 => {
     list: async ({ prefix = "" }: { prefix?: string } = {}) => ({
       objects: Array.from(store.entries())
         .filter(([key]) => key.startsWith(prefix))
-        .map(([key, obj]) => ({ key, size: obj.body.byteLength })),
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+        .map(([key, obj]) => ({ key, size: obj.body.byteLength, uploaded: obj.uploaded })),
       truncated: false,
     }),
   } as unknown as Env["RUNS_STORAGE"];
@@ -130,7 +134,8 @@ export const makeFakeR2 = (): FakeR2 => {
   return {
     binding,
     put: (key, body, contentType = "application/octet-stream") => {
-      store.set(key, { body: encoder.encode(body), contentType });
+      clock += 1;
+      store.set(key, { body: encoder.encode(body), contentType, uploaded: new Date(clock) });
     },
   };
 };

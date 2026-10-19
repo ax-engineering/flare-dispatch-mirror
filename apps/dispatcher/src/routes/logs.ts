@@ -1,12 +1,13 @@
 // FlareDispatch Dispatcher — the log-viewing surfaces.
 //
-//   GET /v1/executions/:id/logs/:file  — one exec log (ndjson | ?format=text)
-//   GET /v1/executions/:id/logs        — all exec logs, concatenated as text
+//   GET /v1/executions/:id/logs/<file> — one log file (ndjson | ?format=text)
+//   GET /v1/executions/:id/logs        — every log, in reading order, as text
 //   GET /logs/:execution               — the self-contained HTML viewer
 //
 // All three are capability-token-gated (log-auth.ts). The full, untruncated
-// log of every command already lives in R2 at `logs/<id>/exec[-N].ndjson`
-// (written by SandboxCloudflareLive); these routes are the readable read side,
+// log of every command already lives in R2 under `logs/<id>/`, named by the
+// shared grammar (runtime-cf log-names.ts): sandbox exec logs and durable
+// check-command chunks with their consolidated log. These routes are the read side,
 // replacing the truncated, JSON-escaped blob the Cloudflare Workflows instance
 // explorer shows. The HTML viewer follows the routes/replay.ts precedent: one
 // self-contained page from the worker's own origin, no build step, no CDN —
@@ -14,6 +15,7 @@
 // control sequences stripped, strict CSP — review M5).
 
 import { Effect, Option } from "effect";
+import { logSections, parseLogFile } from "@fractalboxdev/flare-dispatch-runtime-cf/log-names";
 
 import type { Env } from "../env";
 import { isTerminal } from "../executions-read";
@@ -26,14 +28,6 @@ const json = (body: unknown, status: number): Response =>
     status,
     headers: { "content-type": "application/json" },
   });
-
-/**
- * Valid exec-log file names. Covers today's `exec.ndjson` / `exec-2.ndjson` and
- * the future step-named keys (`exec-<step>-<attempt>.ndjson`) the live-tail work
- * introduces — while refusing anything that could escape the `logs/<id>/`
- * prefix or smuggle a path segment.
- */
-const LOG_FILE_RE = /^exec(-[A-Za-z0-9_]+)?\.ndjson$/;
 
 /** Immutable once the execution is terminal; never cache a running run's logs. */
 const cacheFor = (terminal: boolean): string =>
@@ -157,7 +151,7 @@ export const handleLogFile = (
     const denied = yield* Effect.promise(() => gateLogAccess(env, executionId, url));
     if (denied !== null) return denied;
 
-    if (!LOG_FILE_RE.test(file)) {
+    if (parseLogFile(file) === null) {
       return json({ error: "invalid_log_file", message: `not a log file name: "${file}"` }, 400);
     }
 
@@ -215,10 +209,12 @@ export const handleLogsAggregate = (
         limit: 1000,
       }),
     );
-    const files = listed.objects
-      .map((o) => o.key.slice(`logs/${executionId}/`.length))
-      .filter((f) => LOG_FILE_RE.test(f))
-      .sort(compareLogFiles);
+    const files = logSections(
+      listed.objects.map((o) => ({
+        file: o.key.slice(`logs/${executionId}/`.length),
+        uploaded: o.uploaded.getTime(),
+      })),
+    ).flatMap((section) => section.files);
 
     if (files.length === 0) {
       return json({ error: "no_logs", message: `no logs for execution "${executionId}"` }, 404);
@@ -261,18 +257,6 @@ export const handleLogsAggregate = (
       },
     });
   });
-
-/** Order exec logs `exec.ndjson` < `exec-2.ndjson` < `exec-10.ndjson` < … */
-const compareLogFiles = (a: string, b: string): number => {
-  const n = (f: string): number => {
-    const m = /^exec(?:-(\d+))?\.ndjson$/.exec(f);
-    if (m === null) return Number.MAX_SAFE_INTEGER; // step-named keys sort last
-    return m[1] === undefined ? 1 : Number.parseInt(m[1], 10);
-  };
-  const na = n(a);
-  const nb = n(b);
-  return na !== nb ? na - nb : a.localeCompare(b);
-};
 
 // ---------------------------------------------------------------------------
 // GET /logs/:execution  — the HTML viewer
@@ -731,31 +715,35 @@ const viewerPage = (nonce: string): string => `<!doctype html>
     rec.section.open = !rec.housekeeping;
   }
   function ensureSection(l){
-    var rec = files[l.file];
-    if (rec) return rec;
+    var rec = files[l.id];
+    if (rec){ rec.szEl.textContent = (l.size/1024).toFixed(1)+" KB"; return rec; }
     var det = document.createElement("details");
-    det.id = l.file;
+    det.id = l.id;
     var sum = document.createElement("summary");
     // Title is the COMMAND once the log is fetched; until then fall back to the
     // filename. The filename is demoted to a muted suffix (still the deep-link
     // anchor via det.id) since it carries no signal on its own.
-    var cmd = document.createElement("span"); cmd.className="cmd"; cmd.textContent = l.file;
+    var cmd = document.createElement("span"); cmd.className="cmd"; cmd.textContent = l.id;
     var sz = document.createElement("span"); sz.className="sz"; sz.textContent = (l.size/1024).toFixed(1)+" KB";
-    var fn = document.createElement("span"); fn.className="fn"; fn.textContent = l.file;
+    var fn = document.createElement("span"); fn.className="fn"; fn.textContent = l.id;
     sum.appendChild(cmd); sum.appendChild(sz); sum.appendChild(fn);
     var body = document.createElement("div");
     det.appendChild(sum); det.appendChild(body);
     sectionsEl.appendChild(det);
-    rec = files[l.file] = { section: det, body: body, cmdEl: cmd, lines: [], finalized: false, housekeeping: false };
+    rec = files[l.id] = { section: det, body: body, cmdEl: cmd, szEl: sz, lines: [], finalized: false, housekeeping: false };
     return rec;
   }
-  function fetchLog(file, rec){
-    return fetch(API + "/logs/" + encodeURIComponent(file) + qs)
-      .then(function(r){ return r.ok ? r.text() : ""; })
-      .then(function(txt){ renderInto(rec, txt); applyFilter(); });
+  // A section is one exec log, or one check process: its consolidated log once
+  // finalized, its durable chunks in stream order while it runs. The chunks are
+  // read in the order the index lists them and rendered as one log.
+  function fetchSection(l, rec){
+    return Promise.all(l.files.map(function(f){
+      return fetch(API + "/logs/" + encodeURIComponent(f.file) + qs)
+        .then(function(r){ return r.ok ? r.text() : ""; });
+    })).then(function(txts){ renderInto(rec, txts.join("\\n")); applyFilter(); });
   }
   function syncSections(detail, terminal){
-    var logs = detail.logs || [];
+    var logs = detail.sections || [];
     if (logs.length===0 && Object.keys(files).length===0){
       sectionsEl.innerHTML = '<div class="empty">No logs yet for this execution.</div>';
       return Promise.resolve();
@@ -768,7 +756,7 @@ const viewerPage = (nonce: string): string => `<!doctype html>
       // Re-fetch only files not yet finalized (the last/growing one while live).
       if (!rec.finalized){
         if (terminal) rec.finalized = true;
-        jobs.push(fetchLog(l.file, rec));
+        jobs.push(fetchSection(l, rec));
       }
     });
     return Promise.all(jobs).then(updateHousekeepingLabel);
@@ -812,7 +800,7 @@ const viewerPage = (nonce: string): string => `<!doctype html>
     document.body.classList.toggle("show-housekeeping", hkToggle.checked);
   });
   // Validate the deep-link fragment before any DOM lookup uses it.
-  if (location.hash && !/^#exec(-[A-Za-z0-9_]+)?\\.ndjson$/.test(location.hash)){
+  if (location.hash && !/^#[A-Za-z0-9_.-]+$/.test(location.hash)){
     location.hash = "";
   }
   // A deep link may point at a section that classified as housekeeping (hidden

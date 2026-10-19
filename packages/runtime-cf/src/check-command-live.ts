@@ -12,6 +12,7 @@ import {
 } from "@fractalboxdev/flare-dispatch-core";
 import { commandFingerprint } from "./check-command";
 import { scrubLogPrefix } from "./check-command-log";
+import { checkChunkLogFile, checkHandleId, checkLogFile } from "./log-names";
 import { redactLongestFirst as redact } from "./sandbox-output";
 
 export function makeCheckCommandService(
@@ -44,7 +45,7 @@ export function makeCheckCommandService(
       ),
     });
   };
-  const root = (h: CheckCommandHandle) => `logs/${executionId}/check-${h.id}`;
+  const logs = `logs/${executionId}/`;
   const validate = async (h: CheckCommandHandle, opts: CheckCommandOpts) => {
     const values = policy(opts);
     const containerId = opts.container?.id ?? defaultContainer;
@@ -75,7 +76,7 @@ export function makeCheckCommandService(
       const prefix = scrubLogPrefix(raw.text, opts.redactValues ?? [], terminal);
       if (prefix.characters === 0) continue;
       const end = offset + new TextEncoder().encode(raw.text.slice(0, prefix.characters)).length;
-      const key = `${root(h)}/${stream}-${offset}-${end}.ndjson`;
+      const key = logs + checkChunkLogFile(h.id, stream, offset, end);
       await writeLog(
         key,
         redact(flattenCommand(opts.command), opts.redactValues),
@@ -111,7 +112,7 @@ export function makeCheckCommandService(
           );
           const startedAt = Date.now();
           const candidate: CheckCommandHandle = {
-            id: `check-${operation.slice(0, 48)}`,
+            id: checkHandleId(operation),
             container: opts.container ?? { id: defaultContainer },
             fingerprint,
             startedAt,
@@ -193,7 +194,7 @@ export function makeCheckCommandService(
               if (part === null) throw new Error("durable check log chunk missing");
               size += part.size;
             }
-            const logPath = `${root(handle)}.ndjson`;
+            const logPath = logs + checkLogFile(handle.id);
             const pipe = new FixedLengthStream(size);
             const writer = pipe.writable.getWriter();
             const writing = (async () => {

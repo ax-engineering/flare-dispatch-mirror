@@ -153,6 +153,21 @@ const route = (method: "GET" | "POST", produce: Produce, opts?: { readonly viewe
 const decode = (params: Params, key: string): string => decodeURIComponent(params[key] ?? "");
 
 /**
+ * The log file name of `GET /v1/executions/:id/logs/<file>`, from the raw
+ * pathname: a chunk name holds `/`, linked either encoded (`%2F`) or literal.
+ * Decoded once, whole, so empty and dot segments reach the grammar check
+ * intact; a malformed escape yields `""`, which the grammar refuses.
+ */
+const logFileParam = (url: URL): string => {
+  const raw = /^\/v1\/executions\/[^/]*\/logs\/(.*)$/.exec(url.pathname)?.[1] ?? "";
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return "";
+  }
+};
+
+/**
  * A GET viewer route whose handler is itself an Effect over the ports (the
  * executions/logs read routes). Gates first, then runs the handler within the
  * router's Layer context, streaming its `Response` back. A thrown error (an
@@ -543,10 +558,8 @@ const router = baseRouter.pipe(
     routeEffect(({ request, url }) => handleExecutionsList(request, url)),
   ),
   HttpRouter.all(
-    "/v1/executions/:id/logs/:file",
-    routeEffect(({ params, url }) =>
-      handleLogFile(decode(params, "id"), decode(params, "file"), url),
-    ),
+    "/v1/executions/:id/logs/*",
+    routeEffect(({ params, url }) => handleLogFile(decode(params, "id"), logFileParam(url), url)),
   ),
   HttpRouter.all(
     "/v1/executions/:id/logs",

@@ -66,6 +66,7 @@ import {
 import { previewSafeSandboxId } from "./preview-sandbox-id";
 import { redact } from "./sandbox-output";
 import { makeCheckCommandService } from "./check-command-live";
+import { execLogFile } from "./log-names";
 import type { CheckCommandOwner } from "@fractalboxdev/flare-dispatch-core";
 import { resolveCloneToken, type SandboxGithubAuth } from "./sandbox-clone-auth";
 import {
@@ -366,9 +367,7 @@ export const makeSandboxCloudflareLive = <T extends Sandbox>(
   let execSeq = 0;
   const nextLogKey = (): string => {
     execSeq += 1;
-    return execSeq === 1
-      ? `logs/${executionId}/exec.ndjson`
-      : `logs/${executionId}/exec-${execSeq}.ndjson`;
+    return `logs/${executionId}/${execLogFile(execSeq)}`;
   };
 
   /** Render captured stdout/stderr as NDJSON and stream it to R2. */

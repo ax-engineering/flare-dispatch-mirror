@@ -61,6 +61,7 @@ import {
   type SandboxService,
   flattenCommand,
 } from "@fractalboxdev/flare-dispatch-core";
+import { execLogFile } from "./log-names";
 
 /** The workspace the substrate clones into — fixed, and not consumer-chosen. */
 export const SUBSTRATE_WORKSPACE = "/workspace";
@@ -184,14 +185,12 @@ export const makeSandboxFacadeLive = (opts: SandboxFacadeOptions): Layer.Layer<S
 
   const key = opts.executionId;
 
-  // Log keys mirror sandbox-cf.ts so the viewer, the artifact route and the
-  // `logs/<exec>/exec.ndjson` acceptance all resolve unchanged.
+  // Log keys come from the shared grammar (log-names.ts), so the viewer, the
+  // artifact route and the `logs/<exec>/exec.ndjson` acceptance all resolve.
   let execSeq = 0;
   const nextLogKey = (): string => {
     execSeq += 1;
-    return execSeq === 1
-      ? `logs/${opts.executionId}/exec.ndjson`
-      : `logs/${opts.executionId}/exec-${execSeq}.ndjson`;
+    return `logs/${opts.executionId}/${execLogFile(execSeq)}`;
   };
 
   const writeLog = async (key: string, command: string, tail: string): Promise<void> => {

@@ -19,6 +19,7 @@
 // logs exist (the unused `steps.log_uri` column stays reserved) — review M1.
 
 import { Effect, Option } from "effect";
+import { logSections } from "@fractalboxdev/flare-dispatch-runtime-cf/log-names";
 
 import type { ExecutionRow, StepRow } from "../executions-read";
 import { gateLogAccess } from "../log-auth";
@@ -177,10 +178,18 @@ export const handleExecutionDetail = (
       return {
         file,
         size: o.size,
+        uploaded: o.uploaded.getTime(),
         url: `/v1/executions/${encodeURIComponent(
           executionId,
         )}/logs/${encodeURIComponent(file)}?t=${token}`,
       };
+    });
+    // What the viewer renders: one section per exec or check process, its
+    // files in reading order (log-names.ts), each carrying its link.
+    const byFile = new Map(logs.map((l) => [l.file, l]));
+    const sections = logSections(logs).map((section) => {
+      const files = section.files.map((f) => byFile.get(f)!);
+      return { id: section.id, size: files.reduce((n, f) => n + f.size, 0), files };
     });
 
     // Top-level artifact objects only (skip the upload-time browse expansion
@@ -207,6 +216,7 @@ export const handleExecutionDetail = (
         ...(row.summary_json !== null ? { summary: safeParse(row.summary_json) } : {}),
         steps: steps.map(stepView),
         logs,
+        sections,
         artifacts,
       },
       200,

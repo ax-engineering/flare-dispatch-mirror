@@ -14,6 +14,10 @@ import { makeFakeD1, makeFakeEnv, makeFakeR2, makeFakeWorkflow } from "../test-h
 const SECRET = "log-secret-please-rotate";
 const ORIGIN = "https://dispatcher.example";
 const EXEC = "offload-test:owner_repo:abc123def456";
+// Durable check processes: DONE is finalized (consolidated log beside its
+// chunks), LIVE is still running (chunks only).
+const DONE = `check-check-${"0123456789abcdef".repeat(3)}`;
+const LIVE = `check-check-${"fedcba9876543210".repeat(3)}`;
 
 /** An NDJSON exec log body the way `SandboxCloudflareLive.writeLog` writes it. */
 const ndjson = (command: string, stdout: string[], stderr: string[] = []): string =>
@@ -67,6 +71,20 @@ const fixture = (opts: { adminToken?: string } = {}) => {
     ndjson("pnpm build", ["bundle done"]),
     "application/x-ndjson",
   );
+  storage.put(`logs/${EXEC}/${DONE}/stdout-0-4.ndjson`, ndjson("pnpm check", ["one"]));
+  storage.put(`logs/${EXEC}/${DONE}/stderr-0-10139.ndjson`, ndjson("pnpm check", [], ["two"]));
+  storage.put(
+    `logs/${EXEC}/${DONE}.ndjson`,
+    ndjson("pnpm check", ["one"]) + ndjson("pnpm check", [], ["two"]),
+    "application/x-ndjson",
+  );
+  // Written in stream order; R2 lists them lexically (stderr first, and
+  // `stdout-65536-…` before `stdout-9000-…`).
+  storage.put(`logs/${EXEC}/${LIVE}/stdout-0-9000.ndjson`, ndjson("pnpm long", ["L1"]));
+  storage.put(`logs/${EXEC}/${LIVE}/stderr-0-10139.ndjson`, ndjson("pnpm long", [], ["L2"]));
+  storage.put(`logs/${EXEC}/${LIVE}/stdout-9000-65536.ndjson`, ndjson("pnpm long", ["L3"]));
+  storage.put(`logs/${EXEC}/${LIVE}/stdout-65536-70000.ndjson`, ndjson("pnpm long", ["L4"]));
+  storage.put(`logs/${EXEC}/not-a-log.txt`, "x");
   // A produced-file artifact (what a run `artifact.upload`s) so the detail
   // route surfaces it for the viewer's artifacts strip.
   storage.put(`artifacts/${EXEC}/pr-review.diff`, "diff --git a b\n", "text/plain");
@@ -244,6 +262,83 @@ describe("log routes — token gate", () => {
   });
 });
 
+describe("log routes — check-command log names", () => {
+  const file = async (name: string, query = "") => {
+    const { env } = fixture();
+    const t = await signLogToken(SECRET, EXEC);
+    return get(env, `/v1/executions/${encodeURIComponent(EXEC)}/logs/${name}?t=${t}${query}`);
+  };
+
+  it("serves a consolidated check log", async () => {
+    const res = await file(`${DONE}.ndjson`, "&format=text");
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("$ pnpm check\none\n$ pnpm check\n[stderr] two\n");
+  });
+
+  it("serves a durable chunk addressed the way the listing links it", async () => {
+    const res = await file(encodeURIComponent(`${DONE}/stderr-0-10139.ndjson`));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("application/x-ndjson");
+    expect(await res.text()).toContain('"line":"two"');
+  });
+
+  it("serves a durable chunk addressed with a literal slash", async () => {
+    const res = await file(`${DONE}/stderr-0-10139.ndjson`, "&format=text");
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("$ pnpm check\n[stderr] two\n");
+  });
+
+  it.each([
+    "not-a-log.txt",
+    `${DONE}%2F..%2F..%2Fexec.ndjson`,
+    `..%2F..%2Fartifacts%2F${encodeURIComponent(EXEC)}%2Fpr-review.diff`,
+    `%2F${DONE}.ndjson`,
+    `${DONE}%5Cstderr-0-10139.ndjson`,
+    `${DONE}%2F%2Fstderr-0-10139.ndjson`,
+    `${DONE}/stdin-0-1.ndjson`,
+  ])("refuses %s", async (name) => {
+    const res = await file(name);
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe("invalid_log_file");
+  });
+
+  it("aggregates each process once, its chunks in stream order", async () => {
+    const { env } = fixture();
+    const t = await signLogToken(SECRET, EXEC);
+    const res = await get(env, `/v1/executions/${encodeURIComponent(EXEC)}/logs?t=${t}`);
+    const text = await res.text();
+    expect(text).toContain(`===== ${DONE}.ndjson =====`);
+    expect(text).not.toContain(`${DONE}/`);
+    expect(text).not.toContain("not-a-log.txt");
+    const order = ["exec.ndjson", "exec-2.ndjson", `${DONE}.ndjson`, "L1", "L2", "L3", "L4"];
+    const at = order.map((needle) => text.indexOf(needle));
+    expect(at.every((i) => i >= 0)).toBe(true);
+    expect([...at].sort((a, b) => a - b)).toEqual(at);
+  });
+
+  it("indexes sections the viewer renders, each file linked", async () => {
+    const { env } = fixture();
+    const t = await signLogToken(SECRET, EXEC);
+    const res = await get(env, `/v1/executions/${encodeURIComponent(EXEC)}?t=${t}`);
+    const body = (await res.json()) as {
+      sections: { id: string; size: number; files: { file: string; url: string }[] }[];
+    };
+    expect(body.sections.map((s) => s.id)).toEqual(["exec.ndjson", "exec-2.ndjson", DONE, LIVE]);
+    const live = body.sections[3]!;
+    expect(live.files.map((f) => f.file)).toEqual([
+      `${LIVE}/stdout-0-9000.ndjson`,
+      `${LIVE}/stderr-0-10139.ndjson`,
+      `${LIVE}/stdout-9000-65536.ndjson`,
+      `${LIVE}/stdout-65536-70000.ndjson`,
+    ]);
+    expect(live.size).toBeGreaterThan(0);
+    for (const f of live.files) {
+      const served = await get(env, f.url);
+      expect(served.status).toBe(200);
+    }
+  });
+});
+
 describe("GET /v1/executions/:id", () => {
   it("returns steps + log index but never input_json", async () => {
     const { env } = fixture();
@@ -337,6 +432,9 @@ describe("GET /logs/:execution (viewer)", () => {
     expect(html).toContain("show-housekeeping");
     // The classifier is inlined verbatim from the shared module, not re-typed.
     expect(html).toContain("var isHousekeeping = ");
+    // Sections come from the detail index, so a chunked check process renders
+    // as one section read file by file.
+    expect(html).toContain("detail.sections");
   });
 
   it("403s the viewer without a token", async () => {
