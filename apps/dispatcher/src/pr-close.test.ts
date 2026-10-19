@@ -48,6 +48,14 @@ describe("closedGroups", () => {
     expect(close!.rank).toBeGreaterThan(gateRank!);
   });
 
+  it("ranks a reopen in the close's own second above the marker", () => {
+    // `gh pr close && gh pr reopen` shares one `updated_at` second.
+    const reopen = { ...closedPayload(), action: "reopened" };
+    const reopenRank = contextfulGate.supersede?.(contextfulGate.triggers![0]!.inputs({ payload: reopen }))?.order;
+    const [close] = closedGroups("pull_request", closedPayload(), matches, 0);
+    expect(reopenRank).toBeGreaterThan(close!.rank);
+  });
+
   it("ends nothing for another action, another event, or a payload the trigger's gate refuses", () => {
     expect(closedGroups("pull_request", closedPayload({ action: "synchronize" }), matches, 0)).toEqual([]);
     expect(closedGroups("push", closedPayload(), matches, 0)).toEqual([]);

@@ -533,8 +533,10 @@ export interface GithubService {
 
   /**
    * The pull requests associated with a commit (`commits/{sha}/pulls`). Fails
-   * on any unreadable answer and on an uncredentialed deploy: an empty list is
-   * a real answer here, so no degraded read may stand in for it.
+   * on any unreadable answer and on an uncredentialed deploy rather than
+   * returning an empty list. GitHub answers `[]` for a commit a force-push
+   * moved off its branch, so an empty list does not mean no pull request
+   * held the commit.
    */
   readonly commitPullRequests: (req: {
     repo: string;

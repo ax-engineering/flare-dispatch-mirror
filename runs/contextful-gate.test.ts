@@ -742,8 +742,9 @@ describe("contextful-gate", () => {
       expect(prLiveness(withPr, [])).toEqual({ live: true });
       // An input without `pr` gates every PR headed in the repository.
       const bare = { repo: REPO, sha: SHA };
-      // `commits/{sha}/pulls` answers [] for a commit force-pushed off every branch.
-      expect(prLiveness(bare, [])).toEqual({ live: false, reason: "head superseded" });
+      // `commits/{sha}/pulls` answers [] both for a commit force-pushed off its
+      // branch and for one no PR ever held: unknown, and unknown is live.
+      expect(prLiveness(bare, [])).toEqual({ live: true });
       expect(prLiveness(bare, [pr({ headSha: "c".repeat(40) })])).toEqual({ live: false, reason: "head superseded" });
       expect(prLiveness(bare, [pr({ state: "closed", merged: true })])).toEqual({ live: false, reason: "pull request closed" });
       expect(prLiveness(bare, [pr({ state: "closed" }), pr({ number: 43 })])).toEqual({ live: true });
@@ -795,16 +796,55 @@ describe("contextful-gate", () => {
       }).pipe(Effect.provide(layer));
     });
 
-    it.effect("spawns nothing for an input without `pr` whose commit no pull request holds", () => {
+    it.effect("spawns every part for an input without `pr` whose commit no pull request holds", () => {
       const { layer, handles } = makeCFRuntimeTest({
         sandboxProgram: three,
         github: { commitPullRequests: { [KEY]: [] } },
+        childRuns: { pollFn: (ids) => ids.map((executionId) => ({ executionId, status: "success" })) },
       });
       return Effect.gen(function* () {
-        const exit = yield* Effect.exit(contextfulGate.run(input));
+        expect(yield* contextfulGate.run(input)).toEqual({ stages: 3, failed: [], notAffected: [] });
+        expect(handles.childRuns.spawned).toHaveLength(3);
+        expect(handles.checks.updates).toEqual([]);
+        expect(handles.github.commitPullRequestsCalls.length).toBeGreaterThan(0);
+        expect(handles.github.pullRequestCalls).toEqual([]);
+      }).pipe(Effect.provide(layer));
+    });
+
+    it.effect("replays spawns cached before the liveness read existed and posts only unspawned parts as not run", () => {
+      // An instance created before the read: `spawn-parts-0`, its poll and
+      // `spawn-parts-1` are checkpointed, and the pull request has since closed.
+      const { layer, handles } = makeCFRuntimeTest({
+        config: { "contextful-gate.window:fractalboxdev/contextful": "1" },
+        sandboxProgram: three,
+        github: { pullRequests: { [`${REPO}#42`]: pr({ state: "closed", merged: true }) } },
+        childRuns: { pollFn: (ids) => ids.map((executionId) => ({ executionId, status: "success" })) },
+      });
+      return Effect.gen(function* () {
+        const ordinary = yield* StepRunner;
+        const clock = yield* IO;
+        const at = yield* clock.now;
+        const cached: Record<string, unknown> = {
+          "spawn-parts-0": { handles: [{ executionId: "pins-old" }], spawnedAt: at },
+          "await-parts-0-poll-0": { records: [{ executionId: "pins-old", status: "success" }], observedAt: at },
+          "spawn-parts-1": { handles: [{ executionId: "compile-old" }], spawnedAt: at },
+        };
+        const replayed: string[] = [];
+        const runner: StepRunnerService = {
+          ...ordinary,
+          run: (name, body, opts) =>
+            name in cached
+              ? Effect.sync(() => { replayed.push(name); return cached[name] as never; })
+              : ordinary.run(name, body, opts),
+        };
+        const exit = yield* Effect.exit(contextfulGate.run({ ...input, pr: 42 }).pipe(Effect.provideService(StepRunner, runner)));
+        expect(replayed).toEqual(["spawn-parts-0", "await-parts-0-poll-0", "spawn-parts-1"]);
         expect(Exit.isFailure(exit)).toBe(true);
-        if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("head superseded — 3 of 3 parts not run");
+        if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("pull request closed — 1 of 3 parts not run");
         expect(handles.childRuns.spawned).toHaveLength(0);
+        expect(cancelledChecks(handles)).toEqual([
+          { name: "flare-dispatch/check:formal", conclusion: "cancelled", summary: "not run — pull request closed" },
+        ]);
       }).pipe(Effect.provide(layer));
     });
 

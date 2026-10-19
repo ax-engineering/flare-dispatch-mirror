@@ -97,10 +97,10 @@ const LIVE: Liveness = { live: true };
  * passes that PR (`pulls/{pr}`); an input naming none passes the PRs GitHub
  * associates with the gated commit (`commits/{sha}/pulls`) and gates every one
  * headed in the gated repository. A gated PR open at `sha` is live; one open at
- * another head is superseded; one closed or merged is closed. An input without
- * `pr` was started by a pull request event, so a commit no PR holds any longer —
- * force-pushed off its branch — is superseded. An input with `pr` and no answer
- * for it is unknown, and unknown is live.
+ * another head is superseded; one closed or merged is closed. No gated PR in
+ * the answer is unknown, and unknown is live: `commits/{sha}/pulls` answers []
+ * alike for a commit force-pushed off its branch and for one no PR ever held,
+ * which is why an input naming `pr` reads `pulls/{pr}` instead.
  */
 export const prLiveness = (
   input: { readonly repo: string; readonly sha: string; readonly pr?: number | undefined },
@@ -109,9 +109,7 @@ export const prLiveness = (
   const gated = prs.filter((pr) =>
     input.pr !== undefined ? pr.number === input.pr : pr.headRepo === input.repo,
   );
-  if (gated.length === 0) {
-    return input.pr === undefined && prs.length === 0 ? { live: false, reason: "head superseded" } : LIVE;
-  }
+  if (gated.length === 0) return LIVE;
   const open = gated.filter((pr) => pr.state === "open");
   if (open.some((pr) => pr.headSha.toLowerCase() === input.sha.toLowerCase())) return LIVE;
   return { live: false, reason: open.length > 0 ? "head superseded" : "pull request closed" };
@@ -149,12 +147,22 @@ const Input = Schema.Struct({
   /**
    * The pull request's `updated_at` in ms: the revision order within its
    * supersession group, so a later push outranks an earlier one whichever
-   * gate registers first.
+   * gate registers first. A reopen adds {@link REOPEN_RANK_OFFSET_MS}.
    */
   revisedAt: Schema.optional(Schema.Number.pipe(Schema.int(), Schema.nonNegative())),
 });
 
 type InputType = Schema.Schema.Type<typeof Input>;
+
+/**
+ * A reopen ranks this far above its `updated_at`, past the close marker's
+ * 1 ms (apps/dispatcher/src/pr-close.ts): GitHub reports `updated_at` to the
+ * second, and a close and reopen in one second would otherwise leave the
+ * reopen's gate below the marker, standing itself down. A push in the
+ * reopen's own second ranks below that gate and stands down; the reopen's gate
+ * then stops as head superseded, and the next push starts a gate.
+ */
+export const REOPEN_RANK_OFFSET_MS = 2;
 
 const Output = Schema.Struct({
   stages: Schema.Number,
@@ -257,8 +265,8 @@ export const planStages = (
 
 export const contextfulGate = defineRun({
   name: "contextful-gate",
-  // 1.2.0 — a liveness check before each spawn; an admission timeout stops spawning.
-  version: "1.2.0",
+  // 1.2.2 — a reopen ranks above the close marker of its own second.
+  version: "1.2.2",
   inputs: Input,
   outputs: Output,
   triggers: [
@@ -283,7 +291,9 @@ export const contextfulGate = defineRun({
           sha: String(payload.pull_request?.head?.sha ?? ""),
           baseSha: String(payload.pull_request?.base?.sha ?? ""),
           ...(Number.isInteger(pr) && pr > 0 ? { pr } : {}),
-          ...(Number.isInteger(revisedAt) && revisedAt >= 0 ? { revisedAt } : {}),
+          ...(Number.isInteger(revisedAt) && revisedAt >= 0
+            ? { revisedAt: revisedAt + (payload.action === "reopened" ? REOPEN_RANK_OFFSET_MS : 0) }
+            : {}),
         };
       },
     },

@@ -17,8 +17,9 @@
 // superseded tree is cancelled in its own checkpoint (supersede.ts): instances
 // terminated, admission rows released, check-runs concluded `cancelled`. The
 // marker stays live in the group, so a gate for the closed head that registers
-// after the close ranks below it and stands itself down; a reopen in a later
-// second ranks above it and supersedes the marker.
+// after the close ranks below it and stands itself down; a reopen ranks above
+// it, in the close's own second too (`REOPEN_RANK_OFFSET_MS`,
+// runs/contextful-gate.ts), and supersedes the marker.
 
 import { Effect, Schema } from "effect";
 import type { RunSupersedeStore } from "@fractalboxdev/flare-dispatch-runtime-cf";
