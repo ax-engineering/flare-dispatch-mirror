@@ -564,7 +564,8 @@ export const makeGithubLive = (
       Effect.gen(function* () {
         if (config === undefined) return yield* Effect.fail(new GitHubApiError({ status: 0, reason: "other" }));
         const token = yield* mintToken(config, req.repo, req.installationId);
-        const release = yield* ghCall(() => publishRelease({ token, repo: req.repo, releaseId: req.releaseId }));
+        const release = yield* ghCall(() => publishRelease({ token, repo: req.repo, releaseId: req.releaseId,
+          ...(req.body === undefined ? {} : { body: req.body }) }));
         return { id: release.id, url: release.htmlUrl, tag: release.tagName, published: true, draft: false };
       }),
     publishReleaseAsset: (req): Effect.Effect<ReleaseAssetResult, GitHubApiError> =>

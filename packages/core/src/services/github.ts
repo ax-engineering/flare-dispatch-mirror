@@ -281,6 +281,8 @@ export type TagTarget = { readonly refSha: string; readonly commitSha: string };
 export type PublishRelease = {
   readonly repo: string;
   readonly releaseId: number;
+  /** Release notes replacing the draft's body as it publishes. */
+  readonly body?: string;
   readonly installationId?: number;
 };
 

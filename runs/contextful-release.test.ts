@@ -3,7 +3,7 @@ import { Cause, Effect, Exit, Fiber, TestClock } from "effect";
 import { describe, expect } from "vitest";
 import { ChildRuns, IO, Sandbox, StepRunner, type CheckCommandService } from "@fractalboxdev/flare-dispatch-core";
 import { makeCFRuntimeTest } from "@fractalboxdev/flare-dispatch-core/testing";
-import { contextfulRelease, contextfulReleaseCell, RELEASE_WINDOW, SPAWN_ORDER } from "./contextful-release";
+import { contextfulRelease, contextfulReleaseCell, contextfulReleaseFormula, RELEASE_WINDOW, SPAWN_ORDER } from "./contextful-release";
 
 const sha = "a".repeat(40);
 const repo = "fractalboxdev/contextful";
@@ -183,6 +183,30 @@ describe("contextful-release", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  const formulaManifests = JSON.stringify(Array.from({ length: 10 }, () => ({})));
+  const formulaFiles = { "sha256sum": { exitCode: 0, stdout: `${"a".repeat(64)}  asset\n` } };
+
+  it.effect("the formula child returns the release notes contextful-ci formula writes", () => {
+    const { layer } = makeCFRuntimeTest({ sandboxProgram: formulaFiles,
+      sandboxFiles: { "/workspace/contextful/dist/release-notes.md": "## Consumer compatibility\n" } });
+    return Effect.gen(function* () {
+      const result = yield* contextfulReleaseFormula.run({ repo, tag: "v0.5.0", sha, releaseId: 0, dryRun: true,
+        manifests: formulaManifests });
+      expect(result.notes).toBe("## Consumer compatibility\n");
+      expect(result.assets).toHaveLength(6);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("a tag whose formula step writes no release notes keeps the draft body", () => {
+    const { layer, handles } = makeCFRuntimeTest({ sandboxProgram: { ...formulaFiles, "test -f": { exitCode: 1 } } });
+    return Effect.gen(function* () {
+      const result = yield* contextfulReleaseFormula.run({ repo, tag: "v0.5.0", sha, releaseId: 0, dryRun: true,
+        manifests: formulaManifests });
+      expect(result.notes).toBeUndefined();
+      expect(handles.sandbox.reads.some((read) => read.path.endsWith("release-notes.md"))).toBe(false);
+    }).pipe(Effect.provide(layer));
+  });
+
   type Cell = { profile: string; target: string };
   const MATRIX: Cell[] = ["contextful-control", "contextful-edge", "contextful-full"].flatMap((profile) =>
     (profile === "contextful-control" ? ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"] :
@@ -214,7 +238,8 @@ describe("contextful-release", () => {
       github: { files: { [`${repo}:Cargo.toml`]: '[workspace.package]\nversion = "0.5.0"\n' } },
       childRuns: { existing, pollFn: (ids, poll) => ids.map((id) => {
         if (id.startsWith("contextful-release-formula")) {
-          return { executionId: id, status: "success", summaryJson: JSON.stringify({ assets: FORMULA_ASSETS }) };
+          return { executionId: id, status: "success", summaryJson: JSON.stringify({ assets: FORMULA_ASSETS,
+            notes: "## Consumer compatibility\n" }) };
         }
         const { profile, target } = spawned.find((child) => child.instanceId === id)!.input as Cell;
         const cell = { profile, target };
@@ -263,7 +288,8 @@ describe("contextful-release", () => {
       expect(handles.github.createReleaseCalls).toHaveLength(1);
       expect(handles.github.createReleaseCalls[0]?.draft).toBe(true);
       expect(handles.github.publishContainerImageCalls).toHaveLength(3);
-      expect(handles.github.publishReleaseCalls).toEqual([{ repo, releaseId: 1 }]);
+      expect(handles.github.publishReleaseCalls).toEqual([{ repo, releaseId: 1,
+        body: "Release v0.5.0\n\n## Consumer compatibility\n" }]);
       expect(handles.github.releases[`${repo}:v0.5.0`]?.draft).toBe(false);
       const steps = stepNames(handles);
       expect(steps.indexOf("spawn-formula")).toBeGreaterThan(Math.max(...steps
@@ -322,7 +348,7 @@ describe("contextful-release", () => {
     // The parent queues behind other releases, never behind lean-pool gates.
     expect(contextfulRelease.sandboxImage).toBe("release");
     expect(contextfulReleaseCell.sandboxImage).toBe("release");
-    expect(contextfulRelease.version).toBe("1.1.0");
+    expect(contextfulRelease.version).toBe("1.2.0");
   });
 
   it.effect("window steps share no name with the fixed batches a release in flight checkpointed", () => {

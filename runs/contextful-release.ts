@@ -100,7 +100,12 @@ const FormulaInput = Schema.Struct({
   repo: Schema.String, tag: Schema.String, sha: Schema.String,
   releaseId: Schema.Number, dryRun: Schema.Boolean, manifests: Schema.String,
 });
-const FormulaOutput = Schema.Struct({ assets: Schema.Array(Schema.String) });
+/**
+ * `notes` is the `release-notes.md` stating every cell's compatibility verdict.
+ * A tag whose `contextful-ci formula` predates it writes none, and its release
+ * keeps the draft body.
+ */
+const FormulaOutput = Schema.Struct({ assets: Schema.Array(Schema.String), notes: Schema.optional(Schema.String) });
 
 const ReleaseOutput = Schema.Struct({
   tag: Schema.String,
@@ -262,7 +267,7 @@ export const contextfulReleaseCell = defineRun({
 
 export const contextfulReleaseFormula = defineRun({
   name: "contextful-release-formula",
-  version: "1.0.0",
+  version: "1.1.0",
   sandboxImage: "release",
   inputs: FormulaInput,
   outputs: FormulaOutput,
@@ -279,6 +284,10 @@ export const contextfulReleaseFormula = defineRun({
       timeoutSec: 1800,
     });
     if (formula.exitCode !== 0) return yield* Effect.die(new Error(`formula generation failed: ${formula.exitCode}`));
+    const notesPath = `${checkout.dir}/dist/release-notes.md`;
+    const hasNotes = yield* sandbox.exec({ container: checkout.container, command: ["test", "-f", notesPath], timeoutSec: 30 });
+    const notes = hasNotes.exitCode === 0 ? yield* sandbox.readFile({ container: checkout.container, path: notesPath }).pipe(
+      Effect.mapError((cause) => new StepFailed({ step: "generate-and-upload", cause }))) : undefined;
     const assets = ["contextful-control.rb", "contextful-edge.rb", "contextful-full.rb", "contextful.rb", "SHA256SUMS", "install.sh"];
     for (const name of assets) {
       const path = name.endsWith(".rb") ? `${checkout.dir}/dist/Formula/${name}` : name === "install.sh" ? `${checkout.dir}/install.sh` : `${checkout.dir}/dist/${name}`;
@@ -289,14 +298,15 @@ export const contextfulReleaseFormula = defineRun({
       if (!input.dryRun) yield* github.publishReleaseAsset({ repo: input.repo, releaseId: input.releaseId, artifactName: name,
         contentType: "text/plain", sha256 });
     }
-    return { assets };
+    return notes === undefined ? { assets } : { assets, notes };
   })),
 });
 
 export const contextfulRelease = defineRun({
   name: "contextful-release",
+  // 1.2.0 — publishes the formula step's release notes as the release body.
   // 1.1.0 — release pool, sliding window of cells.
-  version: "1.1.0",
+  version: "1.2.0",
   // The parent makes no sandbox call and hands its admission row off after
   // its first spawn. On the release pool it queues only behind other
   // releases, never behind pull-request gates on the lean pool.
@@ -444,7 +454,7 @@ export const contextfulRelease = defineRun({
     if (formulaChildren.length !== 1 || formulaChildren[0]?.status !== "success") {
       return yield* Effect.die(new Error("release formula failed"));
     }
-    const formulaAssets = (JSON.parse(formulaChildren[0].summaryJson ?? "{}") as { assets?: string[] }).assets;
+    const { assets: formulaAssets, notes } = JSON.parse(formulaChildren[0].summaryJson ?? "{}") as { assets?: string[]; notes?: string };
     if (formulaAssets?.length !== 6) return yield* Effect.die(new Error("release formula output is incomplete"));
     const imageChildren = children.filter((child) => {
       const output = JSON.parse(child.summaryJson ?? "{}") as { target?: string };
@@ -472,7 +482,8 @@ export const contextfulRelease = defineRun({
     if (verified.refSha !== tag.refSha || verified.commitSha !== tag.commitSha) {
       return yield* Effect.die(new Error("release tag moved before publish"));
     }
-    yield* step("publish-release", () => github.publishRelease({ repo: input.repo, releaseId: release.id }));
+    yield* step("publish-release", () => github.publishRelease({ repo: input.repo, releaseId: release.id,
+      ...(notes === undefined ? {} : { body: `Release ${input.tag}\n\n${notes}` }) }));
     return { tag: input.tag, sha: tag.commitSha, dryRun: false, releaseId: release.id,
       cells: CELLS.length, assets: CELLS.length * 3 + formulaAssets.length };
   }),

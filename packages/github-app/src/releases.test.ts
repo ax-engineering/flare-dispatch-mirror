@@ -284,4 +284,9 @@ describe("release lifecycle", () => {
     await publishRelease({ token: "t", repo: "o/r", releaseId: release!.id });
     expect(releasePatches).toEqual([{ id: "555001", body: { draft: false } }]);
   });
+
+  it("publishes a draft with the release notes it is given as its body", async () => {
+    await publishRelease({ token: "t", repo: "o/r", releaseId: 555_001, body: "## Consumer compatibility" });
+    expect(releasePatches).toEqual([{ id: "555001", body: { draft: false, body: "## Consumer compatibility" } }]);
+  });
 });

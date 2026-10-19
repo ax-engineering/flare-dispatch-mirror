@@ -136,8 +136,9 @@ export const getReleaseByTag = async (
   return { id: json.id, htmlUrl: json.html_url, tagName: json.tag_name, draft: json.draft };
 };
 
+/** Publish a draft; `body`, when given, replaces its release notes in the same write. */
 export const publishRelease = async (
-  opts: ReleaseRequest & { readonly releaseId: number },
+  opts: ReleaseRequest & { readonly releaseId: number; readonly body?: string },
 ): Promise<ReleaseRef> => {
   if (!Number.isSafeInteger(opts.releaseId) || opts.releaseId <= 0) {
     throw new TypeError("releaseId must be a positive integer");
@@ -147,7 +148,7 @@ export const publishRelease = async (
   const res = await doFetch(`${apiBase}/repos/${owner}/${name}/releases/${opts.releaseId}`, {
     method: "PATCH",
     headers: ghHeaders(opts.token, { json: true }),
-    body: JSON.stringify({ draft: false }),
+    body: JSON.stringify(opts.body === undefined ? { draft: false } : { draft: false, body: opts.body }),
   });
   await assertOk(res, "release publish failed");
   const json = (await res.json()) as { id: number; html_url: string; tag_name: string; draft: boolean };
