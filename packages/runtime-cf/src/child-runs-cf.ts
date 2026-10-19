@@ -209,12 +209,17 @@ export const makeChildRunsLive = (cfg: ChildRunsLiveConfig): Layer.Layer<ChildRu
       const readRows = async (wanted: readonly string[]) => {
         const { results } = await cfg.db
           .prepare(
-            `SELECT id, status, summary_json
+            `SELECT id, status, summary_json, check_run_id
                FROM executions
               WHERE id IN (${wanted.map(() => "?").join(", ")})`,
           )
           .bind(...wanted)
-          .all<{ id: string; status: string; summary_json: string | null }>();
+          .all<{
+            id: string;
+            status: string;
+            summary_json: string | null;
+            check_run_id: number | string | null;
+          }>();
         const byId = new Map(results.map((r) => [r.id, r]));
         // Preserve input order; an id with no row yet is `missing`.
         return wanted.map((id): ChildStatusRecord => {
@@ -224,6 +229,7 @@ export const makeChildRunsLive = (cfg: ChildRunsLiveConfig): Layer.Layer<ChildRu
             executionId: id,
             status: toChildStatus(row.status),
             ...(row.summary_json !== null ? { summaryJson: row.summary_json } : {}),
+            ...(row.check_run_id !== null ? { checkRunId: String(row.check_run_id) } : {}),
           };
         });
       };
@@ -255,7 +261,11 @@ export const makeChildRunsLive = (cfg: ChildRunsLiveConfig): Layer.Layer<ChildRu
           if (fresh === undefined) return record;
           return isTerminalChildStatus(fresh.status)
             ? fresh
-            : { executionId: record.executionId, status: "failure" };
+            : {
+                executionId: record.executionId,
+                status: "failure",
+                ...(fresh.checkRunId !== undefined ? { checkRunId: fresh.checkRunId } : {}),
+              };
         });
       }).pipe(
         // A transient D1 read fault must not fail the join — degrade every id to

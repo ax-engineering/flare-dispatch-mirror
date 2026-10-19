@@ -153,6 +153,10 @@ export const GithubDeferred: Layer.Layer<Github> = Layer.succeed(
       Effect.logInfo(
         `github.closeIssueAsDuplicate skipped (no GitHub App credentials) — ${repo}#${issue} (dup of #${duplicateOf}) left open`,
       ),
+    closeBotIssue: ({ repo, issue }) =>
+      Effect.logInfo(
+        `github.closeBotIssue skipped (no GitHub App credentials) — ${repo}#${issue} left open`,
+      ).pipe(Effect.as({ closed: false, reason: "uncredentialed", number: issue } as const)),
     // `pullReview` is *reporting*, not correctness — a deploy without GitHub
     // App credentials degrades to a logged no-op (the same posture as the no-op
     // `Checks` Layer), never failing an otherwise-green run. The live

@@ -88,6 +88,11 @@ export type ChildStatusRecord = {
    * (a failed Exit records no output). A parent decodes it to roll up results.
    */
   readonly summaryJson?: string;
+  /**
+   * The GitHub check-run id the child posted, from `executions.check_run_id`.
+   * Absent until the child opens its check-run, and for a child that posts none.
+   */
+  readonly checkRunId?: string;
 };
 
 /** Terminal child statuses — `waitForChildren` stops polling once all reach one. */

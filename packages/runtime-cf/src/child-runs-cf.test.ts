@@ -284,6 +284,16 @@ describe("makeChildRunsLive.poll (live D1 via Miniflare)", () => {
     ]);
   });
 
+  it("carries the check-run id a child row records", async () => {
+    await insertRow({ id: "c-checked", status: "failure" });
+    await bindings.db
+      .prepare(`UPDATE executions SET check_run_id = 4242 WHERE id = ?`)
+      .bind("c-checked")
+      .run();
+    const [rec] = await poll(["c-checked"]);
+    expect(rec).toEqual({ executionId: "c-checked", status: "failure", checkRunId: "4242" });
+  });
+
   it("treats an unrecognized status (queued) as non-terminal running", async () => {
     await insertRow({ id: "c-queued", status: "queued" });
     const [rec] = await poll(["c-queued"]);

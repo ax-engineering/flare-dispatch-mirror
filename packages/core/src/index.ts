@@ -184,6 +184,8 @@ export {
   type DraftPullRequestResult,
   type CloseDraftPullRequest,
   type CloseDraftPullRequestResult,
+  type CloseBotIssue,
+  type CloseBotIssueResult,
   type CreateRelease,
   type ReleaseResult,
   type PublishReleaseAsset,

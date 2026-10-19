@@ -177,6 +177,38 @@ export type CloseDraftPullRequest = {
   readonly installationId?: number;
 };
 
+/**
+ * A request to close a ledger issue the loop itself filed, once the condition it
+ * reports clears. The live Layer reads the issue and closes it as `completed`
+ * only when it is open, this installation's bot opened it, and it carries
+ * `label`; it posts `comment` first. Anything else stays open.
+ */
+export type CloseBotIssue = {
+  /** "owner/name". */
+  readonly repo: string;
+  readonly issue: number;
+  /** The ledger label the issue must carry. */
+  readonly label: string;
+  /** Posted before the close — a rendered template, never model prose. */
+  readonly comment: string;
+  readonly installationId?: number;
+};
+
+/** The outcome of {@link GithubService.closeBotIssue}. */
+export type CloseBotIssueResult =
+  | { readonly closed: true; readonly number: number }
+  | {
+      readonly closed: false;
+      /** `not-open`, `human-owned`, `foreign-owned`, `unlabelled`: left as found. `uncredentialed`: no App. */
+      readonly reason:
+        | "not-open"
+        | "human-owned"
+        | "foreign-owned"
+        | "unlabelled"
+        | "uncredentialed";
+      readonly number: number;
+    };
+
 /** The outcome of {@link GithubService.closeDraftPullRequest}. */
 export type CloseDraftPullRequestResult =
   | { readonly closed: true; readonly number: number }
@@ -581,8 +613,9 @@ export interface GithubService {
   }) => Effect.Effect<void, GitHubApiError>;
 
   /**
-   * Close an issue **as a duplicate of `duplicateOf`** — the only close on this
-   * service, and deliberately not spellable as a bare "close".
+   * Close an issue **as a duplicate of `duplicateOf`** — the only close of a
+   * reporter's issue on this service, and deliberately not spellable as a bare
+   * "close". `closeBotIssue` closes only the loop's own ledger issues.
    *
    * §5 authorizes closing for exactly one verdict. Requiring the link in the
    * signature makes closing-on-another-verdict unrepresentable rather than
@@ -596,6 +629,16 @@ export interface GithubService {
     duplicateOf: number;
     installationId?: number;
   }) => Effect.Effect<void, GitHubApiError>;
+
+  /**
+   * Close a bot-opened ledger issue **as completed** — the one other close.
+   *
+   * It closes no reporter's issue: the live Layer reads the issue and refuses
+   * (`closed: false`) unless a bot account opened it and it carries `label`, so
+   * the verdict recorded is the loop's claim about its own artifact. Closing any
+   * other issue, or on any other verdict, remains unspellable.
+   */
+  readonly closeBotIssue: (req: CloseBotIssue) => Effect.Effect<CloseBotIssueResult, GitHubApiError>;
 
   readonly pullReview: (req: PullReviewRequest) => Effect.Effect<void, GitHubApiError>;
 
@@ -710,6 +753,7 @@ export const github = {
     duplicateOf: number;
     installationId?: number;
   }) => Effect.flatMap(Github, (g) => g.closeIssueAsDuplicate(req)),
+  closeBotIssue: (req: CloseBotIssue) => Effect.flatMap(Github, (g) => g.closeBotIssue(req)),
   pullReview: (req: PullReviewRequest) => Effect.flatMap(Github, (g) => g.pullReview(req)),
   openDraftPullRequest: (req: OpenDraftPullRequest) =>
     Effect.flatMap(Github, (g) => g.openDraftPullRequest(req)),

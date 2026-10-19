@@ -1,4 +1,4 @@
-// Unit tests for the issue surface — one read and four writes.
+// Unit tests for the issue surface — two reads and six writes.
 //
 // Mocks `api.github.com` with MSW and pins the WIRE SHAPE of each call. This is
 // the module that puts labels on issues and closes them, so what matters here
@@ -13,7 +13,8 @@
 //     thing anyone noticed);
 //   * a label removal that 404s is success, because "already absent" is the
 //     requested end state;
-//   * the close PATCHes `state_reason: "duplicate"` and nothing else;
+//   * the duplicate close PATCHes `state_reason: "duplicate"` and nothing else, and
+//     the bot-issue close touches only an open, bot-opened, ledger-labelled issue;
 //   * every call carries the installation token as a Bearer credential.
 
 import { http, HttpResponse } from "msw";
@@ -21,6 +22,7 @@ import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   addIssueLabels,
+  closeBotIssue,
   closeIssueAsDuplicate,
   createIssue,
   createIssueComment,
@@ -98,6 +100,10 @@ const server = setupServer(
   http.patch("https://api.github.com/repos/:owner/:repo/issues/:n", async ({ request, params }) => {
     await capture(request, `patch:${String(params.n)}`);
     return HttpResponse.json({ number: Number(params.n) }, { status: 200 });
+  }),
+  http.post("https://api.github.com/graphql", async ({ request }) => {
+    await capture(request, "viewer");
+    return HttpResponse.json({ data: { viewer: { login: "our-app[bot]" } } });
   }),
 );
 
@@ -369,5 +375,70 @@ describe("closeIssueAsDuplicate", () => {
     await expect(closeIssueAsDuplicate({ ...base, issue: 7, duplicateOf: 3 })).rejects.toThrow(
       /duplicate of #3/,
     );
+  });
+});
+
+describe("closeBotIssue", () => {
+  const req = { ...base, issue: 41, label: "nightly-tier", comment: "Passed on abc." };
+  const serve = (issue: Record<string, unknown>) =>
+    server.use(
+      http.get("https://api.github.com/repos/:owner/:repo/issues/:n", async ({ request, params }) => {
+        await capture(request, `read:${String(params.n)}`);
+        return HttpResponse.json({ number: Number(params.n), ...issue });
+      }),
+    );
+  const botIssue = {
+    state: "open",
+    user: { type: "Bot", login: "our-app[bot]" },
+    labels: [{ name: "nightly-tier" }],
+  };
+
+  it("comments, then PATCHes state closed with state_reason completed", async () => {
+    serve(botIssue);
+    expect(await closeBotIssue(req)).toEqual({ closed: true, number: 41 });
+    expect(calls.map((c) => c.path)).toEqual(["read:41", "viewer", "comment:41", "patch:41"]);
+    expect(calls[1]?.authorization).toBe("Bearer inst-token-abc");
+    expect(calls[2]?.body).toEqual({ body: "Passed on abc." });
+    expect(calls[3]?.body).toEqual({ state: "closed", state_reason: "completed" });
+  });
+
+  it("leaves another App bot's labelled issue open and silent", async () => {
+    serve({ ...botIssue, user: { type: "Bot", login: "other-app[bot]" } });
+    expect(await closeBotIssue(req)).toEqual({
+      closed: false,
+      reason: "foreign-owned",
+      number: 41,
+    });
+    expect(calls.map((c) => c.path)).toEqual(["read:41", "viewer"]);
+  });
+
+  it("fails closed when the installation's bot identity is unavailable", async () => {
+    serve(botIssue);
+    server.use(
+      http.post("https://api.github.com/graphql", async ({ request }) => {
+        await capture(request, "viewer");
+        return HttpResponse.json({ data: { viewer: null } });
+      }),
+    );
+    await expect(closeBotIssue(req)).rejects.toThrow(/identity unavailable/);
+    expect(calls.map((c) => c.path)).toEqual(["read:41", "viewer"]);
+  });
+
+  it("leaves a human-opened issue open and silent", async () => {
+    serve({ ...botIssue, user: { type: "User" } });
+    expect(await closeBotIssue(req)).toEqual({ closed: false, reason: "human-owned", number: 41 });
+    expect(calls.map((c) => c.path)).toEqual(["read:41"]);
+  });
+
+  it("leaves a bot issue without the ledger label open", async () => {
+    serve({ ...botIssue, labels: [{ name: "bug" }] });
+    expect(await closeBotIssue(req)).toEqual({ closed: false, reason: "unlabelled", number: 41 });
+    expect(calls.map((c) => c.path)).toEqual(["read:41"]);
+  });
+
+  it("writes nothing to an issue already closed", async () => {
+    serve({ ...botIssue, state: "closed" });
+    expect(await closeBotIssue(req)).toEqual({ closed: false, reason: "not-open", number: 41 });
+    expect(calls.map((c) => c.path)).toEqual(["read:41"]);
   });
 });

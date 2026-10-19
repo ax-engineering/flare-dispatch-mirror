@@ -28,6 +28,7 @@ import {
   appendGitNote,
   addIssueLabels,
   closeBotPullRequest,
+  closeBotIssue,
   closeIssueAsDuplicate,
   createIssue,
   createIssueComment,
@@ -52,6 +53,7 @@ import {
 } from "@fractalboxdev/flare-dispatch-github-app";
 import { Effect, Layer, Schedule } from "effect";
 import {
+  type CloseBotIssueResult,
   type CloseDraftPullRequestResult,
   type DraftPullRequestResult,
   Github,
@@ -394,6 +396,26 @@ export const makeGithubLive = (
         if (config === undefined) return yield* logSkip(repo, issue, "no GitHub App credentials");
         const token = yield* mintToken(config, repo, installationId);
         yield* ghCall(() => closeIssueAsDuplicate({ token, repo, issue, duplicateOf }));
+      }),
+
+    closeBotIssue: (req): Effect.Effect<CloseBotIssueResult, GitHubApiError> =>
+      Effect.gen(function* () {
+        if (config === undefined) {
+          yield* Effect.logInfo(
+            `github.closeBotIssue skipped (no GitHub App credentials) — ${req.repo}#${req.issue} left open`,
+          );
+          return { closed: false, reason: "uncredentialed", number: req.issue } as const;
+        }
+        const token = yield* mintToken(config, req.repo, req.installationId);
+        return yield* ghCall(() =>
+          closeBotIssue({
+            token,
+            repo: req.repo,
+            issue: req.issue,
+            label: req.label,
+            comment: req.comment,
+          }),
+        );
       }),
 
     pullReview: ({ repo, pr, sha, body, installationId }) =>

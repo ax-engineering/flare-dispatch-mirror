@@ -76,6 +76,7 @@ export { readBranchHead, branchRefUrl, type ReadBranchHeadOptions } from "./bran
 export { appendGitNote, type AppendGitNoteOptions } from "./git-notes";
 export {
   addIssueLabels,
+  closeBotIssue,
   closeIssueAsDuplicate,
   createIssue,
   createIssueComment,
@@ -83,6 +84,8 @@ export {
   removeIssueLabel,
   type AddIssueLabelsOptions,
   type AuthorAssociation,
+  type CloseBotIssueOptions,
+  type CloseBotIssueResult,
   type CloseIssueAsDuplicateOptions,
   type CreateIssueCommentOptions,
   type CreateIssueOptions,

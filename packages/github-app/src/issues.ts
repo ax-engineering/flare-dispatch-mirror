@@ -1,12 +1,14 @@
-// @fractalboxdev/flare-dispatch-github-app — the issue surface: one read, five writes.
+// @fractalboxdev/flare-dispatch-github-app — the issue surface: two reads, six writes.
 //
 //   GET    /repos/{o}/{r}/issues                    — list, carrying labels
+//   GET    /repos/{o}/{r}/issues/{n}                — read one, before a bot-issue close
 //   POST   /repos/{o}/{r}/issues                    — CREATE one issue
 //   POST   /repos/{o}/{r}/issues/{n}/labels         — add labels
 //   DELETE /repos/{o}/{r}/issues/{n}/labels/{name}  — remove one label
 //   POST   /repos/{o}/{r}/issues/{n}/comments       — comment
 //   POST   /repos/{o}/{r}/issues/{n}/assignees      — assign
-//   PATCH  /repos/{o}/{r}/issues/{n}                — close AS A DUPLICATE, only
+//   PATCH  /repos/{o}/{r}/issues/{n}                — close AS A DUPLICATE, or close
+//                                                     a bot-opened ledger issue AS COMPLETED
 //
 // Why these and not a general issue API: `process/content/maintenance-loop.md`
 // §5 says **labels are the state machine**, and a classifier whose verdict
@@ -40,6 +42,11 @@
 // forbidden — the reviewer checks a signature instead of auditing call sites.
 // The `state_reason: "duplicate"` GitHub records is the same claim, in a form
 // GitHub's own UI reads.
+//
+// `closeBotIssue` is the one other close, and it closes no reporter's issue: it
+// reads the issue first and closes it as `completed` only when the authenticated
+// App bot opened it and it carries the caller's ledger label. Any other issue
+// answers `closed: false` and stays open.
 //
 // --- The list endpoint returns pull requests too -----------------------------
 //
@@ -439,4 +446,76 @@ export const closeIssueAsDuplicate = async (opts: CloseIssueAsDuplicateOptions):
     res,
     `close-as-duplicate failed for ${opts.repo}#${opts.issue} (duplicate of #${opts.duplicateOf})`,
   );
+};
+
+// --- closeBotIssue -------------------------------------------------------------
+//
+// The second close, and the narrow one: a bot-opened issue carrying the caller's
+// ledger label closes as `completed` once the condition it reports clears. It
+// never touches an issue a person opened, so the verdict it records is the
+// loop's claim about its own artifact, never about someone else's report. A
+// close on any other verdict, or of any other issue, stays unspellable.
+
+export type CloseBotIssueOptions = IssueTarget & {
+  /** The ledger label the issue must carry; an issue without it stays open. */
+  readonly label: string;
+  /** Posted before the close — a rendered template, never model prose. */
+  readonly comment: string;
+};
+
+export type CloseBotIssueResult =
+  | { readonly closed: true; readonly number: number }
+  | {
+      readonly closed: false;
+      /** `not-open`: already closed. `human-owned` / `foreign-owned`: another author. `unlabelled`: not this ledger. */
+      readonly reason: "not-open" | "human-owned" | "foreign-owned" | "unlabelled";
+      readonly number: number;
+    };
+
+/**
+ * Close `issue` as completed — only when it is open, this installation's bot
+ * opened it, and it carries `label`. The comment lands first, so the timeline
+ * records why before GitHub records `state_reason: "completed"`.
+ */
+export const closeBotIssue = async (opts: CloseBotIssueOptions): Promise<CloseBotIssueResult> => {
+  const { apiBase, doFetch } = resolveClient(opts);
+  const res = await doFetch(issueUrl(opts), { headers: ghHeaders(opts.token) });
+  await assertOk(res, `issue read failed for ${opts.repo}#${opts.issue}`);
+  const issue = (await res.json()) as {
+    state?: string;
+    user?: { type?: string; login?: string } | null;
+    labels?: ReadonlyArray<string | { name?: string }>;
+  };
+  const number = opts.issue;
+  if (issue.state !== "open") return { closed: false, reason: "not-open", number };
+  if (issue.user?.type !== "Bot") return { closed: false, reason: "human-owned", number };
+  const labels = (issue.labels ?? []).map((l) => (typeof l === "string" ? l : (l.name ?? "")));
+  if (!labels.includes(opts.label)) return { closed: false, reason: "unlabelled", number };
+
+  const viewerRes = await doFetch(`${apiBase}/graphql`, {
+    method: "POST",
+    headers: ghHeaders(opts.token, { json: true }),
+    body: JSON.stringify({ query: "query { viewer { login } }" }),
+  });
+  await assertOk(viewerRes, "GitHub App bot identity lookup failed");
+  const viewer = (await viewerRes.json()) as {
+    data?: { viewer?: { login?: unknown } };
+    errors?: unknown;
+  };
+  const login = viewer.data?.viewer?.login;
+  if (viewer.errors !== undefined || typeof login !== "string" || login.length === 0) {
+    throw new GithubApiError("GitHub App bot identity unavailable", viewerRes.status, "");
+  }
+  if (issue.user.login?.toLowerCase() !== login.toLowerCase()) {
+    return { closed: false, reason: "foreign-owned", number };
+  }
+
+  await createIssueComment({ ...opts, body: opts.comment });
+  const close = await doFetch(issueUrl(opts), {
+    method: "PATCH",
+    headers: ghHeaders(opts.token, { json: true }),
+    body: JSON.stringify({ state: "closed", state_reason: "completed" }),
+  });
+  await assertOk(close, `close-as-completed failed for ${opts.repo}#${opts.issue}`);
+  return { closed: true, number };
 };
