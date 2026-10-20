@@ -309,6 +309,8 @@ export class GitHubApiError extends Schema.TaggedError<GitHubApiError>()("GitHub
   status: Schema.Number,
   reason: Schema.Literal("rate-limited", "unauthorized", "transient", "other"),
   retryAfterMs: Schema.optional(Schema.Number),
+  /** The failing operation, when the source names it. */
+  detail: Schema.optional(Schema.String),
 }) {}
 
 export class CloudflareApiError extends Schema.TaggedError<CloudflareApiError>()(

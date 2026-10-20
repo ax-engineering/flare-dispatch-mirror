@@ -75,7 +75,9 @@ export const pushGhcrImage = async (opts: GhcrImage): Promise<void> => {
     throw new Error("GHCR image tag already names a different manifest");
   }
   if (existing.status !== 404) throw new Error(`GHCR manifest lookup failed with HTTP ${existing.status}`);
-  const uploadBlob = async (sha256: string, body: BlobBody, size: number, contentType: string): Promise<void> => {
+  // A blob upload is `application/octet-stream` (OCI Distribution); GHCR answers 404 to
+  // a blob PUT typed with an image media type. Media types belong to the manifest.
+  const uploadBlob = async (sha256: string, body: BlobBody, size: number): Promise<void> => {
     const exists = await doFetch(`${base}/blobs/sha256:${sha256}`, { method: "HEAD", headers: auth });
     if (exists.ok) return;
     if (exists.status !== 404) throw new Error(`GHCR blob lookup failed with HTTP ${exists.status}`);
@@ -92,7 +94,7 @@ export const pushGhcrImage = async (opts: GhcrImage): Promise<void> => {
     const request = doFetch(uploadUrl, {
       method: "PUT",
       headers: { ...(uploadUrl.hostname === "ghcr.io" ? auth : {}),
-        "Content-Type": contentType, "Content-Length": String(size) },
+        "Content-Type": "application/octet-stream", "Content-Length": String(size) },
       body: fixed.body,
       ...(fixed.body instanceof ReadableStream ? { duplex: "half" } : {}),
     } as RequestInit);
@@ -100,10 +102,29 @@ export const pushGhcrImage = async (opts: GhcrImage): Promise<void> => {
     await requireOk(finished, "GHCR blob upload");
   };
 
-  await uploadBlob(configDigest, config, config.byteLength, "application/vnd.oci.image.config.v1+json");
-  await uploadBlob(opts.layerDigest, opts.layer, opts.layerSize, "application/vnd.oci.image.layer.v1.tar+gzip");
+  await uploadBlob(configDigest, config, config.byteLength);
+  await uploadBlob(opts.layerDigest, opts.layer, opts.layerSize);
   const published = await doFetch(manifestUrl, {
     method: "PUT", headers: { ...auth, "Content-Type": "application/vnd.oci.image.manifest.v1+json" }, body: manifest,
   });
   await requireOk(published, "GHCR manifest publish");
+};
+
+/**
+ * A `pushGhcrImage` failure as a GitHub API outcome: the registry's HTTP status
+ * from the failing operation's message, its retry class, and the message itself.
+ * A network failure (no status) is transient; a refused input or a conflicting
+ * tag is final.
+ */
+export const classifyGhcrFailure = (cause: unknown): {
+  status: number; reason: "rate-limited" | "unauthorized" | "transient" | "other"; detail: string;
+} => {
+  const detail = cause instanceof Error ? cause.message : String(cause);
+  const status = Number(/\bHTTP (\d{3})\b/.exec(detail)?.[1] ?? 0);
+  const final = /^invalid OCI image|already names a different manifest/.test(detail);
+  const reason = status === 401 || status === 403 ? "unauthorized"
+    : status === 429 ? "rate-limited"
+      : (status === 0 && !final) || status >= 500 ? "transient"
+        : "other";
+  return { status, reason, detail };
 };

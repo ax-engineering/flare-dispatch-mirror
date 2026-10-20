@@ -71,7 +71,7 @@ import {
   type WorkflowRunRef,
 } from "@fractalboxdev/flare-dispatch-core";
 import { artifactKey } from "./artifact-r2";
-import { pushGhcrImage } from "./ghcr-push";
+import { classifyGhcrFailure, pushGhcrImage } from "./ghcr-push";
 
 /** The GitHub App credentials the live `pullReview` write needs. */
 export type GithubLiveConfig = {
@@ -629,7 +629,7 @@ export const makeGithubLive = (
             layer: source.body, layerSize: source.size,
             layerDigest: req.layerDigest, diffId: req.diffId,
           }),
-          catch: () => new GitHubApiError({ status: 0, reason: "transient" }),
+          catch: (cause) => new GitHubApiError(classifyGhcrFailure(cause)),
         });
       }),
   };
