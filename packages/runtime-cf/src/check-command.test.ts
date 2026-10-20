@@ -25,7 +25,9 @@ function fixture(sdk: { throwsWhenAbsent?: boolean; execForReal?: boolean } = {}
   let loseResponse = false;
   let exitCode: number | undefined;
   let spoolFailures = 0;
+  let spoolRejects = false;
   const pauses: number[] = [];
+  const execTimeouts: number[] = [];
   const storage = {
     async load(key: string) {
       return records.get(key);
@@ -60,9 +62,11 @@ function fixture(sdk: { throwsWhenAbsent?: boolean; execForReal?: boolean } = {}
         ? { status: exitCode === undefined ? "running" : "completed", exitCode }
         : null;
     },
-    async exec(command: string) {
+    async exec(command: string, options: { timeout: number }) {
+      execTimeouts.push(options.timeout);
       if (spoolFailures > 0) {
         spoolFailures--;
+        if (spoolRejects) throw new Error("exec timed out after 10000ms");
         return { exitCode: 137, stdout: "", stderr: "Killed" };
       }
       if (sdk.execForReal) {
@@ -92,10 +96,12 @@ function fixture(sdk: { throwsWhenAbsent?: boolean; execForReal?: boolean } = {}
     advance: (ms: number) => {
       now += ms;
     },
-    spoolFails: (times: number) => {
+    spoolFails: (times: number, rejects = false) => {
       spoolFailures = times;
+      spoolRejects = rejects;
     },
     pauses,
+    execTimeouts,
   };
 }
 
@@ -234,13 +240,35 @@ describe("durable check command", () => {
     expect(await f.owner().observe(request)).toMatchObject({ state: "exited", exitCode: 7 });
     expect(f.pauses.length).toBe(2);
   });
-  it("a terminal record the spool never yields observes missing, so the run relaunches", async () => {
+  it("a terminal record the spool never yields fails the observation and keeps the exit for its retry", async () => {
     const f = fixture();
     await f.owner().start(opts);
     f.exit(7);
     f.spoolFails(Number.MAX_SAFE_INTEGER);
-    expect(await f.owner().observe(request)).toEqual({ state: "missing" });
-    expect(f.launches()).toBe(1);
+    await expect(f.owner().observe(request)).rejects.toThrow(
+      /^check command spool unavailable \(exit 137: Killed\)$/,
+    );
+    f.spoolFails(0);
+    expect(await f.owner().observe(request)).toMatchObject({ state: "exited", exitCode: 7 });
+  });
+  it("each spool read attempt gets a longer exec ceiling for a slow node start", async () => {
+    const f = fixture();
+    await f.owner().start(opts);
+    f.spoolFails(Number.MAX_SAFE_INTEGER);
+    await expect(f.owner().read(request, "stdout", 0, 1024)).rejects.toThrow(/spool unavailable/);
+    expect(f.execTimeouts).toEqual([10_000, 20_000, 30_000]);
+    expect(f.pauses).toEqual([1_000, 2_000]);
+  });
+  it("an exec that rejects is retried, and a persistent rejection carries its message", async () => {
+    const f = fixture();
+    await f.owner().start(opts);
+    f.exit(3);
+    f.spoolFails(1, true);
+    expect(await f.owner().observe(request)).toMatchObject({ state: "exited", exitCode: 3 });
+    f.spoolFails(Number.MAX_SAFE_INTEGER, true);
+    await expect(f.owner().read(request, "stderr", 0, 1024)).rejects.toThrow(
+      /^check command spool unavailable \(exec timed out after 10000ms\)$/,
+    );
   });
   it("a log read the spool never yields fails as spool unavailable with its exit status", async () => {
     const f = fixture();

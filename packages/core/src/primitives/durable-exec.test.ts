@@ -120,6 +120,19 @@ describe("durableExec", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.effect("finalize gets the container-call ceiling, room for a drain over a slow spool", () => {
+    const { layer, handles } = makeCFRuntimeTest();
+    const calls: string[] = [];
+    return Effect.gen(function* () {
+      const original = yield* Sandbox;
+      yield* durableExec({ name: "build", workspace: ws, ensure: Effect.succeed, exec: exec(14_400) }).pipe(
+        Effect.provideService(Sandbox, { ...original, checkCommand: loses(0, calls) }),
+      );
+      const finalize = handles.executions.steps.find((s) => s.name === "build-finalize");
+      expect(finalize?.metadata?.["stepOpts.timeoutSec"]).toBe(300);
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("a process lost on every launch fails SandboxProcessLost and never finalizes", () => {
     const { layer } = makeCFRuntimeTest();
     const calls: string[] = [];

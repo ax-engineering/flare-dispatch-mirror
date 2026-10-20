@@ -245,17 +245,12 @@ export function makeCheckCommandOwner(
         return { state: now() >= h.deadline + 1500 ? "timeout" : "running" };
       // A process that ended without publishing — its supervisor killed with
       // the container — leaves no record, and no exit status to report.
-      // A spool that stays unreadable across every attempt leaves no exit status
-      // to report — the same loss as a supervisor that never published.
-      let spool: unknown;
-      try {
-        spool = await execJson(
-          `const fs=require('node:fs'),p=${JSON.stringify(path(h) + "/terminal.json")};process.stdout.write(fs.existsSync(p)?fs.readFileSync(p,'utf8'):'null')`,
-        );
-      } catch (error) {
-        if (isSpoolUnavailable(error)) return { state: "missing" };
-        throw error;
-      }
+      // An unreadable spool is not that loss: the process ended and its record
+      // may exist, so the read fails the observation and the step's retries
+      // re-read it. Reporting `missing` would relaunch over a real verdict.
+      const spool = await execJson(
+        `const fs=require('node:fs'),p=${JSON.stringify(path(h) + "/terminal.json")};process.stdout.write(fs.existsSync(p)?fs.readFileSync(p,'utf8'):'null')`,
+      );
       const terminal = Schema.decodeUnknownSync(Schema.NullOr(Terminal))(spool);
       if (terminal === null) return { state: "missing" };
       if (terminal.logExceeded)

@@ -47,7 +47,11 @@ const STEP_TIMEOUT_HEADROOM_SEC = 120;
  * a cold start in a saturated pool outlasts a minute.
  */
 const CONTAINER_CALL_STEP_TIMEOUT_SEC = 300;
-const FINALIZE_STEP_TIMEOUT_SEC = 120;
+/**
+ * Finalize re-reads the terminal record, drains the spool and re-reads it at
+ * `finish`; each spool read in a loaded container can take a minute.
+ */
+const FINALIZE_STEP_TIMEOUT_SEC = CONTAINER_CALL_STEP_TIMEOUT_SEC;
 const POLL_MIN_MS = 5_000;
 const POLL_MAX_MS = 60_000;
 /** Polls at each interval before it doubles. */

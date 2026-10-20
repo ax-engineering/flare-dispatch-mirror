@@ -1,6 +1,6 @@
 import { env } from "cloudflare:test";
 import { Effect } from "effect";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type {
   CheckCommandOwner,
   CheckCommandLogState,
@@ -107,7 +107,7 @@ describe("durable command bounded log publication", () => {
   );
 
   it.each(["running", "exited"] as const)(
-    "an unreadable spool during a %s observation keeps the log offset for the next read",
+    "an unreadable spool during a %s observation keeps the log offset and logs the skip",
     async (state) => {
       const advanced: unknown[] = [];
       const owner: CheckCommandOwner = {
@@ -142,7 +142,15 @@ describe("durable command bounded log publication", () => {
       );
       const opts = { command: "cargo test", timeoutSec: 1800, redactValues: [] };
       const handle = await Effect.runPromise(service.prepare({ ...opts, stepName: "exec" }));
-      expect((await Effect.runPromise(service.observe(handle, opts))).state).toBe(state);
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        expect((await Effect.runPromise(service.observe(handle, opts))).state).toBe(state);
+        expect(warn).toHaveBeenCalledWith(
+          `check command ${handle.id}: log capture skipped, resumes at its durable offset — check command spool unavailable (exit 137: Killed)`,
+        );
+      } finally {
+        warn.mockRestore();
+      }
       expect(advanced).toEqual([]);
     },
   );

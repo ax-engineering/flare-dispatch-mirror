@@ -147,6 +147,9 @@ export function makeCheckCommandService(
             // Log progress is durable at its offset: the next observation or
             // finalization reads on from it. Only the process state is a verdict.
             if (!isSpoolUnavailable(error)) throw error;
+            console.warn(
+              `check command ${handle.id}: log capture skipped, resumes at its durable offset — ${redact((error as Error).message, opts.redactValues)}`,
+            );
           }
           return status;
         },
