@@ -99,6 +99,40 @@ describe("createCheckRun", () => {
     expect(posts[0]!.body).not.toHaveProperty("details_url");
   });
 
+  it("creates the check-run already completed when a conclusion is given", async () => {
+    await createCheckRun({
+      token: "ghs_test",
+      repo: "owner/name",
+      sha: "abc123",
+      name: "flare-dispatch/offload-test",
+      conclusion: "failure",
+    });
+    expect(posts[0]!.body).toMatchObject({ status: "completed", conclusion: "failure" });
+    expect(posts[0]!.body.completed_at).toEqual(expect.any(String));
+  });
+
+  it("hands every response's headers to observe, a failed one included", async () => {
+    const seen: (string | null)[] = [];
+    server.use(
+      http.post("https://api.github.com/repos/:owner/:repo/check-runs", () =>
+        HttpResponse.json(
+          { message: "slow down" },
+          { status: 429, headers: { "x-ratelimit-remaining": "0", "retry-after": "5" } },
+        ),
+      ),
+    );
+    await expect(
+      createCheckRun({
+        token: "ghs_test",
+        repo: "owner/name",
+        sha: "abc123",
+        name: "flare-dispatch/offload-test",
+        observe: (headers) => seen.push(headers.get("x-ratelimit-remaining")),
+      }),
+    ).rejects.toBeInstanceOf(GithubApiError);
+    expect(seen).toEqual(["0"]);
+  });
+
   it("surfaces a GithubApiError on a non-2xx response", async () => {
     server.use(
       http.post("https://api.github.com/repos/:owner/:repo/check-runs", () =>

@@ -16,6 +16,7 @@
 
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { DELIVERY_SWEEP_CRON } from "./delivery-sweep";
 import { runNames, schedulesByCron, scheduledRuns } from "./registry";
 
 /**
@@ -47,7 +48,15 @@ describe("cron parity", () => {
     // silently yields no crons passes every assertion below while checking
     // nothing.
     expect(armed.length).toBeGreaterThan(0);
-    expect(armed.filter((cron) => schedulesByCron(cron).length === 0)).toEqual([]);
+    // The reconcile sweep's cron is the one armed expression that binds no
+    // run: the scheduled handler routes it to the sweep.
+    expect(
+      armed.filter((cron) => cron !== DELIVERY_SWEEP_CRON && schedulesByCron(cron).length === 0),
+    ).toEqual([]);
+  });
+
+  it("arms the verdict reconcile sweep", () => {
+    expect(readArmedCrons()).toContain(DELIVERY_SWEEP_CRON);
   });
 
   it("every cron a scheduled run declares is armed unless deliberately left off", () => {

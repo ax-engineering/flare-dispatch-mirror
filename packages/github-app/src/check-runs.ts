@@ -37,6 +37,11 @@ type ClientOptions = {
   readonly apiBase?: string;
   /** `fetch` override — defaults to the global `fetch`. */
   readonly fetchImpl?: typeof fetch;
+  /**
+   * Called with every response's headers, success or failure, before the
+   * status is checked — the caller reads the installation's quota from them.
+   */
+  readonly observe?: (headers: Headers) => void;
 };
 
 /** Options for {@link createCheckRun}. */
@@ -55,10 +60,16 @@ export type CreateCheckRunOptions = ClientOptions & {
    * reviewer jumps straight from the PR check to the execution's step logs.
    */
   readonly detailsUrl?: string;
+  /**
+   * Create the check-run already `completed` with this verdict — the
+   * conclusion of an execution whose opening create never landed.
+   */
+  readonly conclusion?: CheckConclusion;
 };
 
 /**
- * Create a check-run in `in_progress` and resolve to its GitHub-assigned id.
+ * Create a check-run and resolve to its GitHub-assigned id: `in_progress`, or
+ * `completed` when `conclusion` is set.
  *
  * @throws {GithubApiError} when the API returns non-2xx.
  */
@@ -66,19 +77,23 @@ export const createCheckRun = async (opts: CreateCheckRunOptions): Promise<strin
   const { owner, name: repoName } = splitRepo(opts.repo);
   const { apiBase, doFetch } = resolveClient(opts);
 
+  const now = new Date().toISOString();
   const res = await doFetch(`${apiBase}/repos/${owner}/${repoName}/check-runs`, {
     method: "POST",
     headers: ghHeaders(opts.token, { json: true }),
     body: JSON.stringify({
       name: opts.name,
       head_sha: opts.sha,
-      status: "in_progress",
-      started_at: new Date().toISOString(),
+      started_at: now,
+      ...(opts.conclusion !== undefined
+        ? { status: "completed", conclusion: opts.conclusion, completed_at: now }
+        : { status: "in_progress" }),
       ...(opts.detailsUrl ? { details_url: opts.detailsUrl } : {}),
       ...(opts.output ? { output: opts.output } : {}),
     }),
   });
 
+  opts.observe?.(res.headers);
   await assertOk(res, "check-run create failed");
 
   const body = (await res.json()) as CheckRunResponse;
@@ -133,6 +148,7 @@ export const progressCheckRun = async (opts: ProgressCheckRunOptions): Promise<v
     }),
   });
 
+  opts.observe?.(res.headers);
   await assertOk(res, "check-run progress update failed");
 };
 
@@ -157,6 +173,7 @@ export const updateCheckRun = async (opts: UpdateCheckRunOptions): Promise<void>
     }),
   });
 
+  opts.observe?.(res.headers);
   await assertOk(res, "check-run update failed");
 };
 
@@ -182,6 +199,7 @@ export const getCheckRunStatus = async (opts: GetCheckRunStatusOptions): Promise
     headers: ghHeaders(opts.token),
   });
 
+  opts.observe?.(res.headers);
   await assertOk(res, "check-run read failed");
 
   const body = (await res.json()) as { status?: unknown };

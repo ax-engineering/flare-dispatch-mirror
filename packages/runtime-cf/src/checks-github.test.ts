@@ -21,10 +21,11 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { checks } from "@fractalboxdev/flare-dispatch-core";
 import { TEST_APP_PRIVATE_KEY } from "@fractalboxdev/flare-dispatch-github-app/testing";
 import { type ChecksGithubConfig, makeChecksGithubLive, NOOP_CHECK_RUN_ID } from "./checks-github";
+import { __clearQuotas, quotaState } from "./github-quota";
 
 /** Records the GitHub API calls MSW intercepted, for per-test assertions. */
 type Recorded = {
-  posts: { status: unknown }[];
+  posts: { status: unknown; conclusion?: unknown }[];
   patches: { id: string; status: unknown; conclusion: unknown }[];
   tokenExchanges: number;
 };
@@ -42,7 +43,7 @@ const server = setupServer(
   }),
   http.post("https://api.github.com/repos/:owner/:repo/check-runs", async ({ request }) => {
     const body = (await request.json()) as Record<string, unknown>;
-    recorded.posts.push({ status: body.status });
+    recorded.posts.push({ status: body.status, conclusion: body.conclusion });
     return HttpResponse.json({ id: GH_CHECK_RUN_ID }, { status: 201 });
   }),
   http.patch(
@@ -66,6 +67,7 @@ afterAll(() => server.close());
 beforeEach(() => {
   recorded = { posts: [], patches: [], tokenExchanges: 0 };
   __clearTokenCache();
+  __clearQuotas();
 });
 
 const CONFIG: ChecksGithubConfig = {
@@ -215,5 +217,167 @@ describe("ChecksGithubLive — live GitHub App binding", () => {
     expect(recorded.posts).toHaveLength(0);
     expect(recorded.patches).toHaveLength(0);
     expect(recorded.tokenExchanges).toBe(0);
+  });
+});
+
+/** Quota headers for a window resetting ten minutes from now. */
+const quotaHeaders = (remaining: number, limit = 5000): Record<string, string> => ({
+  "x-ratelimit-remaining": String(remaining),
+  "x-ratelimit-limit": String(limit),
+  "x-ratelimit-reset": String(Math.floor(Date.now() / 1000) + 600),
+});
+
+const REPO = { repo: "owner/name", sha: "abc123", name: "flare-dispatch/offload-test" };
+
+describe("ChecksGithubLive — rate limits and the verdict reserve", () => {
+  it("waits out a Retry-After before the retry instead of the default backoff", async () => {
+    const at: number[] = [];
+    server.use(
+      http.post("https://api.github.com/repos/:owner/:repo/check-runs", () => {
+        at.push(Date.now());
+        return at.length === 1
+          ? HttpResponse.json({ message: "slow down" }, { status: 429, headers: { "retry-after": "1" } })
+          : HttpResponse.json({ id: GH_CHECK_RUN_ID }, { status: 201 });
+      }),
+    );
+
+    const id = await Effect.runPromise(checks.create(REPO).pipe(Effect.provide(makeChecksGithubLive(CONFIG))));
+
+    expect(id).toBe(String(GH_CHECK_RUN_ID));
+    expect(at).toHaveLength(2);
+    expect(at[1]! - at[0]!).toBeGreaterThanOrEqual(990);
+  });
+
+  it("degrades a wait longer than one call allows and stops calling until it lapses", async () => {
+    let attempts = 0;
+    server.use(
+      http.post("https://api.github.com/repos/:owner/:repo/check-runs", () => {
+        attempts += 1;
+        return HttpResponse.json(
+          { message: "quota" },
+          { status: 403, headers: { ...quotaHeaders(0), "retry-after": "600" } },
+        );
+      }),
+    );
+    const layer = makeChecksGithubLive(CONFIG);
+
+    const first = await Effect.runPromise(checks.create(REPO).pipe(Effect.provide(layer)));
+    expect(first).toBe(NOOP_CHECK_RUN_ID);
+    expect(attempts).toBe(1);
+    expect(quotaState(CONFIG.installationId, Date.now())).toBe("exhausted");
+
+    // The next create does not spend a call on a wait GitHub already named.
+    const second = await Effect.runPromise(checks.create(REPO).pipe(Effect.provide(layer)));
+    expect(second).toBe(NOOP_CHECK_RUN_ID);
+    expect(attempts).toBe(1);
+  });
+
+  it("stops position updates inside the reserve while create and conclude proceed", async () => {
+    server.use(
+      http.post("https://api.github.com/repos/:owner/:repo/check-runs", () =>
+        HttpResponse.json({ id: GH_CHECK_RUN_ID }, { status: 201, headers: quotaHeaders(500) }),
+      ),
+      http.patch("https://api.github.com/repos/:owner/:repo/check-runs/:id", async ({ request, params }) => {
+        const body = (await request.json()) as Record<string, unknown>;
+        recorded.patches.push({ id: String(params.id), status: body.status, conclusion: body.conclusion });
+        return HttpResponse.json({ id: Number(params.id) }, { headers: quotaHeaders(499) });
+      }),
+    );
+    const layer = makeChecksGithubLive(CONFIG);
+
+    const delivery = await Effect.runPromise(
+      Effect.gen(function* () {
+        const checkRunId = yield* checks.create(REPO);
+        yield* checks.progress({
+          repo: REPO.repo,
+          checkRunId,
+          output: { title: "t", summary: "Queued" },
+        });
+        return yield* checks.conclude({ ...REPO, checkRunId, conclusion: "success" });
+      }).pipe(Effect.provide(layer)),
+    );
+
+    expect(recorded.patches.map((p) => p.status)).toEqual(["completed"]);
+    expect(delivery).toEqual({ _tag: "delivered", checkRunId: String(GH_CHECK_RUN_ID) });
+  });
+
+  it("writes position updates while the quota is above the reserve", async () => {
+    server.use(
+      http.post("https://api.github.com/repos/:owner/:repo/check-runs", () =>
+        HttpResponse.json({ id: GH_CHECK_RUN_ID }, { status: 201, headers: quotaHeaders(501) }),
+      ),
+    );
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const checkRunId = yield* checks.create(REPO);
+        yield* checks.progress({ repo: REPO.repo, checkRunId, output: { title: "t", summary: "Queued" } });
+      }).pipe(Effect.provide(makeChecksGithubLive(CONFIG))),
+    );
+    expect(recorded.patches.map((p) => p.status)).toEqual(["in_progress"]);
+  });
+
+  it("creates the check-run with the verdict when the opener degraded to the sentinel", async () => {
+    const delivery = await Effect.runPromise(
+      checks
+        .conclude({ ...REPO, checkRunId: NOOP_CHECK_RUN_ID, conclusion: "failure" })
+        .pipe(Effect.provide(makeChecksGithubLive(CONFIG))),
+    );
+
+    expect(recorded.posts).toEqual([{ status: "completed", conclusion: "failure" }]);
+    expect(recorded.patches).toHaveLength(0);
+    expect(delivery).toEqual({ _tag: "delivered", checkRunId: String(GH_CHECK_RUN_ID) });
+  });
+
+  it("reports a conclusion GitHub never took as undelivered instead of failing", async () => {
+    server.use(
+      http.patch("https://api.github.com/repos/:owner/:repo/check-runs/:id", () =>
+        HttpResponse.json({ message: "down" }, { status: 503 }),
+      ),
+    );
+    const delivery = await Effect.runPromise(
+      checks
+        .conclude({ ...REPO, checkRunId: "77", conclusion: "success" })
+        .pipe(Effect.provide(makeChecksGithubLive(CONFIG))),
+    );
+    expect(delivery).toEqual({ _tag: "undelivered", reason: "HTTP 503" });
+  });
+
+  it.each([404, 422])("reports a conclusion GitHub rejects with %i as refused", async (status) => {
+    server.use(
+      http.patch("https://api.github.com/repos/:owner/:repo/check-runs/:id", () =>
+        HttpResponse.json({ message: "no" }, { status }),
+      ),
+    );
+    const delivery = await Effect.runPromise(
+      checks
+        .conclude({ ...REPO, checkRunId: "77", conclusion: "success" })
+        .pipe(Effect.provide(makeChecksGithubLive(CONFIG))),
+    );
+    expect(delivery).toEqual({ _tag: "refused", reason: `HTTP ${status}` });
+  });
+
+  it("reports undelivered without a call when the installation is exhausted", async () => {
+    server.use(
+      http.post("https://api.github.com/repos/:owner/:repo/check-runs", () =>
+        HttpResponse.json({ id: GH_CHECK_RUN_ID }, { status: 201, headers: quotaHeaders(0) }),
+      ),
+    );
+    const layer = makeChecksGithubLive(CONFIG);
+    const checkRunId = await Effect.runPromise(checks.create(REPO).pipe(Effect.provide(layer)));
+    const delivery = await Effect.runPromise(
+      checks.conclude({ ...REPO, checkRunId, conclusion: "success" }).pipe(Effect.provide(layer)),
+    );
+    expect(delivery._tag).toBe("undelivered");
+    expect(recorded.patches).toHaveLength(0);
+  });
+
+  it("the no-op Layer reports every conclusion undelivered", async () => {
+    const delivery = await Effect.runPromise(
+      checks
+        .conclude({ ...REPO, checkRunId: NOOP_CHECK_RUN_ID, conclusion: "success" })
+        .pipe(Effect.provide(makeChecksGithubLive(undefined))),
+    );
+    expect(delivery._tag).toBe("undelivered");
+    expect(recorded.posts).toHaveLength(0);
   });
 });

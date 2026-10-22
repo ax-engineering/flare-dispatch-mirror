@@ -12,7 +12,8 @@
 //   - duplicate-id `create` error → swallowed, NOT propagated (dedup path).
 
 import { describe, expect, it, vi } from "vitest";
-import { handleScheduled } from "./scheduled";
+import { DELIVERY_SWEEP_CRON } from "../delivery-sweep";
+import { handleScheduled, liveDeliverySweepPorts } from "./scheduled";
 import type { Env } from "../env";
 import { makeFakeR2, makeFakeWorkflow } from "../test-helpers";
 
@@ -155,5 +156,30 @@ describe("handleScheduled", () => {
     expect(errorLog).not.toHaveBeenCalled();
     info.mockRestore();
     errorLog.mockRestore();
+  });
+});
+
+describe("handleScheduled — verdict reconcile sweep", () => {
+  it("runs the sweep on its cron and fires no run, without the no-match warning", async () => {
+    const workflow = makeFakeWorkflow();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const sweep = vi.fn(async () => {});
+
+    await handleScheduled(makeEnv(workflow), DELIVERY_SWEEP_CRON, FIRED_AT, undefined, sweep);
+
+    expect(sweep).toHaveBeenCalledTimes(1);
+    expect(workflow.calls).toHaveLength(0);
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("leaves the sweep alone on every other cron", async () => {
+    const sweep = vi.fn(async () => {});
+    await handleScheduled(makeEnv(makeFakeWorkflow()), "0 14 * * *", FIRED_AT, undefined, sweep);
+    expect(sweep).not.toHaveBeenCalled();
+  });
+
+  it("has no ports on a deploy without App credentials, where no verdict is owed", () => {
+    expect(liveDeliverySweepPorts(makeEnv(makeFakeWorkflow()))).toBeUndefined();
   });
 });

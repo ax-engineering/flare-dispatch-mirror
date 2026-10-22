@@ -4,7 +4,7 @@
 
 import { describe, expect, it } from "vitest";
 import { GithubApiError } from "./errors";
-import { assertOk, retryAfterMsFromHeaders } from "./http";
+import { assertOk, rateLimitFromHeaders, retryAfterMsFromHeaders } from "./http";
 
 describe("retryAfterMsFromHeaders", () => {
   it("reads Retry-After (whole seconds) as milliseconds", () => {
@@ -77,5 +77,34 @@ describe("assertOk", () => {
     await expect(
       assertOk(new Response("ok", { status: 200 }), "should not throw"),
     ).resolves.toBeUndefined();
+  });
+});
+
+describe("rateLimitFromHeaders", () => {
+  it("reads remaining, limit and the reset as ms epoch", () => {
+    const headers = new Headers({
+      "x-ratelimit-remaining": "412",
+      "x-ratelimit-limit": "5000",
+      "x-ratelimit-reset": "1700000000",
+    });
+    expect(rateLimitFromHeaders(headers)).toEqual({
+      remaining: 412,
+      limit: 5000,
+      resetAtMs: 1_700_000_000_000,
+    });
+  });
+
+  it("returns undefined when any of the three headers is missing", () => {
+    const headers = new Headers({ "x-ratelimit-remaining": "412", "x-ratelimit-limit": "5000" });
+    expect(rateLimitFromHeaders(headers)).toBeUndefined();
+  });
+
+  it("returns undefined for a non-numeric value", () => {
+    const headers = new Headers({
+      "x-ratelimit-remaining": "lots",
+      "x-ratelimit-limit": "5000",
+      "x-ratelimit-reset": "1700000000",
+    });
+    expect(rateLimitFromHeaders(headers)).toBeUndefined();
   });
 });

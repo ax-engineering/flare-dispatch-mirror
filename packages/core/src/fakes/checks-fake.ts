@@ -81,6 +81,12 @@ export const makeChecksFake = (): {
       Effect.sync(() => {
         state.updates.push({ checkRunId, repo, conclusion, output, detailsUrl });
       }),
+
+    conclude: ({ repo, checkRunId, conclusion, output, detailsUrl }) =>
+      Effect.sync(() => {
+        state.updates.push({ checkRunId, repo, conclusion, output, detailsUrl });
+        return { _tag: "delivered", checkRunId } as const;
+      }),
   };
 
   return { layer: Layer.succeed(Checks, service), state };

@@ -44,6 +44,10 @@
       "0 7 * * 1", // finops-audit   — Mondays
       "17 2 * * *", // contextful-measures — daily
       "17 3 * * SUN", // contextful-protocol — Sunday at 03:17 UTC
+      // The verdict reconcile sweep, not a run: re-sends the conclusion of
+      // every finished execution GitHub never received (DELIVERY_SWEEP_CRON,
+      // apps/dispatcher/src/delivery-sweep.ts).
+      "*/10 * * * *",
     ],
   },
 

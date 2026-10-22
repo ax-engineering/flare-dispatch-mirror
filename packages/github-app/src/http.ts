@@ -78,6 +78,30 @@ export const retryAfterMsFromHeaders = (
   return undefined;
 };
 
+/** An installation's primary quota as one response reported it. */
+export type RateLimitSnapshot = {
+  /** `x-ratelimit-remaining` — calls left in the current window. */
+  readonly remaining: number;
+  /** `x-ratelimit-limit` — the window's size. */
+  readonly limit: number;
+  /** `x-ratelimit-reset` as ms epoch — when the window refills. */
+  readonly resetAtMs: number;
+};
+
+/**
+ * Read the primary-quota headers GitHub sends on every REST response, or
+ * `undefined` when any of the three is missing or non-numeric.
+ */
+export const rateLimitFromHeaders = (headers: Headers): RateLimitSnapshot | undefined => {
+  const remaining = Number(headers.get("x-ratelimit-remaining") ?? Number.NaN);
+  const limit = Number(headers.get("x-ratelimit-limit") ?? Number.NaN);
+  const reset = Number(headers.get("x-ratelimit-reset") ?? Number.NaN);
+  if (!Number.isFinite(remaining) || !Number.isFinite(limit) || !Number.isFinite(reset)) {
+    return undefined;
+  }
+  return { remaining, limit, resetAtMs: reset * 1000 };
+};
+
 /**
  * Throw a `GithubApiError` (status + body text + any rate-limit retry hint
  * attached) when a response is non-2xx. Each caller keeps its own success-body

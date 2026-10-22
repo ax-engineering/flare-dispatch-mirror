@@ -45,6 +45,15 @@ import {
   readBranchHead,
   resolveRepoInstallationId,
 } from "@fractalboxdev/flare-dispatch-github-app";
+import { makeChecksGithubService } from "@fractalboxdev/flare-dispatch-runtime-cf/checks-github";
+import { Effect } from "effect";
+import type { ChecksService } from "@fractalboxdev/flare-dispatch-core";
+import {
+  DELIVERY_SWEEP_CRON,
+  type DeliverySweepPorts,
+  sweepUndelivered,
+  type UndeliveredRow,
+} from "../delivery-sweep";
 import { toInstanceId } from "../instance-id";
 import { type ScheduleMatch, schedulesByCron } from "../registry";
 import type { Env } from "../env";
@@ -82,6 +91,103 @@ export const githubScheduledHead =
     }
   };
 
+/** Runs the verdict reconcile sweep for one tick. */
+export type RunDeliverySweep = () => Promise<void>;
+
+/** A D1 row as the undelivered-verdict query returns it. */
+type UndeliveredDbRow = {
+  id: string;
+  run: string;
+  repo: string;
+  sha: string;
+  status: UndeliveredRow["status"];
+  attempt: number;
+  input_json: string;
+  check_run_id: string | number;
+  installation_id: number;
+  completed_at: number;
+};
+
+/** The sweep's D1 + GitHub ports for this deploy, or `undefined` without App credentials. */
+export const liveDeliverySweepPorts = (env: Env): DeliverySweepPorts | undefined => {
+  const appId = env.GITHUB_APP_ID;
+  const privateKeyPem = env.GITHUB_APP_PRIVATE_KEY;
+  if (appId === undefined || privateKeyPem === undefined) return undefined;
+  const db = env.RUNS_METADATA;
+  // One client per installation for the tick, so its quota reads carry across rows.
+  const clients = new Map<number, ChecksService>();
+  const client = (installationId: number): ChecksService => {
+    const existing = clients.get(installationId);
+    if (existing !== undefined) return existing;
+    const created = makeChecksGithubService({ appId, privateKeyPem, installationId });
+    clients.set(installationId, created);
+    return created;
+  };
+  return {
+    listUndelivered: async ({ completedBefore, completedAfter, limit }) => {
+      const { results } = await db
+        .prepare(
+          `SELECT id, run, repo, sha, status, attempt, input_json, check_run_id, installation_id, completed_at
+             FROM executions
+            WHERE delivered_at IS NULL AND installation_id IS NOT NULL
+              AND delivery_refused_at IS NULL
+              AND status IN ('success', 'failure', 'skipped')
+              AND completed_at < ? AND completed_at >= ?
+            ORDER BY completed_at ASC
+            LIMIT ?`,
+        )
+        .bind(completedBefore, completedAfter, limit)
+        .all<UndeliveredDbRow>();
+      return results.map((r) => ({
+        id: r.id,
+        run: r.run,
+        repo: r.repo,
+        sha: r.sha,
+        status: r.status,
+        attempt: r.attempt,
+        inputJson: r.input_json,
+        checkRunId: String(r.check_run_id),
+        installationId: r.installation_id,
+        completedAt: r.completed_at,
+      }));
+    },
+    conclude: (installationId, opts) => Effect.runPromise(client(installationId).conclude(opts)),
+    markDelivered: async (id, checkRunId, at) => {
+      await db
+        .prepare(`UPDATE executions SET delivered_at = ?, check_run_id = ? WHERE id = ?`)
+        .bind(at, checkRunId, id)
+        .run();
+    },
+    markRefused: async (id, at) => {
+      await db
+        .prepare(`UPDATE executions SET delivery_refused_at = ? WHERE id = ?`)
+        .bind(at, id)
+        .run();
+    },
+    now: Date.now,
+  };
+};
+
+/** The live sweep: a no-op on a deploy without App credentials, where no verdict is owed. */
+export const liveDeliverySweep =
+  (env: Env): RunDeliverySweep =>
+  async () => {
+    const ports = liveDeliverySweepPorts(env);
+    if (ports === undefined) return;
+    try {
+      const result = await sweepUndelivered(ports);
+      if (result.delivered + result.undelivered + result.refused + result.deferred > 0) {
+        console.info(
+          `[delivery-sweep] delivered=${result.delivered} undelivered=${result.undelivered} refused=${result.refused} deferred=${result.deferred}`,
+        );
+      }
+    } catch (cause) {
+      console.error(
+        `[delivery-sweep] tick failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+      );
+    }
+  };
+
 /** Trim a long cron to fit inline in a log message. */
 const fmt = (cron: string): string => (cron.length > 40 ? `${cron.slice(0, 37)}...` : cron);
 
@@ -95,16 +201,23 @@ const fmt = (cron: string): string => (cron.length > 40 ? `${cron.slice(0, 37)}.
  * @param cron            `controller.cron` — the expression that fired.
  * @param scheduledTime   `controller.scheduledTime` — epoch ms.
  * @param resolveHead     installation + branch-head lookup for runs that target a branch.
+ * @param deliverySweep   the verdict reconcile sweep, run on `DELIVERY_SWEEP_CRON`.
  */
 export const handleScheduled = async (
   env: Env,
   cron: string,
   scheduledTime: number,
   resolveHead: ResolveScheduledHead = githubScheduledHead(env),
+  deliverySweep: RunDeliverySweep = liveDeliverySweep(env),
 ): Promise<void> => {
+  // The verdict reconcile sweep owns its own cron (delivery-sweep.ts).
+  const isSweepTick = cron === DELIVERY_SWEEP_CRON;
+  if (isSweepTick) await deliverySweep();
+
   const matches = schedulesByCron(cron);
 
   if (matches.length === 0) {
+    if (isSweepTick) return;
     // `wrangler.jsonc` declared a cron the registry does not bind any run to.
     // Most likely a left-over expression after a run was retired, or a typo
     // between the wrangler entry and the run's `schedules[].cron`.

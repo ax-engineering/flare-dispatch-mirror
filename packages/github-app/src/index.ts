@@ -23,6 +23,7 @@ export {
   type GetInstallationTokenOptions,
   type ResolveRepoInstallationOptions,
 } from "./installation-token";
+export { rateLimitFromHeaders, type RateLimitSnapshot } from "./http";
 export {
   createCheckRun,
   getCheckRunStatus,
