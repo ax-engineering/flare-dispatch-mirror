@@ -43,6 +43,7 @@ import { makeOidcLive, type OidcLiveConfig } from "./oidc-live";
 import { type ExecutionContext, makeD1ExecutionsLive } from "./executions-d1";
 import { makeIOLive } from "./io-live";
 import { makeSandboxCloudflareLive } from "./sandbox-cf";
+import { resolveSandboxTransport } from "./sandbox-transport";
 import type { CheckCommandOwner, Container } from "@fractalboxdev/flare-dispatch-core";
 import { resolveAppCredentials } from "./sandbox-clone-auth";
 import { CacheOnFacade, makeSandboxFacadeLive, type SandboxFacadeOptions } from "./sandbox-facade";
@@ -181,12 +182,20 @@ export type CFRuntimeLiveOptions<T extends Sandbox = Sandbox> = {
    */
   readonly sandboxPreviewHostname?: string;
   /**
-   * Pin this execution's containers to a transport instead of the Worker-wide
-   * `SANDBOX_TRANSPORT` default — see `makeSandboxCloudflareLive`'s `transport`
-   * option for why the choice is per-execution rather than per-Worker.
-   * Container path only; the substrate facade owns its own transport.
+   * The `CONFIG_KV` `sandbox.transport:<repo>` pin, as read. It outranks
+   * `sandboxTransportDefault` in either direction, so an operator moves one
+   * repo onto or off `rpc` without a deploy. A value that is not a transport
+   * name is skipped. Container path only; the substrate facade owns its own
+   * transport. See `resolveSandboxTransport`.
    */
-  readonly sandboxTransport?: "http" | "websocket" | "rpc";
+  readonly sandboxTransport?: string;
+  /**
+   * The Worker-wide `SANDBOX_TRANSPORT` var, as read. Applies when no repo pin
+   * names a transport; when it names none either, containers run on `rpc`.
+   * The resolved transport is pinned onto every container the execution
+   * acquires and tells the `cache` Layer whether an archive can stream in.
+   */
+  readonly sandboxTransportDefault?: string;
   /**
    * The dispatcher's own public origin (e.g.
    * `https://<worker>.<account>.workers.dev`) — prefixed onto the
@@ -315,6 +324,13 @@ export const makeCFRuntimeLive = <T extends Sandbox>(
     ...(opts.checks !== undefined ? { checks: opts.checks } : {}),
     payloadRepo: opts.execution.repo,
   });
+  // The repo pin, else the Worker-wide var, else `rpc` — pinned onto every
+  // container this execution acquires, so the cache restores only where the
+  // container streams. Pure and unit-tested in `sandbox-transport.ts`.
+  const sandboxTransport = resolveSandboxTransport({
+    repoPin: opts.sandboxTransport,
+    workerDefault: opts.sandboxTransportDefault,
+  });
   // The substrate path and the container path are mutually exclusive by
   // construction: one execution runs entirely on one of them, so there is never
   // a call that reaches a container the rest of the runtime does not know about.
@@ -335,7 +351,7 @@ export const makeCFRuntimeLive = <T extends Sandbox>(
           cloneAuth,
           opts.sandboxPreviewHostname,
           opts.logsViewerBase,
-          opts.sandboxTransport,
+          sandboxTransport,
           opts.checkCommandOwner,
         );
   const stepRunner = makeStepRunnerCloudflare(opts.executionId);
@@ -346,7 +362,12 @@ export const makeCFRuntimeLive = <T extends Sandbox>(
   const cache =
     opts.substrate !== undefined
       ? CacheOnFacade
-      : makeCacheR2Live(opts.bucket, opts.sandboxNs!, opts.execution.repo);
+      : makeCacheR2Live(
+          opts.bucket,
+          opts.sandboxNs!,
+          opts.execution.repo,
+          sandboxTransport,
+        );
   // `Config` is live when the `CONFIG_KV` binding is present; absent, the
   // dying stub keeps a config-reading run from silently mis-behaving.
   const config =

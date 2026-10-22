@@ -47,6 +47,15 @@ type ToolSpec = {
   readonly paths: readonly string[];
   /** Base the `paths` are packed from, when the tool's home is not the checkout. */
   readonly base?: string;
+  /**
+   * Command run after every restore, hit or miss, when `paths` cannot hold
+   * the whole installed tree. A pnpm workspace links each member's
+   * dependencies into its own `packages/<x>/node_modules`, which the root
+   * `node_modules` archive does not carry; a hit without a relink leaves
+   * every member unable to import its dependencies. After a miss the install
+   * already ran, so the relink finds the tree up to date and returns at once.
+   */
+  readonly relink?: string;
 };
 
 // Exported so the invariant above is assertable. It is the contract this
@@ -60,6 +69,7 @@ export const TOOLS = {
     // NOT `.pnpm-store`: nothing creates one in a checkout, and `tar czf` exits
     // 2 on a missing member — listing it disabled the whole pnpm save.
     paths: ["node_modules"],
+    relink: "pnpm install --frozen-lockfile --prefer-offline",
   },
   npm: { lockfile: "package-lock.json", install: "npm ci", paths: ["node_modules"] },
   cargo: {
@@ -117,7 +127,7 @@ export const installCached = (opts: {
       return;
     }
     const spec: ToolSpec = TOOLS[tool];
-    const { lockfile, install, paths, base } = spec;
+    const { lockfile, install, paths, base, relink } = spec;
 
     // Hash the lockfile inside the container to key the R2 cache entry.
     const hash = yield* sandbox.exec({
@@ -144,4 +154,14 @@ export const installCached = (opts: {
           ...(opts.redactValues !== undefined ? { redactValues: opts.redactValues } : {}),
         }),
     });
+
+    if (relink !== undefined) {
+      yield* sandbox.exec({
+        cwd: opts.dir,
+        container: opts.container,
+        command: relink,
+        ...(opts.env !== undefined ? { env: opts.env } : {}),
+        ...(opts.redactValues !== undefined ? { redactValues: opts.redactValues } : {}),
+      });
+    }
   });

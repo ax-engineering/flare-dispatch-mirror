@@ -323,15 +323,16 @@ describe("makeSandboxCloudflareLive — container routing", () => {
     }),
   );
 
-  it.effect("no transport option leaves the container on the Worker-wide default", () =>
+  it.effect("no transport option leaves the container on the SDK default", () =>
     Effect.gen(function* () {
       currentBox = makeFakeBox({ proc: null });
       transportCalls.length = 0;
       yield* Effect.flatMap(SandboxTag, (s) => s.acquire({})).pipe(
         Effect.provide(makeSandboxCloudflareLive(ns, makeBucket().bucket, "route-2")),
       );
-      // Untouched: the default is whatever `SANDBOX_TRANSPORT` says, and a
-      // Layer that pinned it unasked would silently change every consumer.
+      // Untouched: the Layer pins only what its caller resolved. The runtime
+      // always passes one (`resolveSandboxTransport`), so this is the SDK
+      // default for a caller that opts out.
       expect(transportCalls).toEqual([]);
     }),
   );

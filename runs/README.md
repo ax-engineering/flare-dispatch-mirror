@@ -503,34 +503,42 @@ flowchart TB
 
 ### Container transport (`sandbox.transport:<repo>`)
 
+Containers run on the SDK's `rpc` transport. The dispatcher resolves one
+transport per execution and pins it onto every container the execution
+acquires, highest first:
+
+1. the `CONFIG_KV` key `sandbox.transport:<repo>`;
+2. the Worker-wide `SANDBOX_TRANSPORT` var;
+3. `rpc`.
+
+Each level takes `http`, `websocket` or `rpc`. The pin overrides the var in
+either direction, so one repo moves back to `http` without a deploy:
+
 ```bash
-wrangler kv key put --binding=CONFIG_KV "sandbox.transport:owner/repo" "rpc"
+wrangler kv key put --binding=CONFIG_KV "sandbox.transport:owner/repo" "http"
 ```
 
-Pins every container that repo's executions acquire to one of `http` (the
-default), `websocket`, or `rpc`. **Any other value is dropped by the dispatcher
-before it reaches the SDK** — silently, and the run proceeds on the default. A
-typo therefore degrades rather than breaks, but it also says nothing: check the
-key back if a transport change appears to have had no effect.
+Deleting the key returns the repo to the var, or to `rpc`. **A value that is not
+a transport name is skipped at its level**, silently: a typo in the pin falls
+through to the var, and one in the var falls through to `rpc`. Check the key
+back if a transport change appears to have had no effect. The precedence lives
+in `packages/runtime-cf/src/sandbox-transport.ts`.
 
-**Why it exists.** The SDK's streaming file APIs live only on its `rpc` client —
+**Why `rpc`.** The SDK's streaming file APIs live only on its `rpc` client —
 its own comment calls `rpc` the "primary container-control client" and
 `http`/`websocket` the "route-based compatibility client", and `writeFileStream`
-is a bare `throw` off `rpc`. That is why the R2 dependency cache misses on every
-run: `installCached`'s restore hands `writeFile` a `ReadableStream`, the SDK
-routes any stream to `writeFileStream`, it raises, and `composeRestoreOr`
-records a miss.
-
-`SANDBOX_TRANSPORT=rpc` as a Worker var fixes that in one line — and changes the
-control path for every repo this dispatcher serves, at once. This key is the
-same choice scoped to one consumer, so a change with that blast radius can be
-proved before it is taken.
+is a bare `throw` off `rpc`. `installCached`'s restore hands `writeFile` a
+`ReadableStream`, and the SDK routes any stream to `writeFileStream`, so off
+`rpc` a stored archive cannot be applied. The R2 cache receives the resolved
+transport: on `rpc` it streams the archive in; on `http` or `websocket` it reads
+only the archive's head, reports `unapplied`, runs the install and skips the
+save, so the run pays for neither the download nor a second upload.
 
 **It is sticky.** `setTransport` persists to the container's Durable Object
 storage, and the SDK prefers a stored transport over the env-derived default on
-cold start. A container pinned here keeps that transport for its lifetime;
-since ids are per execution, the pin is re-applied per run and costs one DO call
-at acquire.
+cold start. A container keeps the transport it started with for its lifetime;
+since ids are per execution, a changed pin or var takes effect on the next run,
+and the pin costs one DO call per container at acquire.
 
 ### A stage does not assume its checkout
 

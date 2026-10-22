@@ -569,17 +569,11 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
       }
     }
 
-    // Per-repo container transport — the canary knob for `rpc`.
-    //
-    // The SDK's streaming file APIs exist only on its `rpc` client (`http` is
-    // the "route-based compatibility" path), which is why the R2 dependency
-    // cache misses on every run: its restore hands `writeFile` a stream, the SDK
-    // routes any stream to `writeFileStream`, and that raises off `rpc`.
-    // `SANDBOX_TRANSPORT=rpc` as a Worker var would fix it for every repo at
-    // once; this lets one prove it first.
-    //
-    // A value the SDK does not recognise is ignored by it with a warning, so a
-    // typo degrades to the default rather than breaking the run.
+    // Per-repo container transport pin. It outranks the Worker-wide
+    // `SANDBOX_TRANSPORT` in either direction, and with neither set containers
+    // run on `rpc`, the one transport that streams a cache archive in
+    // (`resolveSandboxTransport`). A value that is not a transport name is
+    // skipped, so a typo falls through rather than breaking the run.
     // Container path only — the substrate owns its own transport, so a run
     // there should not pay a KV read to be told about one it cannot use.
     const sandboxTransport =
@@ -716,10 +710,9 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
         ? { aiGatewayAuthToken: this.env.AI_GATEWAY_AUTH_TOKEN }
         : {}),
       sandboxPreviewHostname: this.env.SANDBOX_PREVIEW_HOSTNAME,
-      ...(sandboxTransport === "rpc" ||
-      sandboxTransport === "websocket" ||
-      sandboxTransport === "http"
-        ? { sandboxTransport }
+      ...(sandboxTransport != null ? { sandboxTransport } : {}),
+      ...(this.env.SANDBOX_TRANSPORT !== undefined
+        ? { sandboxTransportDefault: this.env.SANDBOX_TRANSPORT }
         : {}),
       ...(publicOrigin !== undefined ? { publicOrigin } : {}),
       ...(logsBaseUrl !== undefined ? { logsViewerBase: logsBaseUrl } : {}),

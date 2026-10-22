@@ -128,6 +128,70 @@ RUN if [ "$WITH_RUST" = "true" ]; then \
       echo "WITH_RUST=false — no Rust toolchain baked. Lean image."; \
     fi
 
+# ── Prebuilt DuckDB shared library (gated by the WITH_RUST build arg) ───────
+#
+# specs/adr/0007-cost-efficient-execution.md, "Prebuilt heavy native
+# dependencies in the image". A cold `cargo test` of a workspace on the
+# `duckdb` crate spends most of its time compiling DuckDB's C++ from source.
+# This layer ships the release's `libduckdb.so` and headers, pinned by
+# SHA-256, under /opt/duckdb, so a consumer that links DuckDB skips that
+# compile. The static archive in the release zip is left out: the layer
+# serves dynamic linking only, and the archive doubles the layer's size.
+#
+# libduckdb-sys (1.10505.x, build.rs) reads DUCKDB_LIB_DIR and
+# DUCKDB_INCLUDE_DIR only in its `build_linked` path, compiled under
+# `#[cfg(not(feature = "bundled"))]`. A consumer that builds with the
+# `bundled` feature compiles from source and ignores both, so exporting them
+# changes nothing for it. In linked mode the build script emits
+# `rustc-link-search=$DUCKDB_LIB_DIR` and `rustc-link-lib=dylib=duckdb`, which
+# links but does not make the library loadable at runtime; the ld.so.conf.d
+# entry below puts /opt/duckdb/lib on the loader path for every exec user.
+#
+# Consumer opt-in, owned by the consumer:
+# - build `duckdb` / `libduckdb-sys` without the `bundled` feature in its CI
+#   run command (release builds may stay bundled);
+# - assert the loaded library's version at startup (`SELECT version()` or
+#   `duckdb_library_version()` against the pinned crate's DuckDB version),
+#   because a linked library of the wrong version compiles cleanly and
+#   misbehaves at runtime;
+# - move DUCKDB_VERSION and the digest below together with its crate pin:
+#   libduckdb-sys 1.10505.x pairs with DuckDB v1.5.5.
+#
+# In a linked Linux build DUCKDB_LIB_DIR wins over every other source,
+# `DUCKDB_DOWNLOAD_LIB=1` included: a consumer whose crate pin differs from
+# DUCKDB_VERSION links this library, not the one its crate would download,
+# unless its run command unsets DUCKDB_LIB_DIR first.
+#
+# The ENV paths are set in every variant; with WITH_RUST=false the directory
+# is absent and nothing in the image reads them. The release asset is
+# linux-amd64 only, matching the container platform; any other build
+# architecture fails the image build.
+ARG DUCKDB_VERSION=v1.5.5
+ENV DUCKDB_LIB_DIR=/opt/duckdb/lib \
+    DUCKDB_INCLUDE_DIR=/opt/duckdb/include
+RUN if [ "$WITH_RUST" = "true" ]; then \
+      set -eux; \
+      arch="$(uname -m)"; \
+      case "$arch" in \
+        x86_64) sha256=1fb8ce388157d84a25abe685a8a2520bf00c00321821968e4bb398fd766e7abb ;; \
+        *) echo "libduckdb: unsupported architecture $arch" >&2; exit 1 ;; \
+      esac; \
+      archive="/tmp/libduckdb-${DUCKDB_VERSION}-linux-amd64.zip"; \
+      curl -fsSL -o "$archive" \
+        "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/libduckdb-linux-amd64.zip"; \
+      echo "${sha256}  ${archive}" | sha256sum -c -; \
+      mkdir -p "$DUCKDB_LIB_DIR" "$DUCKDB_INCLUDE_DIR"; \
+      unzip -q -j "$archive" libduckdb.so -d "$DUCKDB_LIB_DIR"; \
+      unzip -q -j "$archive" duckdb.h duckdb.hpp duckdb_extension.h -d "$DUCKDB_INCLUDE_DIR"; \
+      rm -f "$archive"; \
+      chmod -R a+rX /opt/duckdb; \
+      echo "$DUCKDB_LIB_DIR" > /etc/ld.so.conf.d/duckdb.conf; \
+      ldconfig; \
+      ldconfig -p | grep -q "libduckdb.so "; \
+    else \
+      echo "WITH_RUST=false — no prebuilt DuckDB baked. Lean image."; \
+    fi
+
 # ── demo-agent layer ────────────────────────────────────────────────────────
 #
 # The `product-demo` run's bundled CLI (record start/stop, play, gif,

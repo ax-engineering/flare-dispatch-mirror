@@ -309,6 +309,14 @@ export interface Env {
   readonly SANDBOX_PREVIEW_HOSTNAME?: string;
 
   /**
+   * The Worker-wide sandbox transport for a repo no `sandbox.transport:<repo>`
+   * key pins: `http`, `websocket` or `rpc`, and `rpc` when unset or not a
+   * transport name. The dispatcher pins the resolved transport onto every
+   * container (`resolveSandboxTransport`). A var, not a secret.
+   */
+  readonly SANDBOX_TRANSPORT?: string;
+
+  /**
    * The dispatcher's own public origin (e.g.
    * `https://flare-dispatch.<account>.workers.dev`, or a custom domain) —
    * prefixed onto the `/v1/artifacts/...` URLs runs upload so the links a

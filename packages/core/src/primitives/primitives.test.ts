@@ -7,6 +7,7 @@
 // covers `workspace`, `installCached`, `sharded`, `bootApp`, `probeHttp`.
 
 import { Effect } from "effect";
+import { Cache } from "../services/cache";
 import { sandbox } from "../services/sandbox";
 import { describe, expect, it } from "vitest";
 import { bootApp } from "./boot-app";
@@ -153,6 +154,42 @@ describe("installCached", () => {
 
     const cmds = handles.sandbox.execs.map((e) => e.command);
     expect(cmds.some((c) => c.includes("pnpm install"))).toBe(true);
+  });
+
+  // PROOF (a pnpm hit still relinks the workspace): the archive holds the
+  // root `node_modules` only, while pnpm links each workspace member's
+  // dependencies into `packages/<x>/node_modules`. A hit that skipped every
+  // install left those members unable to import anything.
+  it("relinks a pnpm workspace after a cache hit, without the full install", async () => {
+    const { layer, handles } = makeCFRuntimeTest({
+      sandboxProgram: {
+        "test -f pnpm-lock.yaml": { exitCode: 0 },
+        "sha256sum pnpm-lock.yaml": { exitCode: 0, stdout: "feedface\n" },
+        "pnpm install --frozen-lockfile --prefer-offline": { exitCode: 0 },
+      },
+    });
+    const hit = {
+      restoreOr: () => Effect.void,
+      save: () => Effect.void,
+    } as unknown as Cache["Type"];
+
+    await Effect.runPromise(
+      installCached({ container: { id: "c-1" }, dir: "/workspace/repo" }).pipe(
+        Effect.provideService(Cache, hit),
+        Effect.provide(layer),
+      ),
+    );
+
+    const cmds = handles.sandbox.execs.map((e) => String(e.command));
+    expect(cmds).toContain("pnpm install --frozen-lockfile --prefer-offline");
+    expect(cmds).not.toContain("pnpm install --frozen-lockfile");
+  });
+
+  it("relinks nothing for a tool whose cached paths hold the whole tree", () => {
+    expect(TOOLS.pnpm.relink).toBe("pnpm install --frozen-lockfile --prefer-offline");
+    expect("relink" in TOOLS.npm).toBe(false);
+    expect("relink" in TOOLS.cargo).toBe(false);
+    expect("relink" in TOOLS.uv).toBe(false);
   });
 
   it("no recognized lockfile → no install run", async () => {

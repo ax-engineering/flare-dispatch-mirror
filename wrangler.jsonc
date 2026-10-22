@@ -189,7 +189,13 @@
   // class) bakes the native toolchain + Rust: webhook-mode runs have no
   // setup step to install one, and consumer Rust workspaces with `*-sys`
   // crates both need `cc` to link and more memory than standard-2 gives a
-  // cold `cargo test` of a large dep graph.
+  // cold `cargo test` of a large dep graph. `WITH_RUST` also bakes a
+  // sha256-pinned prebuilt DuckDB shared library under /opt/duckdb and
+  // exports `DUCKDB_LIB_DIR` / `DUCKDB_INCLUDE_DIR` (ADR-0007, "Prebuilt
+  // heavy native dependencies"). A consumer opts in by building `duckdb`
+  // without its `bundled` feature in CI, asserts the loaded library's
+  // version at startup, and moves its crate pin with the image's
+  // `DUCKDB_VERSION`; a bundled build ignores the variables.
   "containers": [
     {
       "class_name": "RunSandbox",

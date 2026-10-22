@@ -628,6 +628,10 @@ export const contextfulGate = defineRun({
                   failOnNonZeroExit: true,
                   timeoutSec: STAGE_TIMEOUT_SEC,
                   admissionMaxQueueAgeSec: STAGE_QUEUE_SEC,
+                  // Stays on: what the stage runs is the consumer's `contextful-ci`,
+                  // and its `.cargo/config.toml` may set `net.offline`, so whether
+                  // the stage fetches its own crates is not decidable here
+                  // (specs/adr/0007-cost-efficient-execution.md § Fan-out parts).
                   install: true,
                   ...(prebuilt === null
                     ? {}
