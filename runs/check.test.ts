@@ -654,6 +654,16 @@ describe("check", () => {
       }),
     ).toBe(false);
   });
+
+  it("optIn — names the command keys resolve-config reads; none when the dispatch carries one", () => {
+    const input = check.triggers![0]!.inputs({ payload: prPayload() });
+    expect(check.optIn?.({ input })).toEqual(["check.command:owner/name"]);
+    expect(check.optIn?.({ input: { ...input, checkLabel: "codegen" } })).toEqual([
+      "check.command:owner/name:codegen",
+      "check.command:owner/name",
+    ]);
+    expect(check.optIn?.({ input: { ...input, command: "pnpm lint" } })).toEqual([]);
+  });
 });
 
 // --- Source guard: no direct Date.now() / crypto.randomUUID() in the run -----

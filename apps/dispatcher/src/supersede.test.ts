@@ -1,7 +1,7 @@
 import { Effect, Exit } from "effect";
 import type { ChecksService } from "@fractalboxdev/flare-dispatch-core";
 import type { SupersededRow } from "@fractalboxdev/flare-dispatch-runtime-cf";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   cancelSupersededTree,
   enterSupersession,
@@ -31,7 +31,7 @@ const fixture = (tree: readonly SupersededRow[], statuses: Record<string, Status
       markCancelled: (id) => Effect.sync(() => { events.push(`mark:${id}`); }),
       status: () => Effect.succeed("cancelled"),
       openTree: (id) => Effect.sync(() => { events.push(`tree:${id}`); return tree; }),
-      cancel: (ids) => Effect.sync(() => { events.push(`cancel:${ids.join(",")}`); }),
+      cancel: (ids) => Effect.sync(() => { events.push(`cancel:${ids.join(",")}`); return { admittedSlots: 0 }; }),
     },
     terminate: async (id) => {
       events.push(`terminate:${id}`);
@@ -49,7 +49,7 @@ describe("cancelSupersededTree", () => {
   it("marks the root before reading its tree, then ends and frees every open row", async () => {
     const tree = [row("old-gate", { status: "cancelled" }), row("part-a"), row("part-b", { status: "queued" })];
     const { ports, events } = fixture(tree);
-    const ids = await Effect.runPromise(cancelSupersededTree("old-gate", "new-gate", ports));
+    const ids = await Effect.runPromise(cancelSupersededTree("old-gate", "new-gate", "g", ports));
     expect(ids).toEqual(["old-gate", "part-a", "part-b"]);
     expect(events.slice(0, 4)).toEqual(["mark:old-gate", "tree:old-gate", "terminate:old-gate", "tree:old-gate"]);
     expect(events).toContain("terminate:part-a");
@@ -61,7 +61,7 @@ describe("cancelSupersededTree", () => {
   it("concludes every open check-run of the tree cancelled, naming the newer execution", async () => {
     const tree = [row("old-gate"), row("part-a"), row("part-done"), row("part-noop", { checkRunId: "noop" })];
     const { ports, updates } = fixture(tree, { "cr-part-done": "completed" });
-    await Effect.runPromise(cancelSupersededTree("old-gate", "new-gate", ports));
+    await Effect.runPromise(cancelSupersededTree("old-gate", "new-gate", "g", ports));
     expect(updates.map((u) => [u.checkRunId, u.conclusion])).toEqual([
       ["cr-old-gate", "cancelled"],
       ["cr-part-a", "cancelled"],
@@ -70,9 +70,35 @@ describe("cancelSupersededTree", () => {
     expect(supersededSummary("new-gate")).toContain("`new-gate`");
   });
 
+  it("logs one supersede.cancelled line counting the children, admitted slots and check-runs it ended", async () => {
+    const tree = [row("old-gate"), row("part-a"), row("part-done"), row("part-noop", { checkRunId: "noop" })];
+    const { ports } = fixture(tree, { "cr-part-done": "completed" });
+    const counted: SupersedePorts = { ...ports, store: { ...ports.store, cancel: () => Effect.succeed({ admittedSlots: 2 }) } };
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      await Effect.runPromise(cancelSupersededTree("old-gate", "new-gate", "contextful-gate:o/r#7", counted));
+      const lines = log.mock.calls
+        .map(([line]) => (typeof line === "string" && line.startsWith("{") ? JSON.parse(line) : undefined))
+        .filter((line) => line?.event === "supersede.cancelled");
+      expect(lines).toEqual([
+        {
+          event: "supersede.cancelled",
+          group: "contextful-gate:o/r#7",
+          root: "old-gate",
+          supersededBy: "new-gate",
+          children: 3,
+          admittedSlots: 2,
+          checkRuns: 2,
+        },
+      ]);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
   it("retries cleanup for a root already marked cancelled", async () => {
     const { ports, events } = fixture([row("gone")]);
-    const exit = await Effect.runPromiseExit(cancelSupersededTree("gone", "new-gate", ports));
+    const exit = await Effect.runPromiseExit(cancelSupersededTree("gone", "new-gate", "g", ports));
     expect(Exit.isSuccess(exit)).toBe(true);
     expect(events).toContain("cancel:gone");
   });
@@ -80,13 +106,13 @@ describe("cancelSupersededTree", () => {
   it("fails when the D1 cancel fails, so the step retries the whole sequence", async () => {
     const { ports } = fixture([row("old-gate")]);
     const failing: SupersedePorts = { ...ports, store: { ...ports.store, cancel: () => Effect.fail(new Error("D1 down")) } };
-    expect(Exit.isFailure(await Effect.runPromiseExit(cancelSupersededTree("old-gate", "new-gate", failing)))).toBe(true);
+    expect(Exit.isFailure(await Effect.runPromiseExit(cancelSupersededTree("old-gate", "new-gate", "g", failing)))).toBe(true);
   });
 
   it("leaves rows and check-runs untouched when termination fails", async () => {
     const { ports, events, updates } = fixture([row("old-gate"), row("part-a")]);
     const failing: SupersedePorts = { ...ports, terminate: async () => { throw new Error("unavailable"); } };
-    expect(Exit.isFailure(await Effect.runPromiseExit(cancelSupersededTree("old-gate", "new-gate", failing)))).toBe(true);
+    expect(Exit.isFailure(await Effect.runPromiseExit(cancelSupersededTree("old-gate", "new-gate", "g", failing)))).toBe(true);
     expect(events).not.toContain("cancel:old-gate,part-a");
     expect(updates).toEqual([]);
   });
@@ -94,18 +120,18 @@ describe("cancelSupersededTree", () => {
   it("does not cancel descendants of a root that already finished", async () => {
     const { ports, events } = fixture([row("old-gate", { status: "success" }), row("part-a")]);
     const finished: SupersedePorts = { ...ports, store: { ...ports.store, status: () => Effect.succeed("success") } };
-    expect(await Effect.runPromise(cancelSupersededTree("old-gate", "new-gate", finished))).toEqual([]);
+    expect(await Effect.runPromise(cancelSupersededTree("old-gate", "new-gate", "g", finished))).toEqual([]);
     expect(events).toEqual(["mark:old-gate"]);
   });
 
   it("keeps the opener alive until its check id is persisted, then cancels it on retry", async () => {
     const tree = [row("old-gate", { checkRunId: null })];
     const { ports, events, updates } = fixture(tree);
-    expect(Exit.isFailure(await Effect.runPromiseExit(cancelSupersededTree("old-gate", "new-gate", ports)))).toBe(true);
+    expect(Exit.isFailure(await Effect.runPromiseExit(cancelSupersededTree("old-gate", "new-gate", "g", ports)))).toBe(true);
     expect(events).not.toContain("terminate:old-gate");
     expect(updates).toEqual([]);
     tree[0] = row("old-gate", { status: "cancelled" });
-    await Effect.runPromise(cancelSupersededTree("old-gate", "new-gate", ports));
+    await Effect.runPromise(cancelSupersededTree("old-gate", "new-gate", "g", ports));
     expect(updates[0]?.conclusion).toBe("cancelled");
   });
 
@@ -116,7 +142,7 @@ describe("cancelSupersededTree", () => {
       events.push(`terminate:${id}`);
       if (id === "part-a") tree.push(row("grandchild"));
     } };
-    expect(await Effect.runPromise(cancelSupersededTree("old-gate", "new-gate", spawning))).toEqual(["old-gate", "part-a", "grandchild"]);
+    expect(await Effect.runPromise(cancelSupersededTree("old-gate", "new-gate", "g", spawning))).toEqual(["old-gate", "part-a", "grandchild"]);
     expect(events.indexOf("mark:grandchild")).toBeLessThan(events.indexOf("terminate:grandchild"));
     expect(events).toContain("cancel:old-gate,part-a,grandchild");
   });
@@ -146,7 +172,7 @@ const prelude = (opts: {
       }),
     store: {
       status: (id) => Effect.sync(() => (id === "parent" ? opts.parentStatus : undefined)),
-      cancel: (ids) => Effect.sync(() => { events.push(`cancel:${ids.join(",")}`); }),
+      cancel: (ids) => Effect.sync(() => { events.push(`cancel:${ids.join(",")}`); return { admittedSlots: 0 }; }),
       register: (id, group, o) =>
         Effect.sync(() => {
           registered.push({ id, group, ...o });

@@ -27,6 +27,7 @@ const baseRow = (over: Partial<DashboardRow> = {}): DashboardRow => ({
   logsUrl: null,
   demosUrl: null,
   selfHealPrUrl: null,
+  supersededBy: null,
   ...over,
 });
 
@@ -112,6 +113,24 @@ describe("renderDashboard", () => {
     const html = renderDashboard(data([baseRow({ run: "self-heal-pr", selfHealPrUrl: null })]));
     expect(html).not.toContain("🩹");
     expect(html).not.toContain("badge selfheal");
+  });
+
+  it("labels a cancelled execution with the execution that superseded it", () => {
+    const html = renderDashboard(data([baseRow({ status: "cancelled", supersededBy: "gate-newer" })]));
+    expect(html).toContain('superseded by <span class="sha">gate-newer</span>');
+  });
+
+  it("labels a cancelled execution a pull-request close superseded", () => {
+    const html = renderDashboard(
+      data([baseRow({ status: "cancelled", supersededBy: "pr-closed:1000:contextful-gate:o/r#7" })]),
+    );
+    expect(html).toContain("pull request closed");
+    expect(html).not.toContain("superseded by");
+  });
+
+  it("labels no execution that is not cancelled", () => {
+    const html = renderDashboard(data([baseRow({ status: "running", supersededBy: "gate-newer" })]));
+    expect(html).not.toContain("superseded by");
   });
 
   it("escapes HTML in execution fields", () => {
@@ -446,6 +465,22 @@ describe("GET /v1/dashboard.json — SPA feed", () => {
     expect(body.rows[0]?.logsUrl).toContain("/logs/a%3Ab%3Ac?t=");
     // A plain offload-test run drove no fix PR — no self-heal tag.
     expect(body.rows[0]?.selfHealPrUrl).toBeNull();
+  });
+
+  it("carries the superseding execution of a cancelled row, null otherwise", async () => {
+    const { env } = fixture([
+      execRow({ id: "old", status: "cancelled", superseded_by: "new", started_at: 1000 }),
+      execRow({ id: "new", status: "running", started_at: 2000 }),
+    ]);
+    const res = await handleRequest(
+      new Request("https://dispatcher.example.com/v1/dashboard.json"),
+      env,
+    );
+    const body = (await res.json()) as { rows: { id: string; supersededBy: string | null }[] };
+    expect(body.rows.map((row) => [row.id, row.supersededBy])).toEqual([
+      ["new", null],
+      ["old", "new"],
+    ]);
   });
 
   it("sets selfHealPrUrl for a self-heal-pr run that opened a fix PR (prStaged)", async () => {

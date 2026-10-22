@@ -506,6 +506,14 @@ export const offloadTest = defineRun({
   inputs: OffloadTestInput,
   outputs: OffloadTestOutput,
 
+  // The keys `resolve-command` decides on: the per-repo command, the
+  // dispatcher-wide default, and the stages key (staged mode runs with neither
+  // command). See specs/adr/0007-cost-efficient-execution.md § Dispatch only work.
+  optIn: ({ input }) =>
+    input.command !== undefined
+      ? []
+      : [repoCommandKey(input.repo), COMMAND_KEY, repoStagesKey(input.repo)],
+
   limits: {
     // Run-body wall-time ceiling — specs/02-runs.md § 1, enforced by the
     // dispatcher. One documented 1800 s exec plus checkout, install and

@@ -14,14 +14,17 @@ import {
 import { check } from "./check";
 import {
   contextfulGate,
+  lightLabelsKey,
   mergeStages,
   NOT_AFFECTED_SUMMARY,
   parseAffected,
+  parseLightLabels,
   parseStages,
   parseWindow,
   planStages,
   prLiveness,
   stageCommand,
+  tierParts,
   unrunSummary,
   WINDOW_DEFAULT,
   WINDOW_MAX,
@@ -267,6 +270,7 @@ describe("contextful-gate", () => {
         ),
       );
       expect(handles.executions.steps.map((entry) => entry.name).filter((name) => !name.startsWith("checkout") && !name.startsWith("discover") && name !== "release-discovery-container")).toEqual([
+        "resolve-tiers",
         "prebuild-ci-binary",
         "resolve-window",
         "spawn-parts-0",
@@ -959,6 +963,137 @@ describe("contextful-gate", () => {
           "spawn-parts-2: execution created 2026-10-18T09:00:00.000Z, deployed version v-abc",
         ]);
       }).pipe(Effect.provide(layer));
+    });
+  });
+
+  describe("two-tier gate", () => {
+    const LIGHT_KEY = "gate.lightLabels:fractalboxdev/contextful";
+    const parts = ["pins", "workspace.compile", "formal"];
+    const program = {
+      [DISCOVER_HEAD]: { stdout: `${parts.join("\n")}\n`, exitCode: 0 },
+      [DISCOVER]: { stdout: `${parts.join("\n")}\n`, exitCode: 0 },
+    };
+    const heavyInput = { ...input, tier: "heavy", branch: "main" } as const;
+    const spawnedLabels = (handles: { childRuns: { spawned: readonly { input: unknown }[] } }) =>
+      handles.childRuns.spawned.map((spawn) => (spawn.input as { checkLabel: string }).checkLabel);
+
+    it("parses a comma or JSON list, and reads unset, blank, empty or malformed as no light labels", () => {
+      expect(lightLabelsKey("o/r")).toBe("gate.lightLabels:o/r");
+      expect(parseLightLabels(undefined)).toBeUndefined();
+      expect(parseLightLabels("  ")).toBeUndefined();
+      expect(parseLightLabels(",, ,")).toBeUndefined();
+      expect(parseLightLabels("[]")).toBeUndefined();
+      expect(parseLightLabels("[pins")).toBeUndefined();
+      expect(parseLightLabels('["pins", 3]')).toBeUndefined();
+      expect(parseLightLabels('{"pins": true}')).toBeUndefined();
+      expect(parseLightLabels(" pins , formal,pins ")).toEqual(["pins", "formal"]);
+      expect(parseLightLabels('["pins", " formal "]')).toEqual(["pins", "formal"]);
+    });
+
+    it("splits the plan into light parts for pull requests and heavy parts for the default branch", () => {
+      expect(tierParts(parts, ["formal", "pins"], "pull-request")).toEqual(["pins", "formal"]);
+      expect(tierParts(parts, ["formal", "pins"], "heavy")).toEqual(["workspace.compile"]);
+      expect(tierParts(parts, ["absent"], "pull-request")).toEqual([]);
+      expect(tierParts(parts, ["absent"], "heavy")).toEqual(parts);
+    });
+
+    it("unset: a pull-request gate runs every part and the heavy tier none", () => {
+      expect(tierParts(parts, undefined, "pull-request")).toBe(parts);
+      expect(tierParts(parts, undefined, "heavy")).toEqual([]);
+    });
+
+    it.effect("unset: a pull-request gate spawns every part", () => {
+      const { layer, handles } = makeCFRuntimeTest({
+        sandboxProgram: program,
+        childRuns: { pollFn: (ids) => ids.map((executionId) => ({ executionId, status: "success" })) },
+      });
+      return Effect.gen(function* () {
+        expect(yield* contextfulGate.run(input)).toEqual({ stages: 3, failed: [], notAffected: [] });
+        expect(spawnedLabels(handles)).toEqual(parts);
+      }).pipe(Effect.provide(layer));
+    });
+
+    it.effect("a pull-request gate spawns only the light parts and posts no check for the heavy ones", () => {
+      const { layer, handles } = makeCFRuntimeTest({
+        sandboxProgram: program,
+        config: { [LIGHT_KEY]: "pins,formal" },
+        childRuns: { pollFn: (ids) => ids.map((executionId) => ({ executionId, status: "success" })) },
+      });
+      return Effect.gen(function* () {
+        expect(yield* contextfulGate.run(input)).toEqual({
+          stages: 3,
+          failed: [],
+          notAffected: [],
+          deferred: ["workspace.compile"],
+        });
+        expect(spawnedLabels(handles)).toEqual(["pins", "formal"]);
+        expect(handles.checks.creates).toEqual([]);
+      }).pipe(Effect.provide(layer));
+    });
+
+    it.effect("a default-branch push spawns only the heavy parts without reading pull-request liveness", () => {
+      const { layer, handles } = makeCFRuntimeTest({
+        sandboxProgram: program,
+        config: { [LIGHT_KEY]: '["pins"]' },
+        childRuns: { pollFn: (ids) => ids.map((executionId) => ({ executionId, status: "success" })) },
+      });
+      return Effect.gen(function* () {
+        expect(yield* contextfulGate.run(heavyInput)).toEqual({
+          stages: 3,
+          failed: [],
+          notAffected: [],
+          deferred: ["pins"],
+        });
+        expect(spawnedLabels(handles)).toEqual(["workspace.compile", "formal"]);
+        expect(handles.github.commitPullRequestsCalls).toHaveLength(0);
+        expect(handles.github.pullRequestCalls).toHaveLength(0);
+      }).pipe(Effect.provide(layer));
+    });
+
+    it.effect("unset: a default-branch push skips before it checks anything out", () => {
+      const { layer, handles } = makeCFRuntimeTest({ sandboxProgram: program });
+      return Effect.gen(function* () {
+        const exit = yield* Effect.exit(contextfulGate.run(heavyInput));
+        expect(Exit.isFailure(exit)).toBe(true);
+        if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("two-tier gate not configured");
+        expect(handles.sandbox.clones).toEqual([]);
+        expect(handles.childRuns.spawned).toHaveLength(0);
+      }).pipe(Effect.provide(layer));
+    });
+
+    it("triggers once per default-branch head, opted in by the light-label key", () => {
+      const push = contextfulGate.triggers?.[1];
+      expect(push?.event).toBe("push");
+      const payload = {
+        ref: "refs/heads/main",
+        before: BASE_SHA,
+        after: SHA,
+        repository: { full_name: input.repo, default_branch: "main" },
+      };
+      expect(push?.gate?.({ payload } as never)).toBe(true);
+      expect(push?.idempotencyKey?.({ payload } as never)).toBe(`contextful-gate:push:${SHA}`);
+      expect(push?.inputs({ payload } as never)).toEqual(heavyInput);
+      for (const other of [
+        { ...payload, ref: "refs/heads/feature" },
+        { ...payload, ref: "refs/tags/v1.0.0" },
+        { ...payload, after: "0".repeat(40) },
+        { ...payload, before: "0".repeat(40) },
+        { ...payload, repository: { full_name: "other/repo", default_branch: "main" } },
+      ]) {
+        expect(push?.gate?.({ payload: other } as never)).toBe(false);
+      }
+      expect(contextfulGate.optIn?.({ input: heavyInput })).toEqual([LIGHT_KEY]);
+      expect(contextfulGate.optIn?.({ input: { ...input, pr: 42 } })).toEqual([]);
+    });
+
+    it("serializes heavy-tier gates per repo and leaves pull-request gates unserialized", () => {
+      expect(contextfulGate.serialize?.({ ...input, pr: 42 })).toBeUndefined();
+      expect(contextfulGate.serialize?.(heavyInput)).toEqual({
+        group: "contextful-gate:heavy:fractalboxdev/contextful",
+        revision: SHA,
+        current: expect.anything(),
+      });
+      expect(contextfulGate.supersede?.(heavyInput)).toBeUndefined();
     });
   });
 });

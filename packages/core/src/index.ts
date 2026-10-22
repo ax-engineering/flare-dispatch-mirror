@@ -17,6 +17,7 @@ export {
   type RunSpec,
   type RunLimits,
   type CooldownSpec,
+  type OptInContext,
   type HumanGateSpec,
   type SandboxImage,
   type SerializeSpec,

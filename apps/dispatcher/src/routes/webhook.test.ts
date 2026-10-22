@@ -69,7 +69,12 @@ const webhookRequest = async (
 };
 
 const fixture = (
-  opts: { withWebhookSecret?: boolean; withKv?: boolean; publicOrigin?: string } = {},
+  opts: {
+    withWebhookSecret?: boolean;
+    withKv?: boolean;
+    publicOrigin?: string;
+    configKv?: KVNamespace;
+  } = {},
 ) => {
   const workflow = makeFakeWorkflow();
   const storage = makeFakeR2();
@@ -81,6 +86,7 @@ const fixture = (
     idempotencyKv: idempotencyKv?.binding,
     githubWebhookSecret: opts.withWebhookSecret === false ? undefined : WEBHOOK_SECRET,
     ...(opts.publicOrigin !== undefined ? { publicOrigin: opts.publicOrigin } : {}),
+    ...(opts.configKv !== undefined ? { configKv: opts.configKv } : {}),
   });
   return { workflow, storage, env, idempotencyKv };
 };
@@ -563,6 +569,149 @@ describe("POST /v1/webhooks/github — pull request closed", () => {
       });
       expect(body.closed).toEqual([{ group: `contextful-gate:${REPO}#42`, instanceId: workflow.calls[0]?.id }]);
     }
+  });
+});
+
+describe("POST /v1/webhooks/github — receiver opt-in", () => {
+  /** A pull_request payload passing the check / offload-test gates. */
+  const prPayload = {
+    action: "synchronize",
+    pull_request: {
+      number: 7,
+      draft: false,
+      labels: [],
+      user: { login: "octocat" },
+      head: { sha: "aaaa111122223333" },
+      base: { sha: "base000000000000" },
+    },
+    repository: { full_name: "owner/test-repo" },
+    installation: { id: 99999 },
+  };
+
+  /** A default-branch check_suite payload passing worker-deploy's gate. */
+  const checkSuitePayload = {
+    action: "requested",
+    check_suite: { head_branch: "main", head_sha: "dddd111122223333" },
+    repository: { full_name: "owner/test-repo", default_branch: "main" },
+    installation: { id: 99999 },
+  };
+
+  type Body = {
+    dispatched: Array<{ run: string }>;
+    skipped?: Array<{ run: string; reason: string }>;
+  };
+
+  const deliver = async (
+    env: Parameters<typeof handleRequest>[1],
+    payload: unknown,
+    event: string,
+  ): Promise<Body> => {
+    const res = await handleRequest(await webhookRequest(payload, { event }), env);
+    expect(res.status).toBe(202);
+    return (await res.json()) as Body;
+  };
+
+  const createdRuns = (workflow: ReturnType<typeof makeFakeWorkflow>): string[] =>
+    workflow.calls.map((c) => (c.params as { run: string }).run);
+
+  it("a repo with none of a run's keys creates no Workflow and lists it not-configured", async () => {
+    const configKv = makeFakeKv();
+    const { env, workflow } = fixture({ configKv: configKv.binding });
+
+    const body = await deliver(env, prPayload, "pull_request");
+
+    expect(body.skipped).toEqual(
+      expect.arrayContaining([
+        { run: "check", reason: "not-configured" },
+        { run: "offload-test", reason: "not-configured" },
+      ]),
+    );
+    expect(body.dispatched.map((d) => d.run)).not.toContain("check");
+    expect(body.dispatched.map((d) => d.run)).not.toContain("offload-test");
+    expect(createdRuns(workflow)).not.toContain("check");
+    expect(createdRuns(workflow)).not.toContain("offload-test");
+    // A run without `optIn` dispatches as before.
+    expect(body.dispatched.map((d) => d.run)).toContain("pr-review");
+  });
+
+  it("a present per-repo command key dispatches that run only", async () => {
+    const configKv = makeFakeKv();
+    configKv.store.set("check.command:owner/test-repo", "pnpm lint");
+    const { env, workflow } = fixture({ configKv: configKv.binding });
+
+    const body = await deliver(env, prPayload, "pull_request");
+
+    expect(body.dispatched.map((d) => d.run)).toContain("check");
+    expect(createdRuns(workflow)).toContain("check");
+    expect(body.skipped).toEqual([{ run: "offload-test", reason: "not-configured" }]);
+  });
+
+  it("offload-test opts in through the dispatcher-wide command or the stages key", async () => {
+    for (const key of ["offload-test.command", "offload-test.stages:owner/test-repo"]) {
+      const configKv = makeFakeKv();
+      configKv.store.set(key, "unit");
+      const { env } = fixture({ configKv: configKv.binding });
+
+      const body = await deliver(env, prPayload, "pull_request");
+
+      expect(body.dispatched.map((d) => d.run)).toContain("offload-test");
+      expect(body.skipped?.map((s) => s.run)).not.toContain("offload-test");
+    }
+  });
+
+  it("worker-deploy skips a repo without its command key and dispatches one with it", async () => {
+    const configKv = makeFakeKv();
+    const { env, workflow } = fixture({ configKv: configKv.binding });
+
+    const skippedBody = await deliver(env, checkSuitePayload, "check_suite");
+    expect(skippedBody.skipped).toEqual(
+      expect.arrayContaining([{ run: "worker-deploy", reason: "not-configured" }]),
+    );
+    expect(createdRuns(workflow)).not.toContain("worker-deploy");
+
+    configKv.store.set("worker-deploy.command:owner/test-repo", "pnpm deploy");
+    const { env: configured, workflow: configuredWorkflow } = fixture({
+      configKv: configKv.binding,
+    });
+    const body = await deliver(configured, checkSuitePayload, "check_suite");
+    expect(body.dispatched.map((d) => d.run)).toContain("worker-deploy");
+    expect(createdRuns(configuredWorkflow)).toContain("worker-deploy");
+  });
+
+  it("a failed opt-in read dispatches as before and logs", async () => {
+    const configKv = {
+      get: async () => {
+        throw new Error("kv unavailable");
+      },
+    } as unknown as KVNamespace;
+    const { env, workflow } = fixture({ configKv });
+    const errors: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => {
+      errors.push(args.map(String).join(" "));
+    };
+    try {
+      const body = await deliver(env, prPayload, "pull_request");
+      expect(body.dispatched.map((d) => d.run)).toEqual(
+        expect.arrayContaining(["check", "offload-test"]),
+      );
+      expect(body.skipped).toBeUndefined();
+      expect(createdRuns(workflow)).toEqual(expect.arrayContaining(["check", "offload-test"]));
+    } finally {
+      console.error = original;
+    }
+    expect(errors.some((e) => e.includes("opt-in read failed") && e.includes('run="check"'))).toBe(
+      true,
+    );
+  });
+
+  it("a deploy without CONFIG_KV dispatches as before", async () => {
+    const { env } = fixture();
+    const body = await deliver(env, prPayload, "pull_request");
+    expect(body.dispatched.map((d) => d.run)).toEqual(
+      expect.arrayContaining(["check", "offload-test"]),
+    );
+    expect(body.skipped).toBeUndefined();
   });
 });
 

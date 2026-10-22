@@ -27,6 +27,8 @@ import {
 import { check } from "./check";
 
 const REPO = "fractalboxdev/contextful";
+const SHA40 = /^[a-f0-9]{40}$/i;
+const ZERO_SHA = "0".repeat(40);
 const CI_PACKAGE = "contextful-ci";
 const CARGO_RUN_CI = `cargo run --locked -q -p ${CI_PACKAGE} --`;
 const DISCOVER = `${CARGO_RUN_CI} stages --parts`;
@@ -83,6 +85,57 @@ export const parseWindow = (raw: string | undefined): number => {
  */
 export const partCheckName = (stage: string): string => `flare-dispatch/check:${stage}`;
 export const NOT_AFFECTED_SUMMARY = "not affected by this change";
+
+/**
+ * The two-tier gate (specs/adr/0009-fast-trustworthy-verdicts.md § Two-tier
+ * gate). `gate.lightLabels:<repo>` lists the light parts; every other part is
+ * heavy. A pull-request gate runs the light parts, and a push to the default
+ * branch runs the heavy parts once per head. Unset, every part is heavy and a
+ * pull-request gate runs all of them, as it does without the key.
+ */
+export const lightLabelsKey = (repo: string): string => `gate.lightLabels:${repo}`;
+
+/**
+ * The configured light labels: a JSON list of strings or a comma-separated
+ * list. Absent, blank, empty or malformed → `undefined`: every part is heavy.
+ */
+export const parseLightLabels = (raw: string | undefined): readonly string[] | undefined => {
+  const text = raw?.trim() ?? "";
+  if (text === "") return undefined;
+  let labels: readonly string[];
+  if (text.startsWith("[") || text.startsWith("{")) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      return undefined;
+    }
+    if (!Array.isArray(parsed) || parsed.some((label) => typeof label !== "string")) return undefined;
+    labels = parsed as string[];
+  } else {
+    labels = text.split(",");
+  }
+  const trimmed = [...new Set(labels.map((label) => label.trim()).filter((label) => label !== ""))];
+  return trimmed.length === 0 ? undefined : trimmed;
+};
+
+/** Which half of a two-tier gate one execution runs. */
+export type GateTier = "pull-request" | "heavy";
+
+/**
+ * The parts one tier dispatches, in plan order. With no light labels a
+ * pull-request gate dispatches every part and the heavy tier none: the split
+ * is off.
+ */
+export const tierParts = (
+  dispatch: readonly string[],
+  lightLabels: readonly string[] | undefined,
+  tier: GateTier,
+): readonly string[] => {
+  if (lightLabels === undefined) return tier === "pull-request" ? dispatch : [];
+  const light = new Set(lightLabels);
+  return dispatch.filter((stage) => light.has(stage) === (tier === "pull-request"));
+};
 
 /**
  * Why a gate stops spawning before every part has run. A `spend budget
@@ -158,6 +211,10 @@ const Input = Schema.Struct({
    * gate registers first. A reopen adds {@link REOPEN_RANK_OFFSET_MS}.
    */
   revisedAt: Schema.optional(Schema.Number.pipe(Schema.int(), Schema.nonNegative())),
+  /** `heavy`: a push to the default branch, which runs the heavy parts. Absent: a pull-request gate. */
+  tier: Schema.optional(Schema.Literal("heavy")),
+  /** The default branch a heavy-tier push landed on; its head is the serial group's current revision. */
+  branch: Schema.optional(Schema.String),
 });
 
 type InputType = Schema.Schema.Type<typeof Input>;
@@ -176,6 +233,12 @@ const Output = Schema.Struct({
   stages: Schema.Number,
   failed: Schema.Array(Schema.String),
   notAffected: Schema.Array(Schema.String),
+  /**
+   * The affected parts this tier left to the other one (two-tier gate only):
+   * the heavy parts on a pull request, the light parts on a default-branch
+   * push. Absent when the split is off.
+   */
+  deferred: Schema.optional(Schema.Array(Schema.String)),
 });
 
 /** A malformed or empty discovery cannot quietly remove required checks. */
@@ -273,8 +336,10 @@ export const planStages = (
 
 export const contextfulGate = defineRun({
   name: "contextful-gate",
+  // 1.3.0 — two-tier gate: `gate.lightLabels:<repo>` splits light parts (pull
+  // requests) from heavy parts (pushes to the default branch).
   // 1.2.2 — a reopen ranks above the close marker of its own second.
-  version: "1.2.2",
+  version: "1.3.0",
   inputs: Input,
   outputs: Output,
   triggers: [
@@ -305,7 +370,46 @@ export const contextfulGate = defineRun({
         };
       },
     },
+    {
+      // The heavy tier: one gate per new default-branch head. The receiver
+      // dispatches it only when `gate.lightLabels:<repo>` exists (`optIn`).
+      event: "push",
+      idempotencyKey: ({ payload }) => `contextful-gate:push:${String(payload.after ?? "")}`,
+      gate: ({ payload }) =>
+        payload.repository?.full_name === REPO &&
+        typeof payload.repository?.default_branch === "string" &&
+        payload.ref === `refs/heads/${payload.repository.default_branch}` &&
+        typeof payload.after === "string" && SHA40.test(payload.after) && payload.after !== ZERO_SHA &&
+        typeof payload.before === "string" && SHA40.test(payload.before) && payload.before !== ZERO_SHA,
+      inputs: ({ payload }): InputType => ({
+        repo: REPO,
+        sha: String(payload.after),
+        baseSha: String(payload.before),
+        tier: "heavy",
+        branch: String(payload.repository?.default_branch),
+      }),
+    },
   ],
+  // A pull-request gate reads its light labels in the body and needs no
+  // opt-in; a heavy-tier push exists only for a repo that lists them.
+  optIn: ({ input }) => (input.tier === "heavy" ? [lightLabelsKey(input.repo)] : []),
+  // Heavy-tier gates of one repo never overlap: a newer default-branch head
+  // replaces a waiting older one, and a head that is no longer current skips.
+  serialize: (input) =>
+    input.tier === "heavy"
+      ? {
+          group: `contextful-gate:heavy:${input.repo}`,
+          revision: input.sha,
+          ...(input.branch !== undefined && input.branch !== ""
+            ? {
+                current: github.branchHead({ repo: input.repo, branch: input.branch }).pipe(
+                  Effect.map((sha): string | undefined => sha),
+                  Effect.orElseSucceed(() => undefined),
+                ),
+              }
+            : {}),
+        }
+      : undefined,
   // One gate run per pull request is live: a newer revision cancels the older
   // run, its children and their checks (apps/dispatcher/src/supersede.ts), and
   // the pull request's close cancels the live one (apps/dispatcher/src/pr-close.ts).
@@ -322,6 +426,16 @@ export const contextfulGate = defineRun({
   limits: { maxDurationSec: 30 * 3600, admissionMaxQueueAgeSec: 90 * 60 },
   run: (input) =>
     Effect.gen(function* () {
+      const tier: GateTier = input.tier === "heavy" ? "heavy" : "pull-request";
+      const lightLabels = yield* step("resolve-tiers", () =>
+        config.get(lightLabelsKey(input.repo)).pipe(Effect.map((raw) => parseLightLabels(raw) ?? null)),
+      );
+      // The heavy tier runs only beside a configured light tier.
+      if (tier === "heavy" && lightLabels === null) {
+        return yield* Effect.fail(
+          new RunSkipped({ reason: `two-tier gate not configured — ${lightLabelsKey(input.repo)} is unset` }),
+        );
+      }
       // Discovery runs in the execution's one container, the one its admission
       // slot pays for: head first, then the base in the same checkout, so the
       // base build reuses the head's `target/` and compiles only what differs.
@@ -435,6 +549,8 @@ export const contextfulGate = defineRun({
           }),
         );
       }
+      // This tier's parts. The other tier's parts post no check here.
+      const dispatch = tierParts(plan.dispatch, lightLabels ?? undefined, tier);
 
       // Branch protection requires every part's check: a part the diff cannot
       // reach is posted green under the same name instead of running. Creating
@@ -475,7 +591,7 @@ export const contextfulGate = defineRun({
       // them all before the first fresh read. A part that times out in the
       // admission queue also stops it: the pool is saturated, and further
       // windows would only queue behind the backlog.
-      const queue = [...plan.dispatch];
+      const queue = [...dispatch];
       const running: { readonly stage: string; readonly id: string; readonly expiresAt: number }[] = [];
       const failed = new Set<string>();
       const timedOut: string[] = [];
@@ -497,7 +613,8 @@ export const contextfulGate = defineRun({
           const batch = queue.slice(0, free);
           const spawn = yield* step(`spawn-parts-${spawned}`, () =>
             Effect.gen(function* () {
-              const liveness = yield* readLiveness(input);
+              // A default-branch head has no open pull request to outlive.
+              const liveness = tier === "heavy" ? LIVE : yield* readLiveness(input);
               if (!liveness.live) return { stopped: liveness.reason };
               const fanned = yield* fanOut({
                 run: "check",
@@ -576,7 +693,7 @@ export const contextfulGate = defineRun({
         // gate has ended.
         const reason = stopped;
         const unrun = [...queue];
-        const timedOutInOrder = plan.dispatch.filter((stage) => timedOut.includes(stage));
+        const timedOutInOrder = dispatch.filter((stage) => timedOut.includes(stage));
         yield* Effect.forEach(
           unrun,
           (stage) =>
@@ -594,10 +711,10 @@ export const contextfulGate = defineRun({
         );
         if (reason !== "admission backlog") {
           return yield* Effect.fail(
-            new RunSkipped({ reason: `${reason} — ${unrun.length} of ${plan.dispatch.length} parts not run` }),
+            new RunSkipped({ reason: `${reason} — ${unrun.length} of ${dispatch.length} parts not run` }),
           );
         }
-        const failedParts = plan.dispatch.filter((stage) => failed.has(stage));
+        const failedParts = dispatch.filter((stage) => failed.has(stage));
         return yield* Effect.fail(
           new AcceptanceFailed({
             exitCode: 1,
@@ -609,7 +726,7 @@ export const contextfulGate = defineRun({
           }),
         );
       }
-      const failedInOrder = plan.dispatch.filter((stage) => failed.has(stage));
+      const failedInOrder = dispatch.filter((stage) => failed.has(stage));
       if (failedInOrder.length > 0) {
         return yield* Effect.fail(
           new AcceptanceFailed({
@@ -618,6 +735,12 @@ export const contextfulGate = defineRun({
           }),
         );
       }
-      return { stages: plan.required.length, failed: failedInOrder, notAffected: plan.notAffected };
+      const deferred = plan.dispatch.filter((stage) => !dispatch.includes(stage));
+      return {
+        stages: plan.required.length,
+        failed: failedInOrder,
+        notAffected: plan.notAffected,
+        ...(lightLabels === null ? {} : { deferred }),
+      };
     }),
 });

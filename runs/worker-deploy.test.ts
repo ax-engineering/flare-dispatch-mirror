@@ -646,6 +646,15 @@ describe("worker-deploy", () => {
       }),
     ).toBe(false);
   });
+
+  it("optIn — names the command key resolve-config reads; none when the dispatch carries one", () => {
+    const input = workerDeploy.triggers![0]!.inputs({ payload: checkSuitePayload() });
+    expect(workerDeploy.optIn?.({ input })).toEqual(["worker-deploy.command:owner/name"]);
+    expect(workerDeploy.optIn?.({ input: { ...input, checkLabel: "docs" } })).toEqual([
+      "worker-deploy.command:owner/name:docs",
+    ]);
+    expect(workerDeploy.optIn?.({ input: { ...input, command: "pnpm deploy" } })).toEqual([]);
+  });
 });
 
 // --- Source guard: no direct Date.now() / crypto.randomUUID() in the run -----

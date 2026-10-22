@@ -14,7 +14,9 @@
 //   4. terminate each child's instance and tear down each container;
 //   5. end those rows 'cancelled' and delete their admission, serial-queue
 //      and supersession rows — the freed slots admit the next waiter at once;
-//   6. conclude every still-open check-run of the tree `cancelled`.
+//   6. conclude every still-open check-run of the tree `cancelled`;
+//   7. log one `supersede.cancelled` line naming the group, the root and the
+//      counts of children, admitted slots and check-runs it ended.
 //
 // D1 writes and instance termination fail the step so it retries the
 // idempotent sequence. Container and check-run calls are best-effort.
@@ -65,13 +67,28 @@ const requireCheckRunId = (row: SupersededRow | undefined): Effect.Effect<void, 
     ? Effect.void
     : Effect.fail(new Error("supersede: waiting for check-run id persistence"));
 
+/** The structured `supersede.cancelled` line: one per superseded tree it ended. */
+export type SupersedeCancelledLine = {
+  readonly event: "supersede.cancelled";
+  readonly group: string;
+  readonly root: string;
+  readonly supersededBy: string;
+  readonly children: number;
+  readonly admittedSlots: number;
+  readonly checkRuns: number;
+};
+
+const logCancelled = (line: SupersedeCancelledLine): Effect.Effect<void> =>
+  Effect.sync(() => console.log(JSON.stringify(line)));
+
 /**
- * Cancel `rootId` and its children on behalf of `supersededBy`. Resolves to the
- * ids whose rows it ended.
+ * Cancel `rootId` and its children on behalf of `supersededBy`, a member of
+ * `group`. Resolves to the ids whose rows it ended.
  */
 export const cancelSupersededTree = (
   rootId: string,
   supersededBy: string,
+  group: string,
   ports: SupersedePorts,
 ): Effect.Effect<readonly string[], Error> =>
   Effect.gen(function* () {
@@ -108,28 +125,40 @@ export const cancelSupersededTree = (
       { concurrency: 4, discard: true },
     );
     const ids = tree.map((row) => row.id);
-    yield* ports.store.cancel(ids);
-    yield* Effect.forEach(
+    const { admittedSlots } = yield* ports.store.cancel(ids);
+    const concluded = yield* Effect.forEach(
       tree,
       (row) =>
         Effect.gen(function* () {
           const checkRunId = row.checkRunId;
-          if (checkRunId === null || checkRunId === NOOP_CHECK_RUN_ID) return;
+          if (checkRunId === null || checkRunId === NOOP_CHECK_RUN_ID) return false;
           const state = yield* ports.checks.status({ repo: row.repo, checkRunId });
-          if (state !== "open") return;
+          if (state !== "open") return false;
           yield* ports.checks.update({
             repo: row.repo,
             checkRunId,
             conclusion: "cancelled",
             output: { title: supersededTitle(supersededBy), summary: supersededSummary(supersededBy) },
           });
+          return true;
         }).pipe(
           Effect.catchAllCause((cause) =>
-            Effect.logWarning(`supersede: check-run of ${row.id} not concluded — ${cause}`),
+            Effect.logWarning(`supersede: check-run of ${row.id} not concluded — ${cause}`).pipe(
+              Effect.as(false),
+            ),
           ),
         ),
-      { concurrency: 4, discard: true },
+      { concurrency: 4 },
     );
+    yield* logCancelled({
+      event: "supersede.cancelled",
+      group,
+      root: rootId,
+      supersededBy,
+      children: tree.filter((row) => row.id !== rootId).length,
+      admittedSlots,
+      checkRuns: concluded.filter(Boolean).length,
+    });
     return ids;
   });
 
@@ -144,8 +173,8 @@ export type SupersessionPorts = {
   /** A durable checkpoint (RunWorkflow's `step.do`). */
   readonly stepDo: <T>(name: string, body: () => Promise<T>) => Effect.Effect<T>;
   readonly store: Pick<RunSupersedeStore, "status" | "cancel" | "register">;
-  /** Cancel one superseded tree (`cancelSupersededTree` bound to live ports). */
-  readonly cancelTree: (olderId: string) => Effect.Effect<unknown, Error>;
+  /** Cancel one superseded tree of `group` (`cancelSupersededTree` bound to live ports). */
+  readonly cancelTree: (olderId: string, group: string) => Effect.Effect<unknown, Error>;
   /** Conclude this execution's own check-run `cancelled` with `summary`. */
   readonly concludeCancelled: (summary: string) => Effect.Effect<void>;
 };
@@ -197,7 +226,7 @@ export const enterSupersession = (
     if (registration.supersededBy !== null) return yield* standDown(registration.supersededBy);
     for (const [index, olderId] of registration.superseded.entries()) {
       yield* ports.stepDo(`supersede-cancel-${index}`, () =>
-        Effect.runPromise(ports.cancelTree(olderId)).then(() => true),
+        Effect.runPromise(ports.cancelTree(olderId, spec.group)).then(() => true),
       );
     }
     return "proceed" as const;

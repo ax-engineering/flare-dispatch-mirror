@@ -332,6 +332,11 @@ export const workerDeploy = defineRun({
   inputs: WorkerDeployInput,
   outputs: WorkerDeployOutput,
 
+  // The command key `resolve-config` reads — the receiver skips a repo without
+  // it (specs/adr/0007-cost-efficient-execution.md § Dispatch only work).
+  optIn: ({ input }) =>
+    input.command !== undefined ? [] : [commandKey(input.repo, input.checkLabel)],
+
   limits: {
     maxDurationSec: 1800,
     // A deploy someone waits on: admitted ahead of batch work.

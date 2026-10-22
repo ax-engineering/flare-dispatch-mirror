@@ -278,6 +278,12 @@ export const check = defineRun({
     },
   ],
 
+  // The command keys `resolve-config` reads — the receiver skips a repo with
+  // none of them (specs/adr/0007-cost-efficient-execution.md § Dispatch only
+  // work). A webhook dispatch is unlabelled, so it reads `check.command:<repo>`.
+  optIn: ({ input }) =>
+    input.command !== undefined ? [] : commandKeys(input.repo, input.checkLabel),
+
   limits: {
     // Run-body wall-time ceiling, enforced by the dispatcher: one full 2700 s
     // exec (the per-stage ceiling a fan-out gate passes) plus checkout, upload

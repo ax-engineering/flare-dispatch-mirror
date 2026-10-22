@@ -469,6 +469,16 @@ describe("offload-test", () => {
     ).toBe(false);
   });
 
+  it("optIn — names the keys resolve-command decides on; none when the dispatch carries a command", () => {
+    const input = offloadTest.triggers![0]!.inputs({ payload: prPayload() });
+    expect(offloadTest.optIn?.({ input })).toEqual([
+      "offload-test.command:owner/name",
+      "offload-test.command",
+      "offload-test.stages:owner/name",
+    ]);
+    expect(offloadTest.optIn?.({ input: { ...input, command: "pnpm test" } })).toEqual([]);
+  });
+
   it.effect(
     "command resolution — a dispatch without `command` resolves it from CONFIG_KV (per-repo wins over the default)",
     () => {

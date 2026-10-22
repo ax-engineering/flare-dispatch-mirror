@@ -35,6 +35,7 @@
 import { checkAndArmCooldown } from "../cooldown";
 import { verify } from "../hmac";
 import { toInstanceId } from "../instance-id";
+import { resolveOptIn } from "../opt-in";
 import { closedGroups, closeInstanceId, type CloseGroupPayload } from "../pr-close";
 import { triggersByEvent } from "../registry";
 import { resolveReleaseApproval } from "../release-approval";
@@ -268,12 +269,15 @@ export const handleGithubWebhook = async (request: Request, env: Env): Promise<R
   }
 
   const dispatched: Array<{ run: string; executionId: string }> = [];
-  const skipped: Array<{
-    run: string;
-    executionId: string;
-    reason: "cooldown";
-    retryAfterSec: number;
-  }> = [];
+  const skipped: Array<
+    | {
+        run: string;
+        executionId: string;
+        reason: "cooldown";
+        retryAfterSec: number;
+      }
+    | { run: string; reason: "not-configured" }
+  > = [];
   for (const { run, trigger } of matches) {
     if (
       trigger.actions !== undefined &&
@@ -286,6 +290,22 @@ export const handleGithubWebhook = async (request: Request, env: Env): Promise<R
 
     const id = toInstanceId(trigger.idempotencyKey(ctx));
     const inputs = trigger.inputs(ctx);
+
+    // Opt-in (when declared) — a repo with none of the run's CONFIG_KV keys
+    // gets no Workflow, no check-run and no admission slot. Read before the
+    // cooldown so an unconfigured repo never arms a window.
+    const optIn = run.optIn;
+    if (optIn !== undefined) {
+      const verdict = await resolveOptIn({
+        configKv: env.CONFIG_KV,
+        runName: run.name,
+        keys: () => optIn({ input: inputs }),
+      });
+      if (verdict === "not-configured") {
+        skipped.push({ run: run.name, reason: "not-configured" });
+        continue;
+      }
+    }
 
     // Run cooldown (when declared) — same check-and-arm Action mode applies,
     // so the cap holds across BOTH dispatch paths. A skipped trigger is
@@ -354,7 +374,8 @@ export const handleGithubWebhook = async (request: Request, env: Env): Promise<R
       event,
       deliveryId,
       dispatched,
-      // Shape-stable: `skipped` appears only when a cooldown actually fired.
+      // Shape-stable: `skipped` appears only when a cooldown or an opt-in
+      // check actually skipped a run.
       ...(skipped.length > 0 ? { skipped } : {}),
       ...(closed.length > 0 ? { closed } : {}),
     },

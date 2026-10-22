@@ -38,6 +38,12 @@ export type ExecutionRow = {
   readonly output_tokens: number | null;
   readonly vcpu_seconds: number | null;
   readonly model: string | null;
+  // --- Supersession (infra/migrations/0010; `listExecutions` only) -----------
+  /**
+   * The execution (or pull-request close marker) that superseded this one,
+   * from its `run_supersessions` row; NULL when nothing did or the row aged out.
+   */
+  readonly superseded_by?: string | null;
 };
 
 /** One row of the `steps` table. */
@@ -79,7 +85,8 @@ export type ListFilters = {
 
 /**
  * List executions newest-first, with optional `run`/`repo`/`status` filters and
- * a `(started_at, id)` keyset cursor. Returns at most `limit` rows.
+ * a `(started_at, id)` keyset cursor, each with the `superseded_by` of its
+ * `run_supersessions` row. Returns at most `limit` rows.
  */
 export const listExecutions = async (
   db: D1Database,
@@ -111,7 +118,11 @@ export const listExecutions = async (
     }
   }
   const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
-  const sql = `SELECT * FROM executions ${whereSql}
+  // The filter columns exist only on `executions`, so they stay unqualified.
+  const sql = `SELECT executions.*, run_supersessions.superseded_by
+                 FROM executions
+                 LEFT JOIN run_supersessions ON run_supersessions.execution_id = executions.id
+               ${whereSql}
                ORDER BY started_at DESC
                LIMIT ?`;
   binds.push(filters.limit);

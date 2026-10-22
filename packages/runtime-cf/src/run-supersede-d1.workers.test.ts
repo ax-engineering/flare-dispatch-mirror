@@ -67,6 +67,24 @@ describe("makeRunSupersedeD1: supersession against real D1", () => {
     expect(await executionStatus("exec-c")).toBe("running");
   });
 
+  it("keeps a cancelled member's superseded_by and leaves it out of later registrations", async () => {
+    await insertExecution("exec-a", "running");
+    await superseded("exec-a", G, { supersedeOlder: true });
+    clock += 1;
+    expect(await superseded("exec-b", G, { supersedeOlder: true })).toEqual(["exec-a"]);
+    await run(store.cancel(["exec-a"]));
+    const kept = await bindings.db
+      .prepare(`SELECT state, superseded_by AS by FROM run_supersessions WHERE execution_id = 'exec-a'`)
+      .first<{ state: string; by: string }>();
+    expect(kept).toEqual({ state: "cancelled", by: "exec-b" });
+    clock += 1;
+    expect(await superseded("exec-c", G, { supersedeOlder: true })).toEqual(["exec-b"]);
+    expect(await run(store.register("exec-a", G, { supersedeOlder: true }))).toEqual({
+      superseded: [],
+      supersededBy: "exec-b",
+    });
+  });
+
   it("returns the same superseded set when the registration re-runs", async () => {
     await superseded("exec-a", G, { supersedeOlder: true });
     clock += 1;
@@ -167,7 +185,8 @@ describe("makeRunSupersedeD1: supersession against real D1", () => {
     await insertExecution("child-done", "success", "parent", 13);
     await insertExecution("grandchild-running", "running", "child-running", 14);
     const admissions = makeRunAdmissionD1(bindings.db, () => clock);
-    await run(admissions.enqueue("child-running", "lean", "parent"));
+    const { enqueuedAt } = await run(admissions.enqueue("child-running", "lean", "parent"));
+    await run(admissions.attempt("child-running", "lean", enqueuedAt));
     await run(admissions.enqueue("grandchild-running", "lean", "child-running"));
 
     await run(store.markCancelled("parent"));
@@ -180,7 +199,8 @@ describe("makeRunSupersedeD1: supersession against real D1", () => {
       ["parent", "11"],
     ]);
 
-    await run(store.cancel(tree.map((row) => row.id)));
+    // One admitted slot (child-running); grandchild-running is still queued.
+    expect(await run(store.cancel(tree.map((row) => row.id)))).toEqual({ admittedSlots: 1 });
     expect(await executionStatus("child-running")).toBe("cancelled");
     expect(await executionStatus("grandchild-running")).toBe("cancelled");
     expect(await executionStatus("child-done")).toBe("success");

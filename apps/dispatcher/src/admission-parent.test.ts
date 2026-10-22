@@ -67,7 +67,7 @@ describe("leaveQueueForEndedParent", () => {
         { executionId: "part-a", parentExecutionId: "gate", parentStatus: "failure" },
         {
           stepDo: (name, body) => Effect.promise(async () => { events.push(`step:${name}`); return body(); }),
-          store: { cancel: (ids) => Effect.sync(() => { events.push(`cancel:${ids.join(",")}`); }) },
+          store: { cancel: (ids) => Effect.sync(() => { events.push(`cancel:${ids.join(",")}`); return { admittedSlots: 0 }; }) },
           concludeCancelled: (summary) => Effect.sync(() => { events.push(`conclude:${summary}`); }),
         },
       ),

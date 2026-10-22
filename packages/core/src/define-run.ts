@@ -61,6 +61,11 @@ export type CooldownSpec<I> = {
   readonly scope: (input: I) => string;
 };
 
+/** What a run's `optIn` reads its keys from: the dispatch's inputs. */
+export type OptInContext<I> = {
+  readonly input: I;
+};
+
 /** The raw GitHub webhook delivery; a run narrows it per-event itself. */
 export type WebhookPayload = Record<string, any>;
 
@@ -164,6 +169,17 @@ export type RunSpec<I, O, IEnc, OEnc> = {
    * Schedule mode is exempt (crons self-pace).
    */
   readonly cooldown?: CooldownSpec<I>;
+  /**
+   * The CONFIG_KV keys whose presence means the repo opted in to this run —
+   * exactly the keys the run body reads its command from. The webhook
+   * receiver reads them before it creates a Workflow: with none present it
+   * dispatches nothing and reports the run `skipped` as `not-configured`. An
+   * empty list means the inputs already carry the command (an Action or a
+   * fan-out parent named it), so no read happens. A failed read dispatches.
+   * The run body keeps its own opt-in check. See
+   * specs/adr/0007-cost-efficient-execution.md § Dispatch only work.
+   */
+  readonly optIn?: (ctx: OptInContext<I>) => readonly string[];
   /**
    * Declares that this run PAUSES for a human decision partway through — it
    * hibernates in `step.waitForEvent` until a person approves or rejects, and

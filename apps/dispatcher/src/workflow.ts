@@ -376,7 +376,7 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
             stepDo,
             store,
             cancelTree: (rootId, markerId) =>
-              cancelSupersededTree(rootId, markerId, liveSupersedePorts(env, store, checks)),
+              cancelSupersededTree(rootId, markerId, close.group, liveSupersedePorts(env, store, checks)),
           });
           yield* Effect.logInfo(
             `pull request closed: ${close.group} — cancelled ${cancelled.length} execution(s)${cancelled.length > 0 ? `: ${cancelled.join(", ")}` : ""}`,
@@ -844,8 +844,8 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
         {
           stepDo,
           store: supersessions,
-          cancelTree: (olderId) =>
-            cancelSupersededTree(olderId, payload.executionId, liveSupersedePorts(env, supersessions, checks)),
+          cancelTree: (olderId, group) =>
+            cancelSupersededTree(olderId, payload.executionId, group, liveSupersedePorts(env, supersessions, checks)),
           concludeCancelled: (summary) =>
             checks.update({
               repo: payload.github.repo,

@@ -14,7 +14,9 @@
 // touches a running execution. Supersession is the other policy: the older
 // member is cancelled wherever it stands — queued in admission, running, or
 // joined on children. `cancel` is the D1 half of that: it ends the rows, frees
-// their admission and serial slots, and drops their supersession rows. The
+// their admission and serial slots, and marks their supersession rows
+// 'cancelled', which keeps `superseded_by` readable for the dashboard until the
+// GC age and takes them out of every later registration. The
 // Workflow instances, containers and check-runs are the dispatcher's half
 // (apps/dispatcher/src/supersede.ts).
 //
@@ -55,6 +57,12 @@ export type SupersedeRegistration = {
   readonly supersededBy: string | undefined;
 };
 
+/** What one `cancel` freed. */
+export type CancelOutcome = {
+  /** `run_admissions` rows in state 'admitted' it deleted. */
+  readonly admittedSlots: number;
+};
+
 export interface RunSupersedeStore {
   /**
    * Join `group` at `rank` (default: now). With `supersedeOlder`, mark every
@@ -77,9 +85,11 @@ export interface RunSupersedeStore {
   readonly row: (executionId: string) => Effect.Effect<{ readonly status: string; readonly run: string } | undefined, Error>;
   /**
    * End every row in `ids` as 'cancelled' (rows already ended keep their
-   * status), and delete their admission, serial-queue and supersession rows.
+   * status), delete their admission and serial-queue rows, and mark their
+   * supersession rows 'cancelled'. Resolves to the number of admitted slots
+   * it freed.
    */
-  readonly cancel: (ids: readonly string[]) => Effect.Effect<void, Error>;
+  readonly cancel: (ids: readonly string[]) => Effect.Effect<CancelOutcome, Error>;
   /** Leave the group (DELETE own row) and collect rows past the GC age. */
   readonly release: (executionId: string) => Effect.Effect<void, Error>;
 }
@@ -146,7 +156,7 @@ export const makeRunSupersedeD1 = (
         db
           .prepare(
             `SELECT superseded_by AS supersededBy FROM run_supersessions
-              WHERE execution_id = ? AND state = 'superseded'`,
+              WHERE execution_id = ? AND state IN ('superseded', 'cancelled')`,
           )
           .bind(executionId)
           .first<{ supersededBy: string | null }>(),
@@ -203,12 +213,18 @@ export const makeRunSupersedeD1 = (
         .first<{ status: string; run: string }>(),
     ).pipe(Effect.map((found) => (found === null ? undefined : { status: found.status, run: found.run })));
 
-  const cancel = (ids: readonly string[]): Effect.Effect<void, Error> => {
-    if (ids.length === 0) return Effect.void;
+  const cancel = (ids: readonly string[]): Effect.Effect<CancelOutcome, Error> => {
+    if (ids.length === 0) return Effect.succeed({ admittedSlots: 0 });
     const marks = ids.map(() => "?").join(", ");
     const ts = now();
     return d1(() =>
-      db.batch([
+      db.batch<{ n?: number }>([
+        db
+          .prepare(
+            `SELECT COUNT(*) AS n FROM run_admissions
+              WHERE execution_id IN (${marks}) AND state = 'admitted'`,
+          )
+          .bind(...ids),
         db
           .prepare(
             `UPDATE executions SET status = 'cancelled', completed_at = ?
@@ -217,9 +233,11 @@ export const makeRunSupersedeD1 = (
           .bind(ts, ...ids),
         db.prepare(`DELETE FROM run_admissions WHERE execution_id IN (${marks})`).bind(...ids),
         db.prepare(`DELETE FROM serial_queue WHERE execution_id IN (${marks})`).bind(...ids),
-        db.prepare(`DELETE FROM run_supersessions WHERE execution_id IN (${marks})`).bind(...ids),
+        db
+          .prepare(`UPDATE run_supersessions SET state = 'cancelled' WHERE execution_id IN (${marks})`)
+          .bind(...ids),
       ]),
-    ).pipe(Effect.asVoid);
+    ).pipe(Effect.map(([counted]) => ({ admittedSlots: counted?.results[0]?.n ?? 0 })));
   };
 
   const release = (executionId: string): Effect.Effect<void, Error> =>

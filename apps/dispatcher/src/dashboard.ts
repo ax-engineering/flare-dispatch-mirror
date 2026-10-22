@@ -11,6 +11,8 @@
 // I/O, so it stays trivially testable (dashboard.test.ts). The route that feeds
 // it (query-param parsing, the D1 reads, the Access gate) is wired in http-app.ts.
 
+import { isCloseMarker } from "./pr-close";
+
 /** One execution row, pre-resolved with its tokened viewer links. */
 export interface DashboardRow {
   readonly id: string;
@@ -38,6 +40,12 @@ export interface DashboardRow {
    * — a non-null value means flare-dispatch drove a PR to fix a bug here.
    */
   readonly selfHealPrUrl: string | null;
+  /**
+   * The execution that superseded this one, or a pull-request close marker,
+   * from `run_supersessions.superseded_by`; `null` when nothing superseded it.
+   * A `cancelled` row with a value is labelled with it.
+   */
+  readonly supersededBy: string | null;
 }
 
 export interface DashboardData {
@@ -244,6 +252,15 @@ const STYLE = `
   footer a { margin-right: 1rem; }
 `;
 
+/** "superseded by <id>" (or "pull request closed") under a cancelled row's badge. */
+const supersededLabel = (row: DashboardRow): string => {
+  if (row.status !== "cancelled" || row.supersededBy === null) return "";
+  const text = isCloseMarker(row.supersededBy)
+    ? "pull request closed"
+    : `superseded by <span class="sha">${esc(row.supersededBy)}</span>`;
+  return ` <span class="when superseded">${text}</span>`;
+};
+
 const renderRow = (row: DashboardRow, nowMs: number): string => {
   const links: string[] = [];
   if (row.logsUrl !== null) {
@@ -267,7 +284,7 @@ const renderRow = (row: DashboardRow, nowMs: number): string => {
       ? ` <a class="badge selfheal" href="${esc(row.selfHealPrUrl)}" title="View flare-dispatch self-heal fix PRs">🩹 self-heal</a>`
       : "";
   return `<tr${clickable ? ' class="rowlink"' : ""}>
-    <td><span class="badge ${badgeClass(row.status)}">${esc(row.status)}</span></td>
+    <td><span class="badge ${badgeClass(row.status)}">${esc(row.status)}</span>${supersededLabel(row)}</td>
     <td class="run">${runCell}${selfHealPill}</td>
     <td><span class="repo">${esc(row.repo)}</span> <span class="sha">${esc(shortSha(row.sha))}</span></td>
     <td class="when">${esc(relativeTime(row.startedAt, nowMs))}</td>
