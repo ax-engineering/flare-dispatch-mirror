@@ -304,7 +304,8 @@ export const prReview = defineRun({
 
   outputs: ReviewOutput,
 
-  limits: { maxDurationSec: 1500, maxConcurrency: FULL_AGENTS.length },
+  // A PR verdict someone waits on: admitted ahead of batch work.
+  limits: { maxDurationSec: 1500, maxConcurrency: FULL_AGENTS.length, admissionClass: "interactive" },
 
   // At most one review per PR per window, across BOTH dispatch paths
   // (webhook + Action). Default 60 min; override via CONFIG_KV

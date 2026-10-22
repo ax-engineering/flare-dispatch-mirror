@@ -60,11 +60,14 @@ export {
 } from "./container-lease-d1";
 export {
   makeRunAdmissionD1,
+  BURN_UNLIMITED,
+  type BurnCeiling,
   resolveAdmissionCap,
   resolvePoolAdmissionCap,
   ADMISSION_CAP_DEFAULT,
   RELEASE_ADMISSION_CAP_DEFAULT,
   AGENT_ADMISSION_CAP_DEFAULT,
+  BROWSER_ADMISSION_CAP_DEFAULT,
   ADMISSION_POLL_EVERY_MS,
   ADMISSION_MAX_QUEUE_AGE_MS,
   ADMISSION_TTL_MS,
@@ -116,7 +119,20 @@ export {
   type WorkflowBindingLike,
 } from "./child-runs-cf";
 export { makeModelGatewayLive, type AiBinding, type ModelUsageSink } from "./model-gateway-cf";
-export { recordExecutionCost, instanceForSandboxImage } from "./execution-cost";
+export {
+  recordExecutionCost,
+  instanceForSandboxImage,
+  hourlyRateForSandboxImage,
+  SANDBOX_CONTAINER,
+  COST_METER_ADMITTED_ACTIVE,
+} from "./execution-cost";
+export {
+  readSpend,
+  readSpendLimits,
+  readSpendStatus,
+  warnSpendOnce,
+  type SpendStatus,
+} from "./spend-d1";
 export {
   BrowserDeferred,
   ChildRunsDeferred,

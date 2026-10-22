@@ -32,6 +32,17 @@
 export type AdmissionPool = "lean" | "browser" | "agent" | "release";
 
 /**
+ * The admission class a run waits in (ADR-0009 § Interactive admission class).
+ * A claim admits the oldest live `interactive` waiter in a pool before any
+ * `batch` waiter; FIFO order and the queue position apply within a class,
+ * interactive ahead of batch. A run that declares no class is `batch`.
+ */
+export type AdmissionClass = "interactive" | "batch";
+
+/** The class of a run that declares none. */
+export const ADMISSION_CLASS_DEFAULT: AdmissionClass = "batch";
+
+/**
  * What one claim attempt observed, read atomically by the runtime layer:
  * whether OUR atomic claim landed, and — when it did not — where we stand.
  * `position` counts live queued rows ahead of us (the FIFO line); `poolBusy`
@@ -44,6 +55,12 @@ export type AdmissionObservation = {
   readonly position: number;
   /** Live admitted rows in our pool (slots currently in use). */
   readonly poolBusy: number;
+  /**
+   * The burn ceiling, not the pool cap, held the claim back: our pool had a
+   * free slot, but the admitted hourly rates plus ours exceed the ceiling
+   * (ADR-0006 § Burn ceiling). Absent = false.
+   */
+  readonly ceilingHeld?: boolean;
 };
 
 /**
@@ -69,6 +86,8 @@ export type AdmissionDecision =
       readonly queuedForMs: number;
       readonly position: number;
       readonly poolBusy: number;
+      /** The final attempt saw the burn ceiling, not the pool cap, holding it. */
+      readonly ceilingHeld: boolean;
     };
 
 /**
@@ -96,6 +115,7 @@ export const decideAdmission = (
       queuedForMs,
       position: observed.position,
       poolBusy: observed.poolBusy,
+      ceilingHeld: observed.ceilingHeld === true,
     };
   }
   return {
@@ -112,6 +132,59 @@ export const decideAdmission = (
  * read, so the loop stays replay-deterministic across a Workflow checkpoint
  * resume — exactly the bound `leaseAcquireAttempts` and `waitForChildren`
  * use for their poll loops.
+ *
+ * With position-scaled sleeps ({@link admissionPollSleepMs}) pass the SHORTEST
+ * sleep: every sleep is at least that long, so the count covers the whole
+ * queue age, and the age read inside each claim step (`decideAdmission`) ends
+ * a slower-polling loop at the deadline in fewer attempts. The count is the
+ * ceiling on steps, the age is the ceiling on time.
  */
 export const admissionAcquireAttempts = (maxQueueAgeMs: number, pollEveryMs: number): number =>
   Math.max(1, Math.ceil(maxQueueAgeMs / Math.max(1, pollEveryMs)));
+
+/** The head-of-queue poll interval: the shortest sleep between claims. */
+export const ADMISSION_POLL_MIN_MS = 20_000;
+
+/** The longest sleep between claims, however far back a waiter stands. */
+export const ADMISSION_POLL_MAX_MS = 60_000;
+
+/**
+ * The sleep before a waiter's next claim (ADR-0008 § Position-scaled admission
+ * polls): `min(60 s, 20 s × ceil(position / cap))`, with the head (position 0)
+ * on the 20-second poll. A waiter moves at most one place per released slot,
+ * so polling far from the head admits nothing sooner.
+ *
+ * `position` is the one observed inside the claim step, so a replay sleeps the
+ * same length. `remainingMs` (time left before the dispatch-age ceiling, from
+ * the same step's clock) shortens a long sleep so the final claim lands at the
+ * deadline instead of up to a minute past it; the sleep never drops below the
+ * 20-second poll.
+ */
+export const admissionPollSleepMs = (
+  position: number,
+  cap: number,
+  remainingMs: number = Number.POSITIVE_INFINITY,
+): number => {
+  const slotsBack = Math.max(1, Math.ceil(Math.max(0, position) / Math.max(1, cap)));
+  const scaled = Math.min(ADMISSION_POLL_MAX_MS, ADMISSION_POLL_MIN_MS * slotsBack);
+  return Math.max(ADMISSION_POLL_MIN_MS, Math.min(scaled, remainingMs));
+};
+
+/** The longest jitter an admitted run waits before its container starts. */
+export const ADMISSION_JITTER_MAX_MS = 2_000;
+
+/**
+ * The pause between an admitting claim and the container start (ADR-0009 §
+ * Pools sized under the spend guard), `0..ADMISSION_JITTER_MAX_MS` ms. A burst
+ * of admissions spreads over two seconds instead of hitting the container
+ * start-rate limit at once. Derived from the execution id (FNV-1a), so a
+ * replay waits the same length.
+ */
+export const admissionJitterMs = (executionId: string): number => {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < executionId.length; i++) {
+    hash ^= executionId.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash % (ADMISSION_JITTER_MAX_MS + 1);
+};

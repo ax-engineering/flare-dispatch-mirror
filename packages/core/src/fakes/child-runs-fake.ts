@@ -8,7 +8,7 @@
 // Spec: specs/03-dsl.md § spawnChildRun, specs/pm/plan.md § 3 (fakes/).
 
 import { Effect, Layer } from "effect";
-import { ChildSpawnFailed } from "../errors";
+import { ChildSpawnFailed, RunSkipped } from "../errors";
 import {
   type ChildRunStatus,
   ChildRuns,
@@ -50,6 +50,12 @@ export const makeChildRunsFake = (opts?: {
   /** Reject selected spawns before recording them, for partial fan-out tests. */
   failSpawn?: (opts: SpawnChildRunOpts) => boolean;
   /**
+   * When set, `spendGate` fails `RunSkipped` with this reason (budget reached).
+   * A function is read on every gate call, so a test closes the budget mid-run;
+   * it returns `undefined` while the budget is open.
+   */
+  spendClosed?: string | (() => string | undefined);
+  /**
    * Static per-id poll statuses. An id absent from the map polls as `missing`.
    * For a loop test that flips `running → success`, supply `pollFn` instead.
    */
@@ -77,6 +83,11 @@ export const makeChildRunsFake = (opts?: {
   };
 
   const service: ChildRunsService = {
+    spendGate: () =>
+      Effect.suspend(() => {
+        const closed = typeof opts?.spendClosed === "function" ? opts.spendClosed() : opts?.spendClosed;
+        return closed !== undefined ? Effect.fail(new RunSkipped({ reason: closed })) : Effect.void;
+      }),
     handoffAdmission: () =>
       Effect.sync(() => {
         state.admissionHandoffs += 1;

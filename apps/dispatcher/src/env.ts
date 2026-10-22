@@ -465,6 +465,44 @@ export interface Env {
   readonly ADMISSION_CAP_AGENT?: string;
 
   /**
+   * The browser pool's admission slots — a var, carried as a string. The
+   * browser pool admits at most the smaller of this and `ADMISSION_CAP`; keep
+   * it ≤ `RunSandboxBrowser`'s `max_instances`. Absent / unparsable → 16
+   * (`BROWSER_ADMISSION_CAP_DEFAULT`).
+   */
+  readonly ADMISSION_CAP_BROWSER?: string;
+
+  /**
+   * The monthly spend budget in USD (specs/adr/0006-spend-guard.md) — a var.
+   * At or over it, admission skips every run with a neutral check. Unset or
+   * unparsable → 50; `unlimited` disables it. CONFIG_KV
+   * `spend.budgetMonthlyUsd` overrides it without a deploy. The default lives
+   * in code (core spend.ts), because an operator overlay replaces the
+   * committed wrangler.jsonc.
+   */
+  readonly SPEND_BUDGET_MONTHLY_USD?: string;
+
+  /**
+   * The burn ceiling in USD per hour — a var. The summed hourly rate of every
+   * admitted execution, across all pools, stays at or under it. Unset or
+   * unparsable → 1.50; `unlimited` disables it. CONFIG_KV
+   * `spend.burnMaxUsdPerHour` overrides it.
+   */
+  readonly SPEND_BURN_MAX_USD_PER_HOUR?: string;
+
+  /**
+   * Multiplier on metered container + model spend for Workflow steps and
+   * Durable Objects — a var. Unset or outside [1, 10] → 1.10.
+   */
+  readonly SPEND_OVERHEAD_FACTOR?: string;
+
+  /**
+   * Fraction of the monthly budget whose crossing sends the month's one
+   * warning on the notice path — a var. Unset or outside (0, 1] → 0.8.
+   */
+  readonly SPEND_WARN_RATIO?: string;
+
+  /**
    * Cloudflare account id (the 32-hex id in the dashboard URL) — a var, not a
    * secret. When set, `RunWorkflow` builds a `details_url` on the GitHub
    * check-run pointing at the Cloudflare Workflows instance page

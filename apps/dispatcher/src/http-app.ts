@@ -45,6 +45,7 @@ import { handleProductDemo } from "./routes/product-demos";
 import { handleReplay } from "./routes/replay";
 import { handleGithubWebhook } from "./routes/webhook";
 import { handleSignalsWebhook } from "./routes/signals-webhook";
+import { handleSpend, readSpendNow, spendLine, spendView } from "./routes/spend";
 
 /** `owner/repo` slug for the dashboard source link. */
 const REPO_SLUG = "fractalbox/flare-dispatch";
@@ -368,6 +369,8 @@ const appShellRoute = Effect.gen(function* () {
   }
 
   const { origin, rows, filters, pagination } = yield* dashboardData;
+  // The spend line is a read beside the list, never a reason the page fails.
+  const spend = yield* readSpendNow(env).pipe(Effect.option);
   const html = renderDashboard({
     origin,
     rows,
@@ -375,6 +378,7 @@ const appShellRoute = Effect.gen(function* () {
     pagination,
     nowMs: Date.now(),
     repoSlug: REPO_SLUG,
+    ...(Option.isSome(spend) ? { spendLine: spendLine(spend.value) } : {}),
   });
   return HttpServerResponse.raw(html, {
     status: 200,
@@ -396,8 +400,13 @@ const dashboardJsonRoute = Effect.gen(function* () {
   if (request.method !== "GET") return methodNotAllowed;
 
   const { origin, rows, filters, pagination } = yield* dashboardData;
+  const env = yield* CurrentEnv;
+  const spend = yield* readSpendNow(env).pipe(
+    Effect.map((status) => ({ ...spendView(status), line: spendLine(status) })),
+    Effect.orElseSucceed(() => null),
+  );
   return HttpServerResponse.raw(
-    JSON.stringify({ origin, repoSlug: REPO_SLUG, rows, filters, pagination }),
+    JSON.stringify({ origin, repoSlug: REPO_SLUG, rows, filters, pagination, spend }),
     {
       status: 200,
       headers: { "content-type": "application/json; charset=utf-8" },
@@ -585,6 +594,12 @@ const router = baseRouter.pipe(
   ),
   HttpRouter.all("/v1/dashboard.json", dashboardJsonRoute),
   HttpRouter.all("/v1/analytics.json", analyticsJsonRoute),
+  // The spend guard's month-to-date view (ADR-0006) — Access-gated like the
+  // executions and analytics reads.
+  HttpRouter.all(
+    "/api/spend",
+    route("GET", ({ env }) => handleSpend(env), { viewer: true }),
+  ),
   // Container-side OTP read — TOKEN-ONLY (no `viewer: true`): a sandbox can't
   // carry an Access JWT, so the expiring capability token + burn-after-read are
   // the gate. See routes/mailbox.ts for the posture.

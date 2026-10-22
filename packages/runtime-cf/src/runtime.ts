@@ -97,6 +97,11 @@ export type CFRuntimeLiveOptions<T extends Sandbox = Sandbox> = {
    * required Dispatcher binding, so the production call site always passes it.
    */
   readonly runsWorkflow?: WorkflowBindingLike;
+  /**
+   * The monthly-budget read a fan-out runs before it spawns children
+   * (ADR-0006) — see `ChildRunsLiveConfig.spendGate`. Absent = no spend guard.
+   */
+  readonly spendGate?: () => Promise<string | undefined>;
   /** This execution's ULID — namespaces D1 rows, R2 keys, the sandbox id. */
   readonly executionId: string;
   /** repo/ref/sha/input the `executions` row requires. */
@@ -413,6 +418,7 @@ export const makeCFRuntimeLive = <T extends Sandbox>(
           workflow: opts.runsWorkflow,
           db: opts.db,
           parentExecutionId: opts.executionId,
+          ...(opts.spendGate !== undefined ? { spendGate: opts.spendGate } : {}),
           // Children inherit the parent's public origin so their artifact
           // links are absolute too (a child posts its own check-run).
           ...(opts.publicOrigin !== undefined ? { origin: opts.publicOrigin } : {}),

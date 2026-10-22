@@ -82,10 +82,43 @@ export {
 export {
   decideAdmission,
   admissionAcquireAttempts,
+  admissionPollSleepMs,
+  admissionJitterMs,
+  ADMISSION_CLASS_DEFAULT,
+  ADMISSION_POLL_MIN_MS,
+  ADMISSION_POLL_MAX_MS,
+  ADMISSION_JITTER_MAX_MS,
+  type AdmissionClass,
   type AdmissionPool,
   type AdmissionObservation,
   type AdmissionDecision,
 } from "./run-admission";
+
+// --- Spend guard (pure budget + burn-ceiling math, ADR-0006) -----------------
+export {
+  SPEND_BUDGET_MONTHLY_USD_DEFAULT,
+  SPEND_BURN_MAX_USD_PER_HOUR_DEFAULT,
+  SPEND_OVERHEAD_FACTOR_DEFAULT,
+  SPEND_WARN_RATIO_DEFAULT,
+  SPEND_UNLIMITED,
+  SPEND_BUDGET_KV_KEY,
+  SPEND_BURN_KV_KEY,
+  spendWarnedKvKey,
+  parseUsdLimit,
+  resolveSpendLimits,
+  spendMonth,
+  monthToDateMicroUsd,
+  formatUsd,
+  decideBudget,
+  fitsBurnCeiling,
+  spendCeilingReason,
+  type SpendLimits,
+  type SpendVars,
+  type SpendOverrides,
+  type SpendMonth,
+  type SpendReading,
+  type BudgetDecision,
+} from "./spend";
 
 // --- Run ceiling (limits.maxDurationSec, replay-stable) ----------------------
 export { withRunCeiling, type RunCeiling } from "./run-ceiling";
@@ -303,6 +336,9 @@ export {
   INSTANCE_SPECS,
   CONTAINER_VCPU_MICRO_USD_PER_SEC,
   CONTAINER_GIB_MICRO_USD_PER_SEC,
+  CONTAINER_DISK_MICRO_USD_PER_SEC,
+  containerMicroUsdPerSec,
+  containerMicroUsdPerHour,
   modelRate,
   modelCost,
   containerCostMicroUsd,

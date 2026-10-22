@@ -82,3 +82,24 @@ describe("fanOut", () => {
     expect(spawned).toEqual([]);
   });
 });
+
+describe("fanOut — the spend gate (ADR-0006)", () => {
+  const reason = "spend budget reached: $90.00 of $90.00 this month";
+
+  it("skips and spawns no child once the monthly budget is reached", async () => {
+    const child = makeChildRunsFake({ spendClosed: reason });
+    const error = await Effect.runPromise(
+      fanOut({ run: "check", items: ["a", "b"], toInput: (item) => ({ item }) }).pipe(
+        Effect.flip,
+        Effect.provide(child.layer),
+      ),
+    );
+    expect(error).toMatchObject({ _tag: "RunSkipped", reason });
+    expect(child.state.spawned).toEqual([]);
+  });
+
+  it("spawns under the budget", async () => {
+    const { spawned } = await runFanOut({ run: "check", items: ["a"], toInput: (item) => ({ item }) });
+    expect(spawned).toHaveLength(1);
+  });
+});

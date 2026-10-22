@@ -11,10 +11,9 @@
 // and diffs. Model-calling runs are priced on the Anthropic backend as a representative
 // metered figure; the default Workers AI catalog backend bills as account-level Neurons.
 import {
-  CONTAINER_GIB_MICRO_USD_PER_SEC,
-  CONTAINER_VCPU_MICRO_USD_PER_SEC,
   INSTANCE_SPECS,
   containerCostMicroUsd,
+  containerMicroUsdPerSec,
   modelCost,
   type InstanceType,
 } from "@fractalboxdev/flare-dispatch-core/cost";
@@ -200,9 +199,4 @@ export const benchmarks: readonly BenchmarkRow[] = PROFILES.map((p) => {
 });
 
 /** Container rate for an instance, in micro-USD per active second. */
-export const containerMicroUsdPerSec = (instance: InstanceType): number => {
-  const spec = INSTANCE_SPECS[instance];
-  return spec.vcpu * CONTAINER_VCPU_MICRO_USD_PER_SEC + spec.gib * CONTAINER_GIB_MICRO_USD_PER_SEC;
-};
-
-export { INSTANCE_SPECS };
+export { containerMicroUsdPerSec, INSTANCE_SPECS };

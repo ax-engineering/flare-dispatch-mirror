@@ -52,6 +52,8 @@ export interface DashboardData {
   readonly nowMs: number;
   /** `owner/repo` slug for the source link. */
   readonly repoSlug: string;
+  /** The spend guard's month-to-date line (`GET /api/spend`); absent when unreadable. */
+  readonly spendLine?: string;
 }
 
 /** Server-side filters, parsed from the `run`/`repo`/`status` query params. */
@@ -196,6 +198,7 @@ const STYLE = `
   header { display: flex; flex-wrap: wrap; align-items: baseline; gap: .75rem; margin-bottom: .25rem; }
   h1 { font-size: 1.4rem; margin: 0; letter-spacing: -0.01em; }
   .tagline { color: #9aa3b2; margin: 0 0 1.75rem; }
+  .spend { color: #9aa3b2; margin: -1.25rem 0 1.75rem; font-size: 0.9rem; }
   h2 { font-size: .82rem; text-transform: uppercase; letter-spacing: .08em; color: #9aa3b2; margin: 2rem 0 .6rem; }
   table { width: 100%; border-collapse: collapse; font-size: 14px; }
   th { text-align: left; font-weight: 600; color: #9aa3b2; padding: .4rem .5rem; border-bottom: 1px solid #232838; }
@@ -375,7 +378,7 @@ export const renderDashboard = (data: DashboardData): string => {
   <h1>FlareDispatch</h1>
 </header>
 <p class="tagline">Dispatch CI/CD runs to Cloudflare — inspect logs, executions, and product demos.</p>
-
+${data.spendLine !== undefined ? `<p class="spend">${esc(data.spendLine)}</p>\n` : ""}
 <main>
   <h2>Latest executions</h2>
   ${renderFilters(data.filters)}

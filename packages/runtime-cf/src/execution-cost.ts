@@ -5,32 +5,60 @@
 //
 //   * METERED model tokens — SUMmed from `execution_model_usage` (written per
 //     call by the live `modelGateway` wrapper, model-gateway-cf.ts);
-//   * MODELED container compute — `instance vCPU/mem rate × active seconds`,
-//     where active seconds is the execution wall-time (an upper-bound proxy:
-//     it includes model round-trips + any in-body waits; refining this to the
-//     true sandbox boot→destroy window is a follow-up).
+//   * MODELED container compute — the list rate of the run's container class,
+//     priced on provisioned vCPU, memory and disk, × container-active seconds,
+//     which run from admission (`executions.admitted_at`) to completion. Queue
+//     wait costs nothing; an execution never admitted has no container time.
 //
 // via the pure `@fractalboxdev/flare-dispatch-core` cost engine, which decides the honest
-// `metered | mixed | modeled | unmetered` basis. Best-effort: a cost-rollup
-// failure logs a warning and never flips the run's verdict.
+// `metered | mixed | modeled | unmetered` basis. Each row it writes carries
+// `cost_meter = 'admitted-active'`; rows priced on wall time before this rule
+// carry `'modeled-wall'` (migration 0011). Best-effort: a cost-rollup failure
+// logs a warning and never flips the run's verdict.
 //
-// Spec: specs/06-cost.md, infra/migrations/0005_execution_cost.sql.
+// Spec: specs/06-cost.md, specs/adr/0006-spend-guard.md § Meter,
+//       infra/migrations/0005_execution_cost.sql, 0011_spend_guard.sql.
 
 import { Effect } from "effect";
 import {
   type InstanceType,
   type SandboxImage,
   INSTANCE_SPECS,
+  containerMicroUsdPerHour,
   estimateExecutionCost,
 } from "@fractalboxdev/flare-dispatch-core";
 
 /**
- * The container instance type a run's `sandboxImage` lands on. The Durable
- * Object classes in wrangler.jsonc bind `lean`/`browser` → `standard-2` and
- * `agent` → `standard-3`; an un-set image defaults to `lean`.
+ * The container class and instance type each sandbox image (= admission pool)
+ * runs on — the one table the meter, the burn ceiling and the finish path
+ * read. `execution-cost.test.ts` checks it against the committed
+ * wrangler.jsonc `containers` entries, so a class resized there fails CI until
+ * this table follows.
+ */
+export const SANDBOX_CONTAINER: Record<
+  SandboxImage,
+  { readonly className: string; readonly instance: InstanceType }
+> = {
+  lean: { className: "RunSandbox", instance: "standard-4" },
+  browser: { className: "RunSandboxBrowser", instance: "standard-2" },
+  agent: { className: "RunSandboxAgent", instance: "standard-3" },
+  release: { className: "RunSandboxRelease", instance: "standard-4" },
+};
+
+/**
+ * The container instance type a run lands on. Pass the ADMISSION POOL (the
+ * image after the dispatcher's degrade-to-lean routing), so a run is priced on
+ * the container it actually consumes; an un-set image is `lean`.
  */
 export const instanceForSandboxImage = (sandboxImage: SandboxImage | undefined): InstanceType =>
-  sandboxImage === "agent" ? "standard-3" : sandboxImage === "release" ? "standard-4" : "standard-2";
+  SANDBOX_CONTAINER[sandboxImage ?? "lean"].instance;
+
+/** A sandbox image's list rate per hour, in micro-USD — what the burn ceiling sums. */
+export const hourlyRateForSandboxImage = (sandboxImage: SandboxImage | undefined): number =>
+  containerMicroUsdPerHour(instanceForSandboxImage(sandboxImage));
+
+/** The `executions.cost_meter` label for a row priced by this rule. */
+export const COST_METER_ADMITTED_ACTIVE = "admitted-active";
 
 type UsageRow = {
   readonly model: string;
@@ -40,13 +68,13 @@ type UsageRow = {
 };
 
 /**
- * Compute and persist this execution's cost rollup. Reads its own wall-time and
+ * Compute and persist this execution's cost rollup. Reads its admitted window and
  * model-usage rows from D1, models container compute from the instance type, and
  * writes the `executions` cost columns. Returns `void`; all failure is absorbed.
  *
  * @param db          D1 binding (`env.RUNS_METADATA`).
  * @param executionId the row to roll up.
- * @param instance    the container instance type (`instanceForSandboxImage`).
+ * @param instance    the container instance type (`instanceForSandboxImage(pool)`).
  */
 export const recordExecutionCost = (opts: {
   readonly db: D1Database;
@@ -56,16 +84,17 @@ export const recordExecutionCost = (opts: {
   Effect.tryPromise(async () => {
     const { db, executionId, instance } = opts;
 
-    // Wall-time → modeled container-active seconds (upper-bound proxy).
+    // Admission → completion is the container-active window; queue wait and
+    // a run never admitted cost no container time.
     const exec = await db
-      .prepare(`SELECT started_at, completed_at FROM executions WHERE id = ?`)
+      .prepare(`SELECT admitted_at, completed_at FROM executions WHERE id = ?`)
       .bind(executionId)
-      .first<{ started_at: number | null; completed_at: number | null }>();
-    const startedAt = exec?.started_at ?? null;
+      .first<{ admitted_at: number | null; completed_at: number | null }>();
+    const admittedAt = exec?.admitted_at ?? null;
     const completedAt = exec?.completed_at ?? null;
     const activeSeconds =
-      startedAt !== null && completedAt !== null && completedAt > startedAt
-        ? (completedAt - startedAt) / 1000
+      admittedAt !== null && completedAt !== null && completedAt > admittedAt
+        ? (completedAt - admittedAt) / 1000
         : 0;
 
     // SUM model token usage; pick the dominant model for the rate + the column.
@@ -109,13 +138,14 @@ export const recordExecutionCost = (opts: {
     await db
       .prepare(
         `UPDATE executions
-           SET cost_micro_usd = ?, cost_basis = ?, input_tokens = ?,
+           SET cost_micro_usd = ?, cost_basis = ?, cost_meter = ?, input_tokens = ?,
                output_tokens = ?, vcpu_seconds = ?, model = ?
          WHERE id = ?`,
       )
       .bind(
         cost.totalMicroUsd,
         cost.basis,
+        COST_METER_ADMITTED_ACTIVE,
         rows.length > 0 ? inTok : null,
         rows.length > 0 ? outTok : null,
         vcpuSeconds,

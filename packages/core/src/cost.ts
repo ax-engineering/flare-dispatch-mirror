@@ -39,10 +39,11 @@ export const MICRO_USD_PER_USD = 1_000_000;
 
 // --- Container instance types ---------------------------------------------------
 //
-// vCPU + memory per Cloudflare Containers instance type (specs/05-byoc.md §
-// Wrangler config, "Instance types (2026-05)"). A run's instance type is fixed
-// by the Durable Object class its `sandboxImage` selects (wrangler.jsonc):
-// `lean`/`browser` → `standard-2`, `agent` → `standard-3`.
+// Provisioned vCPU, memory and disk per Cloudflare Containers instance type
+// (specs/05-byoc.md § Wrangler config, "Instance types (2026-05)"). A run's
+// instance type is fixed by the container class its `sandboxImage` selects in
+// wrangler.jsonc — the one table is `SANDBOX_CONTAINER` in runtime-cf
+// execution-cost.ts, checked against that file by its test.
 
 export type InstanceType =
   | "lite"
@@ -57,30 +58,54 @@ export type InstanceSpec = {
   readonly vcpu: number;
   /** Allotted memory in GiB. */
   readonly gib: number;
+  /** Provisioned disk in GB. */
+  readonly diskGb: number;
 };
 
-/** vCPU / memory by instance type (specs/05-byoc.md § Wrangler config). */
+/** vCPU / memory / disk by instance type (specs/05-byoc.md § Wrangler config). */
 export const INSTANCE_SPECS: Record<InstanceType, InstanceSpec> = {
-  lite: { vcpu: 1 / 16, gib: 0.25 },
-  basic: { vcpu: 1 / 4, gib: 1 },
-  "standard-1": { vcpu: 1 / 2, gib: 4 },
-  "standard-2": { vcpu: 1, gib: 6 },
-  "standard-3": { vcpu: 2, gib: 8 },
-  "standard-4": { vcpu: 4, gib: 12 },
+  lite: { vcpu: 1 / 16, gib: 0.25, diskGb: 2 },
+  basic: { vcpu: 1 / 4, gib: 1, diskGb: 4 },
+  "standard-1": { vcpu: 1 / 2, gib: 4, diskGb: 8 },
+  "standard-2": { vcpu: 1, gib: 6, diskGb: 12 },
+  "standard-3": { vcpu: 2, gib: 8, diskGb: 16 },
+  "standard-4": { vcpu: 4, gib: 12, diskGb: 20 },
 } as const;
 
 // --- Container rates (specs/06-cost.md § Pricing model) -------------------------
 //
-// $0.000020 / vCPU-s and $0.0000025 / GiB-s. In µ$: multiply USD by 1e6.
+// List prices on the PROVISIONED size: $0.000020 / vCPU-s, $0.0000025 / GiB-s
+// and $0.00000007 / GB-s of disk. In µ$: multiply USD by 1e6.
 //   $0.000020 × 1e6 = 20 µ$ per vCPU-second
 //   $0.0000025 × 1e6 = 2.5 µ$ per GiB-second
-// (Disk GB-s is billed too but rounds to zero per-execution and we don't track
-// it — see specs/06-cost.md § Per-execution cost anatomy.)
+//   $0.00000007 × 1e6 = 0.07 µ$ per disk GB-second
+// Cloudflare bills active vCPU, so a provisioned-size rate is an upper bound on
+// the billed rate — the direction a spend cap wants (ADR-0006 § Meter).
 
 /** Container vCPU-second rate, in micro-USD (`$0.000020/vCPU-s`). */
 export const CONTAINER_VCPU_MICRO_USD_PER_SEC = 20;
 /** Container memory GiB-second rate, in micro-USD (`$0.0000025/GiB-s`). */
 export const CONTAINER_GIB_MICRO_USD_PER_SEC = 2.5;
+/** Container disk GB-second rate, in micro-USD (`$0.00000007/GB-s`). */
+export const CONTAINER_DISK_MICRO_USD_PER_SEC = 0.07;
+
+/** One instance's list rate per active second, in (fractional) micro-USD. */
+export const containerMicroUsdPerSec = (instance: InstanceType): number => {
+  const spec = INSTANCE_SPECS[instance];
+  return (
+    spec.vcpu * CONTAINER_VCPU_MICRO_USD_PER_SEC +
+    spec.gib * CONTAINER_GIB_MICRO_USD_PER_SEC +
+    spec.diskGb * CONTAINER_DISK_MICRO_USD_PER_SEC
+  );
+};
+
+/**
+ * One instance's list rate per hour, in whole micro-USD — the unit the burn
+ * ceiling sums across admitted executions (`run_admissions.hourly_rate_micro_usd`).
+ * `standard-4` ≈ $0.401/h, `standard-2` ≈ $0.129/h.
+ */
+export const containerMicroUsdPerHour = (instance: InstanceType): number =>
+  Math.round(containerMicroUsdPerSec(instance) * 3600);
 
 // --- Model token rates ----------------------------------------------------------
 //
@@ -209,23 +234,16 @@ export const modelCost = (opts: {
 };
 
 /**
- * Modeled container-compute cost: `(vCPU-s × vCPU-rate) + (GiB-s × GiB-rate)`.
- * GiB-seconds derive from the instance's allotted memory × active seconds. This
- * is ALWAYS modeled — Cloudflare meters container vCPU-s at the account level
- * only, never per-execution.
+ * Modeled container-compute cost: `(vCPU-s × vCPU-rate) + (GiB-s × GiB-rate) +
+ * (disk GB-s × disk rate)`, each on the instance's provisioned size × active
+ * seconds. This is ALWAYS modeled — Cloudflare meters container usage at the
+ * account level only, never per-execution.
  */
 export const containerCostMicroUsd = (opts: {
   readonly instance: InstanceType;
-  /** Seconds the container was active (boot → destroy, or summed exec time). */
+  /** Seconds the container was active (admission → completion). */
   readonly activeSeconds: number;
-}): number => {
-  const spec = INSTANCE_SPECS[opts.instance];
-  const vcpuSeconds = spec.vcpu * opts.activeSeconds;
-  const gibSeconds = spec.gib * opts.activeSeconds;
-  return Math.round(
-    vcpuSeconds * CONTAINER_VCPU_MICRO_USD_PER_SEC + gibSeconds * CONTAINER_GIB_MICRO_USD_PER_SEC,
-  );
-};
+}): number => Math.round(containerMicroUsdPerSec(opts.instance) * opts.activeSeconds);
 
 // --- Whole-execution estimate ---------------------------------------------------
 

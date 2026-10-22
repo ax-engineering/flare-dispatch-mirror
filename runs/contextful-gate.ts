@@ -84,8 +84,16 @@ export const parseWindow = (raw: string | undefined): number => {
 export const partCheckName = (stage: string): string => `flare-dispatch/check:${stage}`;
 export const NOT_AFFECTED_SUMMARY = "not affected by this change";
 
-/** Why a gate stops spawning before every part has run. */
-export type StopReason = "head superseded" | "pull request closed" | "admission backlog";
+/**
+ * Why a gate stops spawning before every part has run. A `spend budget
+ * reached: …` reason is the deploy's monthly budget closing before a window
+ * spawns (specs/adr/0006-spend-guard.md).
+ */
+export type StopReason =
+  | "head superseded"
+  | "pull request closed"
+  | "admission backlog"
+  | `spend budget reached: ${string}`;
 
 /** Whether the gated pull request is still open at the gated commit. */
 export type Liveness = { readonly live: true } | { readonly live: false; readonly reason: StopReason };
@@ -491,7 +499,7 @@ export const contextfulGate = defineRun({
             Effect.gen(function* () {
               const liveness = yield* readLiveness(input);
               if (!liveness.live) return { stopped: liveness.reason };
-              const handles = yield* fanOut({
+              const fanned = yield* fanOut({
                 run: "check",
                 items: batch,
                 concurrency: batch.length,
@@ -509,8 +517,15 @@ export const contextfulGate = defineRun({
                     : { restore: [{ key: prebuilt.key, base: prebuilt.base, paths: prebuilt.paths }] }),
                   secrets: [],
                 }),
-              });
-              return { handles, spawnedAt: yield* io.now };
+              }).pipe(
+                // The monthly budget closed: spawn nothing more, post the
+                // unrun parts, and end the gate skipped with that reason.
+                Effect.catchTag("RunSkipped", (skip) =>
+                  Effect.succeed({ stopped: skip.reason as StopReason }),
+                ),
+              );
+              if ("stopped" in fanned) return fanned;
+              return { handles: fanned, spawnedAt: yield* io.now };
             }),
           );
           if ("stopped" in spawn) {

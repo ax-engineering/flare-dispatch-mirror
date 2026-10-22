@@ -20,10 +20,14 @@
 // checkpoint; the deterministic child instance ids make the underlying
 // `create` idempotent on replay regardless.
 //
+// Before it spawns anything, `fanOut` reads the deploy's spend through the
+// capability's `spendGate`: at or over the monthly budget it fails
+// `RunSkipped` and spawns no child (specs/adr/0006-spend-guard.md).
+//
 // Spec: specs/03-dsl.md § Primitives + § spawnChildRun.
 
 import { Effect } from "effect";
-import type { ChildSpawnFailed } from "../errors";
+import type { ChildSpawnFailed, RunSkipped } from "../errors";
 import { type ChildRunHandle, ChildRuns, spawnChildRun } from "../services/child-runs";
 import type { Shard } from "./sharded";
 
@@ -65,9 +69,10 @@ export const fanOut = <T>(opts: {
   readonly toInstanceId?: (item: T, shard: Shard) => string;
   /** Max concurrent spawns. Default: all at once (spawn is a cheap create). */
   readonly concurrency?: number;
-}): Effect.Effect<readonly ChildRunHandle[], ChildSpawnFailed, ChildRuns> => {
+}): Effect.Effect<readonly ChildRunHandle[], ChildSpawnFailed | RunSkipped, ChildRuns> => {
   const total = opts.items.length;
-  return Effect.forEach(
+  if (total === 0) return Effect.succeed([]);
+  const spawnAll = Effect.forEach(
     opts.items.map((item, i): FanOutShard<T> => ({
       item,
       shard: { index: i + 1, total },
@@ -78,6 +83,7 @@ export const fanOut = <T>(opts: {
         input: opts.toInput(item, shard),
         ...(opts.toInstanceId !== undefined ? { instanceId: opts.toInstanceId(item, shard) } : {}),
       }),
-    { concurrency: opts.concurrency ?? (total === 0 ? 1 : total) },
+    { concurrency: opts.concurrency ?? total },
   );
+  return Effect.flatMap(ChildRuns, (c) => c.spendGate(opts.run)).pipe(Effect.andThen(spawnAll));
 };

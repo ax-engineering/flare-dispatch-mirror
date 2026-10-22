@@ -912,6 +912,23 @@ describe("contextful-gate", () => {
       }).pipe(Effect.provide(layer));
     });
 
+    it.effect("spawns no part once the monthly spend budget is reached, and skips", () => {
+      const reason = "spend budget reached: $90.00 of $90.00 this month";
+      const { layer, handles } = makeCFRuntimeTest({
+        config: { "contextful-gate.window:fractalboxdev/contextful": "1" },
+        sandboxProgram: three,
+        childRuns: { spendClosed: reason },
+      });
+      return Effect.gen(function* () {
+        const failure = yield* Effect.flip(contextfulGate.run(input));
+        expect(failure).toMatchObject({ _tag: "RunSkipped", reason: `${reason} — 3 of 3 parts not run` });
+        expect(handles.childRuns.spawned).toHaveLength(0);
+        expect(cancelledChecks(handles)).toEqual(["pins", "workspace.compile", "formal"].map((stage) => ({
+          name: `flare-dispatch/check:${stage}`, conclusion: "cancelled", summary: `not run — ${reason}`,
+        })));
+      }).pipe(Effect.provide(layer));
+    });
+
     it.effect("keeps spawning after an ordinary red part", () => {
       const { layer, handles } = makeCFRuntimeTest({
         config: { "contextful-gate.window:fractalboxdev/contextful": "1" },

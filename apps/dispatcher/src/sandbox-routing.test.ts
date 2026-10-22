@@ -55,13 +55,37 @@ const POOL_CLASS = { lean: "RunSandbox", browser: "RunSandboxBrowser", agent: "R
 const bound = { RUNS_SANDBOX_BROWSER: browser, RUNS_SANDBOX_AGENT: agent, RUNS_SANDBOX_RELEASE: release };
 
 describe("selectAdmission — the pool a run is metered against and its slot cap", () => {
-  it("admits no pool past its container's max_instances under the committed vars", () => {
+  it("keeps every pool's cap below its container's max_instances under the committed vars", () => {
     for (const image of ["lean", "browser", "agent", "release"] as const) {
       const { pool, cap } = selectAdmission(image, { ...wrangler.vars, ...bound });
       expect(pool).toBe(image);
       const container = wrangler.containers.find((entry) => entry.class_name === POOL_CLASS[pool])!;
-      expect(cap, `${pool} pool`).toBeLessThanOrEqual(container.max_instances);
+      expect(cap, `${pool} pool`).toBeLessThan(container.max_instances);
     }
+  });
+
+  it("keeps every pool's cap below its container's max_instances on the code defaults", () => {
+    for (const image of ["lean", "browser", "agent", "release"] as const) {
+      const { pool, cap } = selectAdmission(image, bound);
+      const container = wrangler.containers.find((entry) => entry.class_name === POOL_CLASS[pool])!;
+      expect(cap, `${pool} pool`).toBeLessThan(container.max_instances);
+    }
+  });
+
+  it("meters every sandbox container class as one pool", () => {
+    const sandboxClasses = wrangler.containers
+      .map((entry) => entry.class_name)
+      .filter((name) => name.startsWith("RunSandbox"))
+      .sort();
+    expect(sandboxClasses).toEqual(Object.values(POOL_CLASS).sort());
+  });
+
+  it("caps the browser pool by ADMISSION_CAP_BROWSER", () => {
+    expect(wrangler.vars.ADMISSION_CAP_BROWSER).toBeDefined();
+    expect(selectAdmission("browser", { ADMISSION_CAP: "16", ADMISSION_CAP_BROWSER: "4", ...bound })).toEqual({
+      pool: "browser",
+      cap: 4,
+    });
   });
 
   it("caps the release and agent pools at their eight containers", () => {

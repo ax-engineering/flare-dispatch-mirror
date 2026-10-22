@@ -310,12 +310,13 @@ describe("contextful-release", () => {
   const releaseFixture = (
     status: (cell: Cell, poll: number, now: number, attempt: number) => Verdict,
     existing: readonly string[] = [],
+    spendClosed?: () => string | undefined,
   ) => {
     let spawned: readonly { readonly input: unknown; readonly instanceId: string }[] = [];
     let now = 0;
     const runtime = makeCFRuntimeTest({
       github: { files: { [`${repo}:Cargo.toml`]: '[workspace.package]\nversion = "0.5.0"\n' } },
-      childRuns: { existing, pollFn: (ids, poll) => ids.map((id) => {
+      childRuns: { existing, ...(spendClosed !== undefined ? { spendClosed } : {}), pollFn: (ids, poll) => ids.map((id) => {
         if (id.startsWith("contextful-release-formula")) {
           return { executionId: id, status: "success", summaryJson: JSON.stringify({ assets: FORMULA_ASSETS,
             notes: "## Consumer compatibility\n" }) };
@@ -422,6 +423,45 @@ describe("contextful-release", () => {
       expect(cellsOf(handles)).toHaveLength(8);
       expect(cellsOf(handles).some((cell) => cell.startsWith("contextful-control/"))).toBe(false);
       expect(handles.childRuns.spawned.some((child) => child.run === "contextful-release-formula")).toBe(false);
+    }).pipe(Effect.provide(layer));
+  });
+
+  const skipOf = (exit: Exit.Exit<unknown, unknown>) => {
+    if (!Exit.isFailure(exit)) return undefined;
+    const failure = Option.getOrUndefined(Cause.failureOption(exit.cause)) as
+      { _tag?: string; reason?: string } | undefined;
+    expect(failure?._tag).toBe("RunSkipped");
+    return failure?.reason;
+  };
+  const budgetReason = "spend budget reached: $90.00 of $90.00 this month";
+
+  it.effect("a budget closed before the first spawn starts no cell and skips the release", () => {
+    const { layer, handles, provideClock } = releaseFixture(() => "success", [], () => budgetReason);
+    return Effect.gen(function* () {
+      const exit = yield* Effect.exit(provideClock(contextfulRelease.run({ repo, tag: "v0.5.0", sha, dryRun: true })));
+      expect(skipOf(exit)).toBe(`${budgetReason} — 10 of 10 release cells not started`);
+      expect(handles.childRuns.spawned).toHaveLength(0);
+      expect(handles.childRuns.admissionHandoffs).toBe(0);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("a budget that closes mid-release starts no further cell, lets the running ones settle, then skips", () => {
+    // The first window spawns; the budget is closed for every later spawn.
+    let gateCalls = 0;
+    const { layer, handles, provideClock } = releaseFixture(
+      (cell, poll) => (cell.profile === "contextful-full" && cell.target === "x86_64-unknown-linux-musl") || poll >= 3
+        ? "success" : "running",
+      [],
+      () => (gateCalls++ === 0 ? undefined : budgetReason),
+    );
+    return Effect.gen(function* () {
+      const exit = yield* Effect.exit(provideClock(contextfulRelease.run({ repo, tag: "v0.5.0", sha, dryRun: true })));
+      expect(skipOf(exit)).toBe(`${budgetReason} — 2 of 10 release cells not started`);
+      expect(cellsOf(handles)).toHaveLength(8);
+      expect(handles.childRuns.spawned.some((child) => child.run === "contextful-release-formula")).toBe(false);
+      // Every running cell was awaited to its terminal poll before the release ended.
+      const awaits = stepNames(handles).filter((name) => name.startsWith("await-cells-"));
+      expect(awaits.length).toBeGreaterThan(1);
     }).pipe(Effect.provide(layer));
   });
 

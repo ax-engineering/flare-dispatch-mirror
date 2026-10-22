@@ -61,6 +61,9 @@ import { getSandbox } from "@cloudflare/sandbox";
 import { Duration, Effect, Exit, identity, Runtime, Schedule, Schema } from "effect";
 import {
   admissionAcquireAttempts,
+  ADMISSION_CLASS_DEFAULT,
+  admissionJitterMs,
+  admissionPollSleepMs,
   AdmissionTimedOut,
   Checks,
   decideAdmission,
@@ -72,7 +75,10 @@ import {
   isEngineInterruptedCause,
   isEngineInterruption,
   withRunCeiling,
-  type RunSkipped,
+  RunSkipped,
+  spendCeilingReason,
+  type AdmissionObservation,
+  type SpendLimits,
   type RunContext,
   type RunError,
 } from "@fractalboxdev/flare-dispatch-core";
@@ -84,6 +90,7 @@ import {
   type ChecksGithubConfig,
   describeOutcome,
   type EmailCloudflareConfig,
+  hourlyRateForSandboxImage,
   instanceForSandboxImage,
   LEASE_HEARTBEAT_EVERY_MS,
   makeCFRuntimeLive,
@@ -94,9 +101,13 @@ import {
   makeSerialQueueD1,
   makeWritebackTokenMinter,
   previewSafeSandboxId,
+  readSpendLimits,
+  readSpendStatus,
   recordExecutionCost,
   runSerialGate,
   runWriteback,
+  type SpendStatus,
+  warnSpendOnce,
   type WritebackOutcome,
 } from "@fractalboxdev/flare-dispatch-runtime-cf";
 import { WRITEBACK_ARTIFACT } from "@fractalboxdev/flare-dispatch-core";
@@ -434,9 +445,10 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
     // selection above (browser/agent/release image without a bound container
     // degrades to lean), so a run is always metered against the pool whose
     // container it will actually consume — and that pool's slot cap: the plain
-    // `ADMISSION_CAP` wrangler var (unset/unparsable → 16), and for the agent
-    // and release pools the smaller of that and `ADMISSION_CAP_AGENT` /
-    // `ADMISSION_CAP_RELEASE` (unset → 8). Keep every cap ≤ its container's
+    // `ADMISSION_CAP` wrangler var (unset/unparsable → 16), and for the agent,
+    // browser and release pools the smaller of that and `ADMISSION_CAP_AGENT` /
+    // `ADMISSION_CAP_BROWSER` / `ADMISSION_CAP_RELEASE` (unset → 8, 16, 8).
+    // Keep every cap ≤ its container's
     // `max_instances` (sandbox-routing.test.ts reads wrangler.jsonc to check).
     const { pool: admissionPool, cap: admissionCap } = selectAdmission(run.sandboxImage, this.env);
 
@@ -614,6 +626,17 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
       // The `Workflow` binding backs the `childRuns` capability — a run can
       // `spawnChildRun` / `fanOut` to independent child `RunWorkflow` instances.
       runsWorkflow: this.env.RUNS_WORKFLOW,
+      // A fan-out parent reads spend before it spawns children: over the
+      // monthly budget it skips and spawns none (ADR-0006). `fanOut` calls
+      // this inside its spawn step, so a replay reads the checkpoint.
+      spendGate: async () => {
+        const status = await Effect.runPromise(
+          readSpendLimits(this.env.CONFIG_KV, this.env).pipe(
+            Effect.flatMap((limits) => readSpendStatus(this.env.RUNS_METADATA, limits, Date.now())),
+          ),
+        );
+        return status.decision._kind === "closed" ? status.decision.reason : undefined;
+      },
       executionId: payload.executionId,
       execution: {
         repo: payload.github.repo,
@@ -878,17 +901,74 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
           });
           return yield* Effect.fail(error);
         });
+      // --- Spend guard (specs/adr/0006-spend-guard.md) -----------------------
+      //
+      // Admission reads month-to-date spend before it enqueues and again
+      // before each claim; at or over the monthly budget the run ends
+      // `RunSkipped` — a neutral check, a `skipped` row. The claim itself
+      // enforces the burn ceiling across every pool, at this run's container
+      // class rate. Every read sits in a `step.do`, so a replay reads the
+      // checkpointed answer.
+      const hourlyRateMicroUsd = hourlyRateForSandboxImage(admissionPool);
+      const spendCheck = (name: string, limits: SpendLimits) =>
+        Effect.gen(function* () {
+          const status: SpendStatus = yield* stepDo(name, () =>
+            Effect.runPromise(readSpendStatus(db, limits, Date.now())),
+          );
+          if (status.decision._kind === "closed") {
+            yield* Effect.logWarning(`spend.closed ${payload.executionId} — ${status.decision.reason}`);
+            return yield* Effect.fail(new RunSkipped({ reason: status.decision.reason }));
+          }
+          return status;
+        });
       const admissionGate: Effect.Effect<void, AdmissionTimedOut | RunSkipped> = Effect.gen(function* () {
+        const limits = yield* stepDo("spend-limits", () =>
+          Effect.runPromise(readSpendLimits(env.CONFIG_KV, env)),
+        );
+        let spend = yield* spendCheck("spend-check-enqueue", limits);
+        const burnMaxMicroUsdPerHour = limits.burnMaxMicroUsdPerHour;
+        // The run's admission class (ADR-0009): interactive waiters are
+        // admitted ahead of batch ones in the same pool. The burn ceiling
+        // applies to both and never reorders the line.
+        const claimer = makeRunAdmissionD1(
+          db,
+          Date.now,
+          admissionCap,
+          { hourlyRateMicroUsd, burnMaxMicroUsdPerHour },
+          run.limits.admissionClass ?? ADMISSION_CLASS_DEFAULT,
+        );
+        // A queue timeout while the burn ceiling, not the pool cap, held the
+        // run back is a spend skip; under the cap alone it stays a failure.
+        const queueTimeout = (
+          observed: AdmissionObservation & { readonly now: number },
+          timedOut: AdmissionTimedOut,
+        ): Effect.Effect<never, AdmissionTimedOut | RunSkipped> =>
+          observed.ceilingHeld === true && burnMaxMicroUsdPerHour !== null
+            ? Effect.fail(
+                new RunSkipped({
+                  reason: spendCeilingReason({
+                    admittedMicroUsdPerHour: spend.reading.admittedMicroUsdPerHour,
+                    ownMicroUsdPerHour: hourlyRateMicroUsd,
+                    burnMaxMicroUsdPerHour,
+                  }),
+                }),
+              )
+            : admissionTimedOut(timedOut, enqueuedAt, observed.now);
+
         // Enqueue — the row's `enqueued_at` (FIFO key + dispatch-age basis)
         // is read inside the step, so a replay sees the SAME timestamp.
         const { enqueuedAt } = yield* stepDo("admission-enqueue", () =>
           Effect.runPromise(
-            admissions.enqueue(payload.executionId, admissionPool, payload.parentExecutionId),
+            claimer.enqueue(payload.executionId, admissionPool, payload.parentExecutionId),
           ),
         );
 
         // Bounded claim/sleep loop uses a count, so the bound is replay-stable
-        // and trivial against the Workflows step cap (#83 precedent).
+        // and trivial against the Workflows step cap (#83 precedent). Each
+        // attempt is three steps (spend check, claim, sleep). The count is
+        // derived from the SHORTEST sleep, so it covers the queue age however
+        // the sleeps scale; a waiter sleeping longer reaches the age limit,
+        // read inside its claim step, in fewer attempts.
         const maxAttempts = admissionAcquireAttempts(
           admissionMaxQueueAgeMs,
           ADMISSION_POLL_EVERY_MS,
@@ -899,12 +979,13 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
           // A child reads its parent's row before each claim: once a parent
           // that joins its children has ended, the child leaves the queue
           // instead (admission-parent.ts).
+          spend = yield* spendCheck(`spend-check-${i}`, limits);
           const observed = yield* stepDo(`admission-claim-${i}`, () =>
             claimUnlessParentEnded({
               parentExecutionId: payload.parentExecutionId,
               parentRow: (id) => Effect.runPromise(supersessions.row(id)),
               joinsChildren: (name) => lookupRun(name)?.joinsChildren === true,
-              claim: () => Effect.runPromise(admissions.attempt(payload.executionId, admissionPool, enqueuedAt)),
+              claim: () => Effect.runPromise(claimer.attempt(payload.executionId, admissionPool, enqueuedAt)),
             }),
           );
           if (isParentEnded(observed)) {
@@ -941,16 +1022,42 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
             admissionMaxQueueAgeMs,
           );
 
-          if (decision._kind === "admit") return;
+          if (decision._kind === "admit") {
+            // The month's one warning, past `SPEND_WARN_RATIO` of the budget.
+            const status = spend;
+            yield* stepDo("spend-warn", () =>
+              Effect.runPromise(
+                warnSpendOnce({
+                  kv: env.CONFIG_KV,
+                  status,
+                  notify: async (text, monthKey) => {
+                    const sent = await emitSlackNotice(env, {
+                      useCase: "spend-warn",
+                      deliveryId: `spend-warn-${monthKey}`,
+                      text,
+                      run: payload.run,
+                      executionId: payload.executionId,
+                    });
+                    if (sent.outcome === "failed") throw new Error(sent.reason);
+                  },
+                }),
+              ),
+            );
+            // Spread a burst of admissions over up to two seconds before the
+            // container starts (ADR-0009). Derived from the execution id and
+            // slept durably, so a replay neither re-draws nor re-sleeps it.
+            const jitterMs = admissionJitterMs(payload.executionId);
+            if (jitterMs > 0) yield* stepSleep("admission-jitter", jitterMs);
+            return;
+          }
           if (decision._kind === "timeout") {
-            return yield* admissionTimedOut(
+            return yield* queueTimeout(
+              observed,
               new AdmissionTimedOut({
                 queuedForMs: decision.queuedForMs,
                 position: decision.position,
                 poolBusy: decision.poolBusy,
               }),
-              enqueuedAt,
-              observed.now,
             );
           }
 
@@ -982,19 +1089,29 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
               );
           }
 
-          // Durable, free hibernation between polls. Don't sleep after the
-          // final attempt — fall straight through to timeout.
+          // Durable, free hibernation between polls, scaled with the position
+          // the claim step observed (ADR-0008): 20 s at the head, up to 60 s
+          // several slots back, never past the age limit by more than one
+          // 20 s poll. Both inputs are checkpointed, so a replay sleeps the
+          // same length. Don't sleep after the final attempt — fall straight
+          // through to timeout.
           if (i < maxAttempts - 1) {
-            yield* stepSleep(`admission-wait-${i}`, ADMISSION_POLL_EVERY_MS);
+            yield* stepSleep(
+              `admission-wait-${i}`,
+              admissionPollSleepMs(
+                decision.position,
+                admissionCap,
+                enqueuedAt + admissionMaxQueueAgeMs - observed.now,
+              ),
+            );
           } else {
-            return yield* admissionTimedOut(
+            return yield* queueTimeout(
+              observed,
               new AdmissionTimedOut({
                 queuedForMs: Math.max(0, observed.now - enqueuedAt),
                 position: decision.position,
                 poolBusy: decision.poolBusy,
               }),
-              enqueuedAt,
-              observed.now,
             );
           }
         }
@@ -1343,13 +1460,14 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
 
       // Per-execution cost rollup — METERED model tokens (summed from
       // `execution_model_usage`, written by the modelGateway wrapper) + MODELED
-      // container compute (instance × wall-time). Runs AFTER finishExecution so
-      // the wall-time it reads is complete. Best-effort: a cost failure logs and
-      // never flips the verdict (recordExecutionCost absorbs its own errors).
+      // container compute (the admission pool's instance list rate × admitted
+      // seconds, ADR-0006 § Meter). Runs AFTER finishExecution so the window
+      // it reads is closed. Best-effort: a cost failure logs and never flips
+      // the verdict (recordExecutionCost absorbs its own errors).
       yield* recordExecutionCost({
         db,
         executionId: payload.executionId,
-        instance: instanceForSandboxImage(run.sandboxImage),
+        instance: instanceForSandboxImage(admissionPool),
       });
 
       // --- Post-run writeback (the Worker proposes the diff as a PR) --------

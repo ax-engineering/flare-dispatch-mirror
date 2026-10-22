@@ -1,7 +1,7 @@
 import { Effect, Schema } from "effect";
 import {
   AcceptanceFailed, artifact, checkpointSleep, defineRun, GitHubApiError, github, handoffChildAdmission, io,
-  isTerminalChildStatus, sandbox, step, StepFailed, type ChildStatusRecord,
+  isTerminalChildStatus, RunSkipped, sandbox, step, StepFailed, type ChildStatusRecord,
 } from "@fractalboxdev/flare-dispatch-core";
 import {
   DURABLE_EXEC_RETRY_ON, durableExec, ensureWorkspace, fanOut, waitForAnyChildDurably, waitForChildren, workspace,
@@ -436,15 +436,21 @@ export const contextfulRelease = defineRun({
     const timedOut = new Set<number>();
     const cellFailed = (child: ChildStatusRecord) => child.status !== "success" || !child.summaryJson;
     let spawned = 0;
+    // The monthly budget closing at a spawn (specs/adr/0006-spend-guard.md)
+    // stops the window like a failed cell: no further cell starts, and the
+    // running ones settle before the release ends skipped.
+    let budgetClosed: string | undefined;
     for (let round = 0; queue.length > 0 || running.length > 0; round++) {
-      const failed = timedOut.size > 0 || [...settledByCell.values()].some(cellFailed);
+      const failed = budgetClosed !== undefined || timedOut.size > 0 || [...settledByCell.values()].some(cellFailed);
       const free = RELEASE_WINDOW - running.length;
       // After a failure no further cell starts; the running ones settle or
       // outlive their budget, so the verdict names every failed cell. They
       // write to the same draft release, so the parent never ends before them.
       if (!failed && queue.length > 0 && free > 0) {
-        const batch = queue.splice(0, free);
-        const { handles, spawnedAt } = yield* step(`spawn-cells-${spawned}`, () => Effect.gen(function* () {
+        const batch = queue.slice(0, free);
+        // The skip is caught inside the step, so it checkpoints as an answer
+        // rather than a failure the platform retries.
+        const spawn = yield* step(`spawn-cells-${spawned}`, () => Effect.gen(function* () {
           const handles = yield* fanOut({
             run: contextfulReleaseCell.name,
             items: batch,
@@ -453,7 +459,14 @@ export const contextfulRelease = defineRun({
               releaseId: release.id, dryRun, ...(attempt > 0 ? { attempt } : {}) }),
           });
           return { handles, spawnedAt: yield* io.now };
-        }));
+        }).pipe(Effect.catchTag("RunSkipped", (skip) => Effect.succeed({ budgetClosed: skip.reason }))));
+        if ("budgetClosed" in spawn) {
+          budgetClosed = spawn.budgetClosed;
+          if (running.length === 0) break;
+          continue;
+        }
+        const { handles, spawnedAt } = spawn;
+        queue.splice(0, batch.length);
         if (spawned === 0) yield* step("handoff-admission", () => handoffChildAdmission());
         batch.forEach(({ cell, attempt }, index) => running.push({
           index: CELLS.indexOf(cell),
@@ -499,6 +512,11 @@ export const contextfulRelease = defineRun({
       const child = settledByCell.get(index);
       return child !== undefined && cellFailed(child);
     });
+    if (budgetClosed !== undefined && failedCells.length === 0 && timedOut.size === 0) {
+      return yield* Effect.fail(new RunSkipped({
+        reason: `${budgetClosed} — ${queue.length} of ${CELLS.length} release cells not started`,
+      }));
+    }
     if (failedCells.length > 0 || timedOut.size > 0) {
       // A typed failure, not a defect: the check-run renders `summaryMd`, so
       // the verdict names every failed, timed-out and unstarted cell there.
@@ -507,7 +525,7 @@ export const contextfulRelease = defineRun({
       const verdict = [
         ["Failed", failedCells],
         ["Timed out", CELLS.filter((_, index) => timedOut.has(index))],
-        ["Not started", queue.map(({ cell }) => cell)],
+        [budgetClosed === undefined ? "Not started" : `Not started (${budgetClosed})`, queue.map(({ cell }) => cell)],
       ] as const;
       return yield* Effect.fail(new AcceptanceFailed({ exitCode: 1, summaryMd: `**Release cells**\n\n${verdict
         .filter(([, cells]) => cells.length > 0)
@@ -528,11 +546,15 @@ export const contextfulRelease = defineRun({
         return yield* Effect.die(new Error("release tag moved during build"));
       }
     }
-    const formulaHandle = yield* step("spawn-formula", () => fanOut({ run: contextfulReleaseFormula.name,
+    const formulaSpawn = yield* step("spawn-formula", () => fanOut({ run: contextfulReleaseFormula.name,
       items: [JSON.stringify(manifests)],
       toInput: (manifestJson) => ({ repo: input.repo, tag: input.tag, sha: tag.commitSha,
         releaseId: release.id, dryRun, manifests: manifestJson }),
-    }));
+    }).pipe(Effect.catchTag("RunSkipped", (skip) => Effect.succeed({ budgetClosed: skip.reason }))));
+    if ("budgetClosed" in formulaSpawn) {
+      return yield* Effect.fail(new RunSkipped({ reason: `${formulaSpawn.budgetClosed} — release formula not started` }));
+    }
+    const formulaHandle = formulaSpawn;
     const formulaChildren = yield* step("await-formula", () => waitForChildren({
       ids: formulaHandle.map((handle) => handle.executionId), timeout: "8 hours",
     }));

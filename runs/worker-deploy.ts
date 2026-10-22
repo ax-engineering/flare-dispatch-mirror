@@ -334,6 +334,8 @@ export const workerDeploy = defineRun({
 
   limits: {
     maxDurationSec: 1800,
+    // A deploy someone waits on: admitted ahead of batch work.
+    admissionClass: "interactive",
   },
 
   run: (input) =>

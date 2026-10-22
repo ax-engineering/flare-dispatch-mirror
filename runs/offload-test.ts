@@ -511,6 +511,8 @@ export const offloadTest = defineRun({
     // dispatcher. One documented 1800 s exec plus checkout, install and
     // upload fits; aligned retries of that exec do not (issue #42).
     maxDurationSec: 3600,
+    // A PR verdict someone waits on: admitted ahead of batch work.
+    admissionClass: "interactive",
   },
 
   run: (input) =>

@@ -12,16 +12,26 @@ import { makeTestBindings, type TestBindings } from "./test-support-workers";
 
 const EXEC = "01TEST0000000000000000COST";
 
-/** Insert a finished executions row spanning `wallMs` of wall-time. */
-const seedExecution = (db: D1Database, id: string, wallMs: number) =>
-  db
+/**
+ * Insert a finished executions row admitted `activeMs` before it completed,
+ * after `queuedMs` in the admission queue (`admittedAt: null` = never admitted).
+ */
+const seedExecution = (
+  db: D1Database,
+  id: string,
+  activeMs: number,
+  opts: { readonly queuedMs?: number; readonly admitted?: boolean } = {},
+) => {
+  const admittedAt = 1000 + (opts.queuedMs ?? 0);
+  return db
     .prepare(
       `INSERT INTO executions
-         (id, run, repo, ref, sha, status, started_at, completed_at, input_json)
-       VALUES (?, 'pr-review', 'owner/name', 'refs/heads/main', 'abc', 'success', 1000, ?, '{}')`,
+         (id, run, repo, ref, sha, status, started_at, admitted_at, completed_at, input_json)
+       VALUES (?, 'pr-review', 'owner/name', 'refs/heads/main', 'abc', 'success', 1000, ?, ?, '{}')`,
     )
-    .bind(id, 1000 + wallMs)
+    .bind(id, opts.admitted === false ? null : admittedAt, admittedAt + activeMs)
     .run();
+};
 
 const seedUsage = (
   db: D1Database,
@@ -50,8 +60,9 @@ describe("recordExecutionCost", () => {
   });
 
   it("rolls up metered model tokens + modeled container compute as 'mixed'", async () => {
-    // 480s wall on standard-2 → 16_800 µ$ modeled container; sonnet 20k in /
-    // 2k out → 20000×3 + 2000×15 = 90_000 µ$ metered model.
+    // 480s admitted on standard-2 → 17_203 µ$ modeled container (vCPU +
+    // memory + disk); sonnet 20k in / 2k out → 20000×3 + 2000×15 = 90_000 µ$
+    // metered model.
     await seedExecution(bindings.db, EXEC, 480_000);
     await seedUsage(bindings.db, EXEC, "anthropic/claude-sonnet-4-6", 20_000, 2_000, 1);
 
@@ -68,7 +79,7 @@ describe("recordExecutionCost", () => {
       .first<Record<string, unknown>>();
 
     expect(row).toMatchObject({
-      cost_micro_usd: 106_800, // 16_800 container + 90_000 model
+      cost_micro_usd: 107_203, // 17_203 container + 90_000 model
       cost_basis: "mixed",
       input_tokens: 20_000,
       output_tokens: 2_000,
@@ -92,10 +103,41 @@ describe("recordExecutionCost", () => {
       .bind(EXEC)
       .first<Record<string, unknown>>();
 
-    expect(row).toMatchObject({ cost_micro_usd: 16_800, cost_basis: "modeled" });
+    expect(row).toMatchObject({ cost_micro_usd: 17_203, cost_basis: "modeled" });
     expect(row?.input_tokens).toBeNull();
     expect(row?.output_tokens).toBeNull();
     expect(row?.model).toBeNull();
+  });
+
+  it("prices admission to completion: queue wait costs nothing, and the row reads admitted-active", async () => {
+    // 10 minutes queued, then 480 s admitted on standard-4.
+    await seedExecution(bindings.db, EXEC, 480_000, { queuedMs: 600_000 });
+
+    await Effect.runPromise(
+      recordExecutionCost({ db: bindings.db, executionId: EXEC, instance: "standard-4" }),
+    );
+
+    const row = await bindings.db
+      .prepare(`SELECT cost_micro_usd, cost_meter, vcpu_seconds FROM executions WHERE id = ?`)
+      .bind(EXEC)
+      .first<{ cost_micro_usd: number; cost_meter: string; vcpu_seconds: number }>();
+    // (4 × 20 + 12 × 2.5 + 20 × 0.07) µ$/s × 480 s = 111.4 × 480.
+    expect(row).toMatchObject({ cost_micro_usd: 53_472, cost_meter: "admitted-active" });
+    expect(row?.vcpu_seconds).toBeCloseTo(1920, 3);
+  });
+
+  it("charges no container time to an execution never admitted", async () => {
+    await seedExecution(bindings.db, EXEC, 480_000, { admitted: false });
+
+    await Effect.runPromise(
+      recordExecutionCost({ db: bindings.db, executionId: EXEC, instance: "standard-4" }),
+    );
+
+    const row = await bindings.db
+      .prepare(`SELECT cost_micro_usd FROM executions WHERE id = ?`)
+      .bind(EXEC)
+      .first<{ cost_micro_usd: number }>();
+    expect(row?.cost_micro_usd).toBe(0);
   });
 
   it("upsert-SUM accumulates a same-model fan-out (no double-count on the PK)", async () => {

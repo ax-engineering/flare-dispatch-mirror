@@ -35,6 +35,7 @@ import {
   ChildSpawnFailed,
   type ChildStatusRecord,
   isTerminalChildStatus,
+  RunSkipped,
 } from "@fractalboxdev/flare-dispatch-core";
 import { makeRunAdmissionD1 } from "./run-admission-d1";
 
@@ -85,6 +86,14 @@ export type ChildRunsLiveConfig = {
    * Workflow has no request to infer it from). Absent → relative paths.
    */
   readonly origin?: string;
+  /**
+   * The deploy's monthly-budget read (ADR-0006): resolves the `RunSkipped`
+   * reason when month-to-date spend is at or over the budget, `undefined`
+   * while it is open; rejects when spend is unreadable. The dispatcher wires
+   * it over D1 + `CONFIG_KV`. Absent = a runtime with no spend guard, the
+   * same as an `unlimited` budget.
+   */
+  readonly spendGate?: () => Promise<string | undefined>;
 };
 
 /** Map a raw `executions.status` cell to the capability's `ChildRunStatus`. */
@@ -154,7 +163,19 @@ export const deriveChildInstanceId = (opts: {
 
 /** Build the live `ChildRuns` Layer bound to a CF `Workflow` binding. */
 export const makeChildRunsLive = (cfg: ChildRunsLiveConfig): Layer.Layer<ChildRuns> => {
+  const spendGate = cfg.spendGate;
   const service: ChildRunsService = {
+    spendGate: (run) =>
+      spendGate === undefined
+        ? Effect.void
+        : Effect.tryPromise({
+            try: spendGate,
+            catch: (cause) => new ChildSpawnFailed({ run, instanceId: "spend-gate", cause }),
+          }).pipe(
+            Effect.flatMap((closed) =>
+              closed === undefined ? Effect.void : Effect.fail(new RunSkipped({ reason: closed })),
+            ),
+          ),
     handoffAdmission: () =>
       makeRunAdmissionD1(cfg.db).release(cfg.parentExecutionId).pipe(Effect.orDie),
     spawn: ({ run, input, instanceId }) => {

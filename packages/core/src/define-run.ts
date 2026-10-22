@@ -9,12 +9,19 @@
 import type { Effect, Schema } from "effect";
 import type { RunContext } from "./context";
 import type { RunError } from "./errors";
+import type { AdmissionClass } from "./run-admission";
 import type { WritebackSpec } from "./writeback";
 
 export type RunLimits<I = unknown> = {
   readonly maxDurationSec: number;
   /** Maximum admission wait; defaults to the dispatcher's standard queue age. */
   readonly admissionMaxQueueAgeSec?: number | ((input: I) => number);
+  /**
+   * The admission class this run waits in; `interactive` runs are admitted
+   * ahead of `batch` ones in the same pool. Defaults to `batch`
+   * (specs/adr/0009-fast-trustworthy-verdicts.md).
+   */
+  readonly admissionClass?: AdmissionClass;
   readonly maxConcurrency?: number;
   readonly requiresBrowser?: boolean;
 };

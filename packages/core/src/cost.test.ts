@@ -5,11 +5,13 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  CONTAINER_DISK_MICRO_USD_PER_SEC,
   CONTAINER_GIB_MICRO_USD_PER_SEC,
   CONTAINER_VCPU_MICRO_USD_PER_SEC,
   INSTANCE_SPECS,
   MICRO_USD_PER_USD,
   containerCostMicroUsd,
+  containerMicroUsdPerHour,
   estimateExecutionCost,
   formatMicroUsd,
   microUsdToUsd,
@@ -18,13 +20,25 @@ import {
 } from "./cost.js";
 
 describe("rate card (pinned to specs/06-cost.md)", () => {
-  it("standard-2 is 1 vCPU / 6 GiB", () => {
-    expect(INSTANCE_SPECS["standard-2"]).toEqual({ vcpu: 1, gib: 6 });
+  it("standard-2 is 1 vCPU / 6 GiB / 12 GB disk", () => {
+    expect(INSTANCE_SPECS["standard-2"]).toEqual({ vcpu: 1, gib: 6, diskGb: 12 });
   });
 
-  it("basic is 1/4 vCPU / 1 GiB and standard-3 is 2 vCPU / 8 GiB", () => {
-    expect(INSTANCE_SPECS.basic).toEqual({ vcpu: 1 / 4, gib: 1 });
-    expect(INSTANCE_SPECS["standard-3"]).toEqual({ vcpu: 2, gib: 8 });
+  it("basic, standard-3 and standard-4 carry their provisioned disk", () => {
+    expect(INSTANCE_SPECS.basic).toEqual({ vcpu: 1 / 4, gib: 1, diskGb: 4 });
+    expect(INSTANCE_SPECS["standard-3"]).toEqual({ vcpu: 2, gib: 8, diskGb: 16 });
+    expect(INSTANCE_SPECS["standard-4"]).toEqual({ vcpu: 4, gib: 12, diskGb: 20 });
+  });
+
+  it("disk is $0.00000007/GB-s in micro-USD", () => {
+    expect(CONTAINER_DISK_MICRO_USD_PER_SEC).toBe(0.07);
+  });
+
+  it("prices an hour on the provisioned size", () => {
+    // standard-4: 4 × 0.072 + 12 × 0.009 + 20 × 0.000252 = $0.40104/h.
+    expect(containerMicroUsdPerHour("standard-4")).toBe(401_040);
+    // standard-2: 0.072 + 6 × 0.009 + 12 × 0.000252 = $0.129024/h.
+    expect(containerMicroUsdPerHour("standard-2")).toBe(129_024);
   });
 
   it("container rates are $0.000020/vCPU-s and $0.0000025/GiB-s in micro-USD", () => {
@@ -35,17 +49,18 @@ describe("rate card (pinned to specs/06-cost.md)", () => {
 });
 
 describe("containerCostMicroUsd — spec-06 per-execution anatomy", () => {
-  it("standard-2 for an 8-minute run ≈ $0.0168 (the spec's ~$0.017 example)", () => {
+  it("standard-2 for an 8-minute run ≈ $0.0172 (the spec's ~$0.017 example)", () => {
     // specs/06-cost.md § Per-execution cost anatomy: a standard-2 (1 vCPU,
-    // 6 GiB) running 8 min (480 s) = ~$0.0096 vCPU + ~$0.0072 mem ≈ $0.0168.
+    // 6 GiB, 12 GB) running 8 min (480 s) = $0.0096 vCPU + $0.0072 mem +
+    // $0.000403 disk ≈ $0.0172.
     const micro = containerCostMicroUsd({ instance: "standard-2", activeSeconds: 480 });
-    expect(micro).toBe(16_800);
-    expect(microUsdToUsd(micro)).toBeCloseTo(0.0168, 6);
+    expect(micro).toBe(17_203);
+    expect(microUsdToUsd(micro)).toBeCloseTo(0.0172, 4);
   });
 
   it("scales linearly with active seconds", () => {
-    const a = containerCostMicroUsd({ instance: "standard-2", activeSeconds: 60 });
-    const b = containerCostMicroUsd({ instance: "standard-2", activeSeconds: 120 });
+    const a = containerCostMicroUsd({ instance: "standard-2", activeSeconds: 100 });
+    const b = containerCostMicroUsd({ instance: "standard-2", activeSeconds: 200 });
     expect(b).toBe(a * 2);
   });
 
@@ -144,7 +159,7 @@ describe("estimateExecutionCost — honesty basis", () => {
     });
     expect(cost.basis).toBe("modeled");
     expect(cost.modelMicroUsd).toBeNull();
-    expect(cost.totalMicroUsd).toBe(16_800);
+    expect(cost.totalMicroUsd).toBe(17_203);
   });
 
   it("metered model with no container → metered", () => {

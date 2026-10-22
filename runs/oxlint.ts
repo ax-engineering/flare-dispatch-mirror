@@ -204,6 +204,8 @@ export const oxlint = defineRun({
     // Wall-time ceiling — lint is cheap, but a cold `npx` fetch + a huge tree
     // gets headroom.
     maxDurationSec: 600,
+    // A PR verdict someone waits on: admitted ahead of batch work.
+    admissionClass: "interactive",
   },
 
   run: (input) =>

@@ -88,10 +88,12 @@
     // mutually exclusive). If the gateway has Authenticated Gateway turned on,
     // also set the AI_GATEWAY_AUTH_TOKEN secret. Operator overlay.
     "AI_GATEWAY_ID": "your-ai-gateway",
-    "ADMISSION_CAP": "16",
-    // The agent and release pools admit at most RunSandboxAgent's and
-    // RunSandboxRelease's max_instances.
+    "ADMISSION_CAP": "48",
+    // The agent, browser and release pools admit at most RunSandboxAgent's,
+    // RunSandboxBrowser's and RunSandboxRelease's max_instances. Each cap is an
+    // upper bound; SPEND_BURN_MAX_USD_PER_HOUR sets the operating concurrency.
     "ADMISSION_CAP_AGENT": "8",
+    "ADMISSION_CAP_BROWSER": "16",
     "ADMISSION_CAP_RELEASE": "8",
     // Opt the human-facing viewer surfaces (incl. the GitHub App install flow)
     // out of the Cloudflare Access gate for the initial dogfood. Configure
@@ -191,26 +193,26 @@
       "image_build_context": ".",
       "image_vars": { "WITH_BUILD_TOOLS": "true", "WITH_RUST": "true" },
       "instance_type": "standard-4",
-      "max_instances": 16,
+      "max_instances": 56,
     },
     {
       "class_name": "RunSandboxBrowser",
       "image": "./infra/Dockerfile.sandbox",
       "instance_type": "standard-2",
-      "max_instances": 16,
+      "max_instances": 24,
     },
     {
       "class_name": "RunSandboxAgent",
       "image": "./infra/Dockerfile.sandbox",
       "instance_type": "standard-3",
-      "max_instances": 8,
+      "max_instances": 16,
     },
     {
       "class_name": "RunSandboxRelease",
       "image": "./infra/Dockerfile.sandbox-release",
       "image_build_context": ".",
       "instance_type": "standard-4",
-      "max_instances": 8,
+      "max_instances": 16,
       // Every deploy pushes a new image and rolls every container. A rollout
       // replaces an active instance once this grace has passed, and a
       // replaced release container loses its build (`SandboxProcessLost`):

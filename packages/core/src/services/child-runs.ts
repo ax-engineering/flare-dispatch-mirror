@@ -23,7 +23,7 @@
 //       § Long-running test handling + § Platform limits.
 
 import { Context, Effect } from "effect";
-import type { ChildSpawnFailed } from "../errors";
+import type { ChildSpawnFailed, RunSkipped } from "../errors";
 
 /**
  * The result of a spawn. `executionId` and `instanceId` are equal — the
@@ -115,6 +115,14 @@ export const isTerminalChildStatus = (status: ChildRunStatus): boolean => TERMIN
 /** The service contract a runtime Layer implements. */
 export interface ChildRunsService {
   readonly spawn: (opts: SpawnChildRunOpts) => Effect.Effect<ChildRunHandle, ChildSpawnFailed>;
+  /**
+   * Read the deploy's month-to-date spend before a fan-out spawns children of
+   * `run` (ADR-0006 § Monthly budget). At or over the monthly budget it fails
+   * `RunSkipped` with the budget reason, and the parent spawns none; an
+   * unreadable spend fails `ChildSpawnFailed` rather than reading as open.
+   * Call it inside the spawn step, so a replay reads the checkpointed answer.
+   */
+  readonly spendGate: (run: string) => Effect.Effect<void, RunSkipped | ChildSpawnFailed>;
   /**
    * Release the parent's global admission slot after it has finished its own
    * sandbox work. A parent waiting on children must not occupy a slot that a
