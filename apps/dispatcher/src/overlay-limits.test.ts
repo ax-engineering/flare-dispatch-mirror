@@ -79,4 +79,64 @@ describe("mergeOverlayLimits", () => {
       { class_name: "RunSandboxBrowser" },
     ]);
   });
+
+  describe("Durable Objects", () => {
+    type Config = {
+      durable_objects?: { bindings: { name: string; class_name: string }[] };
+      migrations?: { tag: string; new_sqlite_classes?: string[] }[];
+    };
+    const tpl = `{
+      "durable_objects": { "bindings": [
+        { "name": "AGENT_BUDGET", "class_name": "AgentBudget" },
+        { "name": "COMPILE_CACHE_LEDGER", "class_name": "CompileCacheLedger" },
+      ] },
+      "migrations": [
+        { "tag": "v0", "new_sqlite_classes": ["AgentBudget"] },
+        { "tag": "v1", "new_sqlite_classes": ["CompileCacheLedger"] },
+      ],
+    }`;
+
+    it("adds a template binding the overlay lacks, with its migration, when the overlay's migrations lead the template's", () => {
+      const own = `{ "name": "x",
+        "durable_objects": { "bindings": [{ "name": "AGENT_BUDGET", "class_name": "AgentBudget" }] },
+        "migrations": [{ "tag": "v0", "new_sqlite_classes": ["AgentBudget"] }] }`;
+      const merged = parseJsonc(mergeOverlayLimits(tpl, own)) as Config;
+      expect(merged.durable_objects?.bindings.map((binding) => binding.name)).toEqual(["AGENT_BUDGET", "COMPILE_CACHE_LEDGER"]);
+      expect(merged.migrations?.map((migration) => migration.tag)).toEqual(["v0", "v1"]);
+    });
+
+    it("leaves an overlay whose migrations diverge from the template's unchanged", () => {
+      const own = `{ "name": "x",
+        "durable_objects": { "bindings": [{ "name": "AGENT_BUDGET", "class_name": "AgentBudget" }] },
+        "migrations": [{ "tag": "own-v0", "new_sqlite_classes": ["AgentBudget"] }] }`;
+      expect(parseJsonc(mergeOverlayLimits(tpl, own))).toEqual(parseJsonc(own));
+    });
+
+    it("keeps a binding the overlay already declares", () => {
+      const own = `{ "name": "x",
+        "durable_objects": { "bindings": [
+          { "name": "AGENT_BUDGET", "class_name": "AgentBudget" },
+          { "name": "COMPILE_CACHE_LEDGER", "class_name": "CompileCacheLedger" },
+        ] },
+        "migrations": [
+          { "tag": "v0", "new_sqlite_classes": ["AgentBudget"] },
+          { "tag": "v1", "new_sqlite_classes": ["CompileCacheLedger"] },
+        ] }`;
+      expect(parseJsonc(mergeOverlayLimits(tpl, own))).toEqual(parseJsonc(own));
+    });
+
+    it("carries the committed wrangler.jsonc's ledger into an overlay that predates it", () => {
+      const committed = parseJsonc(template) as Config;
+      const own = JSON.stringify({
+        name: "x",
+        durable_objects: {
+          bindings: committed.durable_objects!.bindings.filter((binding) => binding.name !== "COMPILE_CACHE_LEDGER"),
+        },
+        migrations: committed.migrations!.filter((migration) => !migration.new_sqlite_classes?.includes("CompileCacheLedger")),
+      });
+      const merged = parseJsonc(mergeOverlayLimits(template, own)) as Config;
+      expect(merged.durable_objects?.bindings).toContainEqual({ name: "COMPILE_CACHE_LEDGER", class_name: "CompileCacheLedger" });
+      expect(merged.migrations).toEqual(committed.migrations);
+    });
+  });
 });

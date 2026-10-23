@@ -61,6 +61,7 @@ import {
   COMPILE_CACHE_ENDPOINT_KEY,
   COMPILE_CACHE_TOKEN_KEY,
   durableExec,
+  isCompileCacheLane,
   ensureWorkspace,
   isRestorableEntry,
   loadSecrets,
@@ -135,6 +136,12 @@ const CheckInput = Schema.Struct({
    * injected token the command runs unwrapped.
    */
   compileCache: Schema.optional(Schema.Boolean),
+  /**
+   * The compile-cache lane the token writes (primitives/compile-cache.ts
+   * `CompileCacheLane`): `base` for a default-branch execution, `pr-<n>` for
+   * pull request `n`'s. Absent, the token reads `base` and writes nothing.
+   */
+  compileCacheLane: Schema.optional(Schema.String.pipe(Schema.filter(isCompileCacheLane))),
   /**
    * Non-sensitive env only. Dispatch inputs are persisted (executions row +
    * Workflow params) — never put credentials here. Same contract as
@@ -252,8 +259,10 @@ export const check = defineRun({
   // unlabelled dispatch resolves the same key, names the same check-run, and
   // gets the same instance id as under 1.0.0.
   // 1.2.0 — additive: `restore`. A dispatch without it runs as under 1.1.0.
+  // 1.4.0 — additive: `compileCacheLane`. A dispatch without it reads the
+  // compile cache and writes nothing.
   // 1.3.0 — additive: `compileCache`. A dispatch without it runs as under 1.2.0.
-  version: "1.3.0",
+  version: "1.4.0",
 
   inputs: CheckInput,
   outputs: CheckOutput,
@@ -296,7 +305,12 @@ export const check = defineRun({
   optIn: ({ input }) =>
     input.command !== undefined ? [] : commandKeys(input.repo, input.checkLabel),
 
-  compileCache: (input) => input.compileCache === true,
+  compileCache: (input) =>
+    input.compileCache === true
+      ? input.compileCacheLane !== undefined && isCompileCacheLane(input.compileCacheLane)
+        ? input.compileCacheLane
+        : "read-only"
+      : undefined,
 
   limits: {
     // Run-body wall-time ceiling, enforced by the dispatcher: one full 2700 s

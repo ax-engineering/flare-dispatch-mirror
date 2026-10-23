@@ -39,7 +39,9 @@ export {
   compileCacheEnv,
   COMPILE_CACHE_ENDPOINT_KEY,
   COMPILE_CACHE_TOKEN_KEY,
+  isCompileCacheLane,
   type CompileCacheAccess,
+  type CompileCacheLane,
 } from "./compile-cache";
 export { sharded, type Shard } from "./sharded";
 export { fanOut, type FanOutShard } from "./fan-out";

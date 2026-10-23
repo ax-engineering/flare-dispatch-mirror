@@ -22,6 +22,7 @@ import {
   prebuiltCommand,
   waitForAnyChildDurably,
   workspace,
+  type CompileCacheLane,
   type PrebuiltBinary,
 } from "@fractalboxdev/flare-dispatch-core/primitives";
 import { check } from "./check";
@@ -220,6 +221,13 @@ const Input = Schema.Struct({
 type InputType = Schema.Schema.Type<typeof Input>;
 
 /**
+ * The compile-cache lane a gate's parts write: `base` from a default-branch
+ * push, the pull request's own lane from a pull-request gate, and none
+ * (read-only) from a gate that names no pull request.
+ */
+export const compileCacheLane = (input: InputType): CompileCacheLane => (input.tier === "heavy" ? "base" : input.pr !== undefined ? `pr-${input.pr}` : "read-only");
+
+/**
  * A reopen ranks this far above its `updated_at`, past the close marker's
  * 1 ms (apps/dispatcher/src/pr-close.ts): GitHub reports `updated_at` to the
  * second, and a close and reopen in one second would otherwise leave the
@@ -336,11 +344,13 @@ export const planStages = (
 
 export const contextfulGate = defineRun({
   name: "contextful-gate",
+  // 1.5.0 — a part writes the compile cache's default-branch lane only from a
+  // default-branch push, and its own pull request's lane otherwise.
   // 1.4.0 — every part compiles through the shared compile cache.
   // 1.3.0 — two-tier gate: `gate.lightLabels:<repo>` splits light parts (pull
   // requests) from heavy parts (pushes to the default branch).
   // 1.2.2 — a reopen ranks above the close marker of its own second.
-  version: "1.4.0",
+  version: "1.5.0",
   inputs: Input,
   outputs: Output,
   triggers: [
@@ -638,6 +648,7 @@ export const contextfulGate = defineRun({
                   // cache (sccache over the dispatcher's compile-cache route)
                   // replaces each part's cold compile with cache reads.
                   compileCache: true,
+                  compileCacheLane: compileCacheLane(input),
                   ...(prebuilt === null
                     ? {}
                     : { restore: [{ key: prebuilt.key, base: prebuilt.base, paths: prebuilt.paths }] }),

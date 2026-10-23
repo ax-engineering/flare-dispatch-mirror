@@ -55,7 +55,7 @@ import {
   type UndeliveredRow,
 } from "../delivery-sweep";
 import { toInstanceId } from "../instance-id";
-import { COMPILE_CACHE_SWEEP_CRON, resolveCompileCacheLimits, sweepCompileCache } from "./compile-cache";
+import { COMPILE_CACHE_SWEEP_CRON, ledgersOf, resolveCompileCacheLimits, sweepCompileCache } from "./compile-cache";
 import { type ScheduleMatch, schedulesByCron } from "../registry";
 import type { Env } from "../env";
 
@@ -194,12 +194,15 @@ export const liveCompileCacheSweep =
   (env: Env): RunDeliverySweep =>
   async () => {
     try {
-      const result = await sweepCompileCache(env.RUNS_STORAGE, resolveCompileCacheLimits(env), Date.now());
+      const result = await sweepCompileCache(env.RUNS_STORAGE, resolveCompileCacheLimits(env), Date.now(), {
+        ledger: ledgersOf(env),
+      });
       for (const repo of result.repos) {
         console.info(
-          `[compile-cache-sweep] ${repo.repo} bytes=${repo.bytes} objects=${repo.objects} expired=${repo.expired} evicted=${repo.evicted}${result.truncated ? " (listing truncated)" : ""}`,
+          `[compile-cache-sweep] ${repo.repo} bytes=${repo.bytes} objects=${repo.objects} expired=${repo.expired} evicted=${repo.evicted}${repo.complete ? "" : " (listed in part)"}`,
         );
       }
+      if (result.truncated) console.info("[compile-cache-sweep] page bound reached; the next tick resumes from its cursor");
     } catch (cause) {
       console.error(
         `[compile-cache-sweep] tick failed: ${cause instanceof Error ? cause.message : String(cause)}`,

@@ -335,11 +335,13 @@ export interface Env {
 
   /**
    * Compile-cache bounds (routes/compile-cache.ts): one entry's bytes, one
-   * repository prefix's bytes, and the entry age in days the sweep deletes.
-   * Unset or malformed → 100 MiB, 20 GiB, 14 days.
+   * repository's bytes, one execution's written bytes, and the entry age in
+   * days the sweep deletes. Unset or malformed → 100 MiB, 20 GiB, 10 GiB,
+   * 14 days.
    */
   readonly COMPILE_CACHE_MAX_OBJECT_BYTES?: string;
   readonly COMPILE_CACHE_MAX_REPO_BYTES?: string;
+  readonly COMPILE_CACHE_MAX_EXECUTION_BYTES?: string;
   readonly COMPILE_CACHE_TTL_DAYS?: string;
 
   /**
@@ -430,6 +432,14 @@ export interface Env {
    * Spec: specs/08-self-healing.md § 6.3.
    */
   readonly AGENT_BUDGET?: DurableObjectNamespace<import("./agent-budget-do").AgentBudget>;
+
+  /**
+   * One compile-cache ledger per repository (compile-cache-ledger.ts): the
+   * byte count every compile-cache PUT reserves against, and each
+   * execution's write budget and end marker. Absent → the compile cache
+   * serves reads and refuses every write.
+   */
+  readonly COMPILE_CACHE_LEDGER?: DurableObjectNamespace<import("./compile-cache-ledger-do").CompileCacheLedger>;
 
   /**
    * Optional dedicated secret for the agent model-proxy capability token. Falls

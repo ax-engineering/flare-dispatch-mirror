@@ -1,12 +1,14 @@
 // `/v1/compile-cache/…` — the WebDAV subset sccache's backend issues, its
 // token scope, its bounds, and the sweep that holds each prefix to its ceiling.
 
-import { describe, expect, it } from "vitest";
+import type { CompileCacheLane } from "@fractalboxdev/flare-dispatch-core/primitives";
+import { beforeEach, describe, expect, it } from "vitest";
 import {
   compileCacheOverrides,
   signCompileCacheToken,
   verifyCompileCacheToken,
 } from "../compile-cache-token";
+import { type LedgerStorage, makeCompileCacheLedger } from "../compile-cache-ledger";
 import type { Env } from "../env";
 import { handleRequest } from "../router";
 import { makeFakeEnv, makeFakeR2, makeFakeWorkflow } from "../test-helpers";
@@ -15,8 +17,8 @@ import {
   handleCompileCache,
   parseCompileCachePath,
   resolveCompileCacheLimits,
+  SWEEP_STATE_KEY,
   sweepCompileCache,
-  usageKey,
 } from "./compile-cache";
 
 const SECRET = "compile-cache-secret-aaaaaaaaaaaaaaaa";
@@ -56,14 +58,17 @@ const makeBucket = (pageSize = 1000) => {
       for (const key of Array.isArray(keys) ? keys : [keys]) store.delete(key);
     },
     list: async (opts: { prefix?: string; cursor?: string; limit?: number }) => {
-      const keys = [...store.keys()].filter((key) => key.startsWith(opts.prefix ?? "")).sort();
-      const start = opts.cursor === undefined ? 0 : Number(opts.cursor);
-      const page = keys.slice(start, start + Math.min(pageSize, opts.limit ?? 1000));
-      const next = start + page.length;
+      // The cursor names the last key returned, so deletions between pages
+      // and between sweeps shift nothing, as with R2's opaque cursor.
+      const keys = [...store.keys()]
+        .filter((key) => key.startsWith(opts.prefix ?? "") && (opts.cursor === undefined || key > opts.cursor))
+        .sort();
+      const page = keys.slice(0, Math.min(pageSize, opts.limit ?? 1000));
+      const more = page.length < keys.length;
       return {
         objects: page.map((key) => meta(key, store.get(key)!)),
-        truncated: next < keys.length,
-        ...(next < keys.length ? { cursor: String(next) } : {}),
+        truncated: more,
+        ...(more ? { cursor: page[page.length - 1] } : {}),
       };
     },
   } as unknown as CompileCacheBucket;
@@ -72,16 +77,51 @@ const makeBucket = (pageSize = 1000) => {
   return { bucket, store, seed };
 };
 
+const memoryStorage = (): LedgerStorage => {
+  const map = new Map<string, unknown>();
+  return {
+    get: async <T>(key: string) => map.get(key) as T | undefined,
+    put: async <T>(key: string, value: T) => {
+      map.set(key, value);
+    },
+    delete: async (key: string) => map.delete(key),
+    list: async <T>(opts: { prefix: string }) =>
+      new Map([...map].filter(([key]) => key.startsWith(opts.prefix)) as [string, T][]),
+  };
+};
+
+/** One in-memory ledger per repository, addressed the way the route addresses the Durable Object. */
+const makeLedgers = () => {
+  const byName = new Map<string, ReturnType<typeof makeCompileCacheLedger>>();
+  const ledger = (name: string) => {
+    let found = byName.get(name);
+    if (found === undefined) {
+      found = makeCompileCacheLedger(memoryStorage());
+      byName.set(name, found);
+    }
+    return found;
+  };
+  const namespace = { idFromName: (name: string) => name, get: (id: string) => ledger(id) };
+  return { ledger, namespace: namespace as unknown as Env["COMPILE_CACHE_LEDGER"] };
+};
+
+let ledgers = makeLedgers();
+beforeEach(() => {
+  ledgers = makeLedgers();
+});
+
 const envWith = (bucket: CompileCacheBucket, over: Partial<Env> = {}) => ({
   HMAC_SECRET: SECRET,
   RUNS_STORAGE: bucket,
+  COMPILE_CACHE_LEDGER: ledgers.namespace,
   ...over,
 });
 
-const token = (over: { repo?: string; expiresAt?: number } = {}) =>
+const token = (over: { repo?: string; expiresAt?: number; lane?: CompileCacheLane; executionId?: string } = {}) =>
   signCompileCacheToken(SECRET, {
     repo: over.repo ?? "owner/name",
-    executionId: EXEC,
+    executionId: over.executionId ?? EXEC,
+    lane: over.lane ?? "base",
     expiresAt: over.expiresAt ?? NOW + 3600,
   });
 
@@ -89,7 +129,13 @@ const call = async (
   bucket: CompileCacheBucket,
   method: string,
   url: string,
-  opts: { token?: string | null; body?: string; headers?: Record<string, string>; env?: Partial<Env> } = {},
+  opts: {
+    token?: string | null;
+    body?: string;
+    headers?: Record<string, string>;
+    env?: Partial<Env>;
+    waitUntil?: (promise: Promise<unknown>) => void;
+  } = {},
 ) => {
   const bearer = opts.token === undefined ? await token() : opts.token;
   const headers: Record<string, string> = { ...opts.headers };
@@ -99,7 +145,10 @@ const call = async (
   return handleCompileCache(
     new Request(url, { method, headers, ...(opts.body !== undefined ? { body: opts.body } : {}) }),
     envWith(bucket, opts.env),
-    { now: () => NOW_MS },
+    {
+      now: () => NOW_MS,
+      ...(opts.waitUntil !== undefined ? { waitUntil: opts.waitUntil, fixedLength: (stream: ReadableStream) => stream } : {}),
+    },
   );
 };
 
@@ -124,9 +173,17 @@ describe("compile-cache auth", () => {
 
   it("refuses a token whose expiry was rewritten", async () => {
     const minted = await token();
-    const [v, , exec, mac] = minted.split(".");
-    const res = await call(makeBucket().bucket, "GET", `${BASE}/a/b/c/abc`, { token: `${v}.${NOW + 999_999}.${exec}.${mac}` });
+    const [v, , exec, lane, mac] = minted.split(".");
+    const res = await call(makeBucket().bucket, "GET", `${BASE}/a/b/c/abc`, { token: `${v}.${NOW + 999_999}.${exec}.${lane}.${mac}` });
     expect(res.status).toBe(403);
+  });
+
+  it("refuses a token whose lane was rewritten", async () => {
+    const minted = await token({ lane: "pr-7" });
+    const [v, expiry, exec, , mac] = minted.split(".");
+    const res = await call(makeBucket().bucket, "PUT", `${BASE}/a/b/c/abc`, { token: `${v}.${expiry}.${exec}.base.${mac}`, body: "x" });
+    expect(res.status).toBe(403);
+    expect(await res.text()).toBe("token invalid");
   });
 
   it("refuses a malformed token", async () => {
@@ -148,7 +205,7 @@ describe("compile-cache auth", () => {
 
   it("verifies a minted token's scope", async () => {
     const verdict = await verifyCompileCacheToken(SECRET, "owner/name", await token(), NOW);
-    expect(verdict).toEqual({ ok: true, scope: { repo: "owner/name", executionId: EXEC, expiresAt: NOW + 3600 } });
+    expect(verdict).toEqual({ ok: true, scope: { repo: "owner/name", executionId: EXEC, lane: "base", expiresAt: NOW + 3600 } });
   });
 });
 
@@ -157,7 +214,7 @@ describe("compile-cache WebDAV", () => {
     const { bucket, store } = makeBucket();
     const put = await call(bucket, "PUT", `${BASE}/a/b/c/abcdef`, { body: "rlib-bytes" });
     expect(put.status).toBe(201);
-    expect([...store.keys()]).toEqual(["compile-cache/owner/name/1.90.0/x86_64-unknown-linux-gnu/a/b/c/abcdef"]);
+    expect([...store.keys()]).toEqual(["compile-cache/owner/name/@base/1.90.0/x86_64-unknown-linux-gnu/a/b/c/abcdef"]);
 
     const get = await call(bucket, "GET", `${BASE}/a/b/c/abcdef`);
     expect(get.status).toBe(200);
@@ -214,15 +271,49 @@ describe("compile-cache WebDAV", () => {
     expect(res.status).toBe(411);
   });
 
-  it("refuses a PUT once the measured prefix plus the entry exceeds the repository bound", async () => {
+  it("refuses a PUT once the repository's admitted bytes plus the entry exceed its bound", async () => {
     const { bucket, store } = makeBucket();
-    await bucket.put(usageKey("owner/name"), "", { customMetadata: { bytes: "95" } });
-    const res = await call(bucket, "PUT", `${BASE}/a/b/c/x`, {
-      body: "0123456789",
-      env: { COMPILE_CACHE_MAX_REPO_BYTES: "100" },
-    });
+    const env = { COMPILE_CACHE_MAX_REPO_BYTES: "15" };
+    expect((await call(bucket, "PUT", `${BASE}/a/b/c/x`, { body: "0123456789", env })).status).toBe(201);
+    const other = await token({ executionId: "check:owner_name:other" });
+    const res = await call(bucket, "PUT", `${BASE}/a/b/c/y`, { token: other, body: "0123456789", env });
     expect(res.status).toBe(507);
-    expect([...store.keys()]).toEqual([usageKey("owner/name")]);
+    expect(store.size).toBe(1);
+  });
+
+  it("counts every PUT at once, so writes between sweeps cannot pass the repository bound", async () => {
+    const { bucket, store } = makeBucket();
+    const env = { COMPILE_CACHE_MAX_REPO_BYTES: "25" };
+    const statuses: number[] = [];
+    for (let i = 0; i < 5; i++) statuses.push((await call(bucket, "PUT", `${BASE}/a/b/c/k${i}`, { body: "0123456789", env })).status);
+    expect(statuses).toEqual([201, 201, 507, 507, 507]);
+    expect(store.size).toBe(2);
+  });
+
+  it("refuses an execution's PUT past its own byte budget", async () => {
+    const { bucket } = makeBucket();
+    const env = { COMPILE_CACHE_MAX_EXECUTION_BYTES: "15" };
+    expect((await call(bucket, "PUT", `${BASE}/a/b/c/x`, { body: "0123456789", env })).status).toBe(201);
+    const res = await call(bucket, "PUT", `${BASE}/a/b/c/y`, { body: "0123456789", env });
+    expect(res.status).toBe(507);
+    expect(await res.text()).toContain("execution");
+  });
+
+  it("refuses a PUT once the execution ended, though its token has not expired", async () => {
+    const { bucket } = makeBucket();
+    await ledgers.ledger("owner/name").end({ executionId: EXEC, expiresAt: NOW + 3600 });
+    const res = await call(bucket, "PUT", `${BASE}/a/b/c/x`, { body: "0123456789" });
+    expect(res.status).toBe(403);
+    expect(await res.text()).toBe("execution ended");
+    expect((await call(bucket, "GET", `${BASE}/a/b/c/x`)).status).toBe(404);
+  });
+
+  it("refuses every PUT on a deploy without the ledger, and still serves reads", async () => {
+    const { bucket, seed } = makeBucket();
+    seed("compile-cache/owner/name/@base/1.90.0/x86_64-unknown-linux-gnu/a/b/c/x", 3, NOW_MS);
+    const env = { COMPILE_CACHE_LEDGER: undefined };
+    expect((await call(bucket, "PUT", `${BASE}/a/b/c/y`, { body: "0123456789", env })).status).toBe(503);
+    expect((await call(bucket, "GET", `${BASE}/a/b/c/x`, { env })).status).toBe(200);
   });
 
   it("rejects paths that escape or skip the repository", () => {
@@ -233,14 +324,15 @@ describe("compile-cache WebDAV", () => {
     expect(parseCompileCachePath("/v1/compile-cache/owner")).toBeUndefined();
     expect(parseCompileCachePath("/v1/compile-cache/owner/name/")).toEqual({
       repo: "owner/name",
-      key: "compile-cache/owner/name/",
+      key: "",
       collection: true,
     });
     expect(parseCompileCachePath("/v1/compile-cache/owner/name/.sccache_check")).toEqual({
       repo: "owner/name",
-      key: "compile-cache/owner/name/.sccache_check",
+      key: ".sccache_check",
       collection: false,
     });
+    expect(parseCompileCachePath("/v1/compile-cache/owner/name/@base/x")).toBeUndefined();
   });
 
   it("is reachable through the dispatcher router", async () => {
@@ -250,11 +342,75 @@ describe("compile-cache WebDAV", () => {
   });
 });
 
+describe("compile-cache lanes", () => {
+  const entry = "1.90.0/x86_64-unknown-linux-gnu/a/b/c/abcdef";
+
+  it("lands a pull request's PUT in its own lane, which no other lane reads", async () => {
+    const { bucket, store } = makeBucket();
+    const pr7 = await token({ lane: "pr-7" });
+    expect((await call(bucket, "PUT", `${BASE}/a/b/c/abcdef`, { token: pr7, body: "planted" })).status).toBe(201);
+    expect([...store.keys()]).toEqual([`compile-cache/owner/name/@pr-7/${entry}`]);
+    expect((await call(bucket, "GET", `${BASE}/a/b/c/abcdef`, { token: await token() })).status).toBe(404);
+    expect((await call(bucket, "GET", `${BASE}/a/b/c/abcdef`, { token: await token({ lane: "pr-8" }) })).status).toBe(404);
+    expect((await call(bucket, "GET", `${BASE}/a/b/c/abcdef`, { token: await token({ lane: "read-only" }) })).status).toBe(404);
+    expect(await (await call(bucket, "GET", `${BASE}/a/b/c/abcdef`, { token: pr7 })).text()).toBe("planted");
+  });
+
+  it("serves a pull request the default branch's entry, and its own entry over it", async () => {
+    const { bucket } = makeBucket();
+    const pr7 = await token({ lane: "pr-7" });
+    await call(bucket, "PUT", `${BASE}/a/b/c/abcdef`, { body: "from-base" });
+    expect(await (await call(bucket, "GET", `${BASE}/a/b/c/abcdef`, { token: pr7 })).text()).toBe("from-base");
+    expect((await call(bucket, "HEAD", `${BASE}/a/b/c/abcdef`, { token: pr7 })).status).toBe(200);
+    expect((await call(bucket, "PROPFIND", `${BASE}/a/b/c/abcdef`, { token: pr7, headers: { depth: "0" } })).status).toBe(207);
+    await call(bucket, "PUT", `${BASE}/a/b/c/abcdef`, { token: pr7, body: "from-pr" });
+    expect(await (await call(bucket, "GET", `${BASE}/a/b/c/abcdef`, { token: pr7 })).text()).toBe("from-pr");
+    expect(await (await call(bucket, "GET", `${BASE}/a/b/c/abcdef`)).text()).toBe("from-base");
+  });
+
+  it("refuses a PUT from a read-only token", async () => {
+    const { bucket, store } = makeBucket();
+    const res = await call(bucket, "PUT", `${BASE}/a/b/c/abcdef`, { token: await token({ lane: "read-only" }), body: "x" });
+    expect(res.status).toBe(403);
+    expect(await res.text()).toBe("token grants no writes");
+    expect(store.size).toBe(0);
+  });
+
+  it("rewrites an entry read past half its lifetime, so the sweep ages entries by last use", async () => {
+    const { bucket, store, seed } = makeBucket();
+    const DAY = 24 * 3600 * 1000;
+    const key = `compile-cache/owner/name/@base/${entry}`;
+    seed(key, 4, NOW_MS - 8 * DAY);
+    const pending: Promise<unknown>[] = [];
+    const res = await call(bucket, "GET", `${BASE}/a/b/c/abcdef`, {
+      token: await token({ lane: "pr-7" }),
+      waitUntil: (promise) => pending.push(promise),
+    });
+    expect(res.status).toBe(200);
+    expect((await res.arrayBuffer()).byteLength).toBe(4);
+    await Promise.all(pending);
+    expect(store.get(key)?.uploaded.getTime()).toBe(NOW_MS);
+    expect([...store.keys()]).toEqual([key]);
+  });
+
+  it("leaves an entry read within half its lifetime as written", async () => {
+    const { bucket, store, seed } = makeBucket();
+    const DAY = 24 * 3600 * 1000;
+    const key = `compile-cache/owner/name/@base/${entry}`;
+    seed(key, 4, NOW_MS - 6 * DAY);
+    const pending: Promise<unknown>[] = [];
+    await (await call(bucket, "GET", `${BASE}/a/b/c/abcdef`, { waitUntil: (promise) => pending.push(promise) })).arrayBuffer();
+    expect(pending).toEqual([]);
+    expect(store.get(key)?.uploaded.getTime()).toBe(NOW_MS - 6 * DAY);
+  });
+});
+
 describe("compile-cache limits", () => {
   it("records its defaults and reads overrides from the Worker vars", () => {
     expect(resolveCompileCacheLimits({})).toEqual({
       maxObjectBytes: 100 * 1024 * 1024,
       maxRepoBytes: 20 * 1024 * 1024 * 1024,
+      maxExecutionBytes: 10 * 1024 * 1024 * 1024,
       ttlDays: 14,
     });
     expect(
@@ -263,48 +419,85 @@ describe("compile-cache limits", () => {
         COMPILE_CACHE_MAX_REPO_BYTES: "garbage",
         COMPILE_CACHE_TTL_DAYS: "3",
       }),
-    ).toEqual({ maxObjectBytes: 10, maxRepoBytes: 20 * 1024 * 1024 * 1024, ttlDays: 3 });
+    ).toEqual({ maxObjectBytes: 10, maxRepoBytes: 20 * 1024 * 1024 * 1024, maxExecutionBytes: 10 * 1024 * 1024 * 1024, ttlDays: 3 });
   });
 });
 
 describe("sweepCompileCache", () => {
   const DAY = 24 * 3600 * 1000;
-  const limits = { maxObjectBytes: 100, maxRepoBytes: 100, ttlDays: 7 };
+  const limits = { maxObjectBytes: 100, maxRepoBytes: 100, maxExecutionBytes: 100, ttlDays: 7 };
+  const repoBytes = async (repo: string) =>
+    (await ledgers.ledger(repo).reserve({ executionId: "probe", expiresAt: NOW + 1, bytes: 0, maxRepoBytes: 1e12, maxExecutionBytes: 1e12 })).repoBytes;
+  const sweep = (bucket: CompileCacheBucket, maxPages?: number) =>
+    sweepCompileCache(bucket, limits, NOW_MS, {
+      ledger: (repo) => ledgers.ledger(repo),
+      ...(maxPages !== undefined ? { maxPages } : {}),
+    });
 
   it("deletes expired entries, evicts the oldest-written to 90% of the ceiling, and records the size", async () => {
     const { bucket, store, seed } = makeBucket(2);
-    seed("compile-cache/owner/name/r/t/expired", 10, NOW_MS - 8 * DAY);
-    seed("compile-cache/owner/name/r/t/oldest", 40, NOW_MS - 3 * DAY);
-    seed("compile-cache/owner/name/r/t/older", 40, NOW_MS - 2 * DAY);
-    seed("compile-cache/owner/name/r/t/newest", 40, NOW_MS - 1 * DAY);
-    seed("compile-cache/other/repo/r/t/kept", 5, NOW_MS);
+    seed("compile-cache/owner/name/@base/r/t/expired", 10, NOW_MS - 8 * DAY);
+    seed("compile-cache/owner/name/@base/r/t/oldest", 40, NOW_MS - 3 * DAY);
+    seed("compile-cache/owner/name/@base/r/t/older", 40, NOW_MS - 2 * DAY);
+    seed("compile-cache/owner/name/@pr-7/r/t/newest", 40, NOW_MS - 1 * DAY);
+    seed("compile-cache/other/repo/@base/r/t/kept", 5, NOW_MS);
 
-    const result = await sweepCompileCache(bucket, limits, NOW_MS);
+    const result = await sweep(bucket);
 
     expect(result.truncated).toBe(false);
     expect(result.repos).toEqual([
-      { repo: "other/repo", bytes: 5, objects: 1, expired: 0, evicted: 0 },
-      { repo: "owner/name", bytes: 80, objects: 2, expired: 1, evicted: 1 },
+      { repo: "other/repo", bytes: 5, objects: 1, expired: 0, evicted: 0, complete: true },
+      { repo: "owner/name", bytes: 80, objects: 2, expired: 1, evicted: 1, complete: true },
     ]);
-    expect([...store.keys()].filter((key) => key.startsWith("compile-cache/")).sort()).toEqual([
-      "compile-cache/other/repo/r/t/kept",
-      "compile-cache/owner/name/r/t/newest",
-      "compile-cache/owner/name/r/t/older",
+    expect([...store.keys()].sort()).toEqual([
+      "compile-cache/other/repo/@base/r/t/kept",
+      "compile-cache/owner/name/@base/r/t/older",
+      "compile-cache/owner/name/@pr-7/r/t/newest",
     ]);
-    expect(store.get(usageKey("owner/name"))?.customMetadata?.bytes).toBe("80");
+    expect(await repoBytes("owner/name")).toBe(80);
+    expect(await repoBytes("other/repo")).toBe(5);
   });
 
-  it("deletes the usage record of a prefix that no longer holds entries", async () => {
-    const { bucket, store } = makeBucket();
-    await bucket.put(usageKey("gone/repo"), "", { customMetadata: { bytes: "999" } });
-    await sweepCompileCache(bucket, limits, NOW_MS);
-    expect(store.has(usageKey("gone/repo"))).toBe(false);
+  it("resumes where the last tick stopped, so entries past one tick's listing still expire", async () => {
+    const { bucket, store, seed } = makeBucket(2);
+    for (const repo of ["a/one", "b/two", "c/three"]) {
+      seed(`compile-cache/${repo}/@base/r/t/1-expired`, 10, NOW_MS - 8 * DAY);
+      seed(`compile-cache/${repo}/@base/r/t/2-kept`, 10, NOW_MS);
+      seed(`compile-cache/${repo}/@base/r/t/3-kept`, 10, NOW_MS);
+    }
+
+    const first = await sweep(bucket, 2);
+    expect(first.truncated).toBe(true);
+    expect(first.repos).toEqual([
+      { repo: "a/one", bytes: 20, objects: 2, expired: 1, evicted: 0, complete: true },
+      { repo: "b/two", bytes: 0, objects: 0, expired: 1, evicted: 0, complete: false },
+    ]);
+    expect(store.has(SWEEP_STATE_KEY)).toBe(true);
+
+    const second = await sweep(bucket, 3);
+    expect(second.truncated).toBe(false);
+    expect(second.repos.map((repo) => [repo.repo, repo.complete, repo.expired])).toEqual([
+      ["b/two", false, 0],
+      ["c/three", true, 1],
+    ]);
+    expect([...store.keys()].filter((key) => key.includes("expired"))).toEqual([]);
+    expect(store.has(SWEEP_STATE_KEY)).toBe(false);
+  });
+
+  it("releases the bytes it deletes from a repository it could not list whole", async () => {
+    const { bucket, seed } = makeBucket(1);
+    await ledgers.ledger("a/one").reserve({ executionId: "x", expiresAt: NOW + 60, bytes: 50, maxRepoBytes: 100, maxExecutionBytes: 100 });
+    seed("compile-cache/a/one/@base/r/t/1-expired", 30, NOW_MS - 8 * DAY);
+    seed("compile-cache/a/one/@base/r/t/2-kept", 20, NOW_MS);
+    const result = await sweep(bucket, 1);
+    expect(result.repos).toEqual([{ repo: "a/one", bytes: 0, objects: 0, expired: 1, evicted: 0, complete: false }]);
+    expect(await repoBytes("a/one")).toBe(20);
   });
 });
 
 describe("compileCacheOverrides", () => {
   const mint = {
-    wanted: true,
+    lane: "pr-7" as CompileCacheLane | undefined,
     repo: "owner/name",
     executionId: EXEC,
     createdAtMs: NOW_MS,
@@ -314,10 +507,12 @@ describe("compileCacheOverrides", () => {
   };
 
   it("hands the run the endpoint and a token valid until creation plus the ceiling", async () => {
-    const overrides = await compileCacheOverrides(mint);
-    expect(overrides?.["compile-cache.endpoint"]).toBe("https://dispatch.example/v1/compile-cache");
-    const verdict = await verifyCompileCacheToken(SECRET, "owner/name", overrides!["compile-cache.token"]!, NOW);
-    expect(verdict).toEqual({ ok: true, scope: { repo: "owner/name", executionId: EXEC, expiresAt: NOW + 9900 } });
+    const minted = await compileCacheOverrides(mint);
+    expect(minted?.expiresAt).toBe(NOW + 9900);
+    expect(minted?.lane).toBe("pr-7");
+    expect(minted?.overrides["compile-cache.endpoint"]).toBe("https://dispatch.example/v1/compile-cache");
+    const verdict = await verifyCompileCacheToken(SECRET, "owner/name", minted!.overrides["compile-cache.token"]!, NOW);
+    expect(verdict).toEqual({ ok: true, scope: { repo: "owner/name", executionId: EXEC, lane: "pr-7", expiresAt: NOW + 9900 } });
   });
 
   it("mints the same token on every invocation of one execution", async () => {
@@ -325,7 +520,7 @@ describe("compileCacheOverrides", () => {
   });
 
   it("mints nothing for a run that does not want the cache or a deploy that cannot serve it", async () => {
-    expect(await compileCacheOverrides({ ...mint, wanted: false })).toBeUndefined();
+    expect(await compileCacheOverrides({ ...mint, lane: undefined })).toBeUndefined();
     expect(await compileCacheOverrides({ ...mint, publicOrigin: undefined })).toBeUndefined();
     expect(await compileCacheOverrides({ ...mint, secret: undefined })).toBeUndefined();
   });

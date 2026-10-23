@@ -73,20 +73,30 @@ so a budget buys more checks.
 
 ### Shared compile cache
 
-- A run whose definition answers `compileCache` with `true` compiles Rust
+- A run whose definition answers `compileCache` with a lane compiles Rust
   through sccache. Every contextful gate part does. The dispatcher's
   `/v1/compile-cache` route serves sccache's WebDAV backend (GET, HEAD, PUT,
   `Depth: 0` PROPFIND, MKCOL) from `RUNS_STORAGE` under
-  `compile-cache/<owner>/<name>/`; the client's key prefix below that is
-  `<repo>/<rustc release>/<host triple>`.
+  `compile-cache/<owner>/<name>/@<lane>/`; the client's key prefix below that
+  is `<repo>/<rustc release>/<host triple>`.
 - The dispatcher mints one token per execution: an HMAC under a key derived
-  from `HMAC_SECRET`, bound to the repository and execution, expiring at the
-  instance's creation plus its queue age and `maxDurationSec`. A token for
+  from `HMAC_SECRET`, bound to the repository, execution and lane, expiring at
+  the instance's creation plus its queue age and `maxDurationSec`. A token for
   another repository, a forged one and an expired one are refused.
-- One entry is at most `COMPILE_CACHE_MAX_OBJECT_BYTES`, one repository prefix
-  at most `COMPILE_CACHE_MAX_REPO_BYTES` as of the last hourly sweep, and an
-  entry older than `COMPILE_CACHE_TTL_DAYS` is deleted. The sweep evicts the
-  oldest-written entries down to 90% of the ceiling.
+- The lane decides writes and reads. `base` belongs to default-branch
+  executions and reads and writes `@base`. `pr-<n>` writes `@pr-<n>` and reads
+  it, then `@base`. `read-only` reads `@base` and writes nothing. No execution
+  reads another pull request's lane.
+- One entry is at most `COMPILE_CACHE_MAX_OBJECT_BYTES`. Every PUT reserves its
+  length in the repository's ledger, a Durable Object, against
+  `COMPILE_CACHE_MAX_REPO_BYTES` for the repository and
+  `COMPILE_CACHE_MAX_EXECUTION_BYTES` for the execution. When the run ends the
+  workflow ends the execution's record, and its token writes nothing more.
+- The hourly sweep lists up to 500 pages per tick and resumes from its stored
+  cursor. It deletes entries older than `COMPILE_CACHE_TTL_DAYS`. For a
+  repository listed whole within a tick, it evicts the oldest entries down to
+  90% of the ceiling and sets the ledger to the measured size. A GET of an
+  entry older than half the TTL rewrites it, so age counts from last use.
 - A cache outage never fails a part: the wrapper starts the sccache server
   first and compiles without `RUSTC_WRAPPER` when it does not start; a started
   server reads an unreachable entry as a miss.
@@ -106,6 +116,13 @@ compiler cache turns all but the first compile of each crate into a read.
 sccache's WebDAV backend needs no cloud credentials in the container, so the
 Worker's R2 binding stays the only storage authority.
 
+Pull-request code runs with its token in its environment, and sccache trusts
+whatever an entry holds. A shared writable prefix would let one pull request
+plant an artifact that another pull request's gate, or a default-branch gate,
+links and runs. Lanes confine each pull request's writes to itself. A ledger
+counted at admission keeps the byte bound against a client that ignores
+sccache's write pattern, where a bound measured hourly would not.
+
 Building a C++ engine from source in every part buys nothing a prebuilt
 library does not, and only the consumer can decide whether CI may link it
 dynamically while release builds stay static.
@@ -117,9 +134,15 @@ dynamically while release builds stay static.
 - A broken restore still costs a cold install per part until the transport is
   fixed, but no longer a repeated pack and upload.
 - The lean image grows by the prebuilt libraries' size.
-- Pull-request parts write to the repository's shared prefix, so a
-  same-repository pull request can place an entry a later default-branch
-  part reads.
+- A pull request reuses entries across its own pushes and the default
+  branch's entries. It reuses nothing another pull request compiled. Only
+  default-branch executions write `@base`. A gate whose default-branch tier
+  runs other parts than its pull-request tier therefore populates `@base` only
+  for the compiles those parts share.
+- A pull request's lane holds its entries until they expire, after the pull
+  request closes too.
+- A deploy whose `wrangler.jsonc` lacks the `COMPILE_CACHE_LEDGER` binding
+  serves compile-cache reads and refuses every write.
 
 ## Revisit triggers
 

@@ -28,10 +28,11 @@ import { RunSandbox, RunSandboxBrowser, RunSandboxAgent, RunSandboxRelease } fro
 // Re-export the binding classes so wrangler's `main` entry resolves them.
 export { RunWorkflow } from "./workflow";
 export { AgentBudget } from "./agent-budget-do";
+export { CompileCacheLedger } from "./compile-cache-ledger-do";
 export { RunSandbox, RunSandboxBrowser, RunSandboxAgent, RunSandboxRelease };
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     // Preview-URL proxying for `exposePort` (the `cdp-acceptance` reachability
     // path): a request to `<port>-<sandboxId>-<token>.<SANDBOX_PREVIEW_HOSTNAME>`
     // is forwarded to that container's port. `proxyToSandbox` returns `null`
@@ -49,7 +50,7 @@ export default {
       Sandbox: env.RUNS_SANDBOX,
     });
     if (proxied !== null) return proxied;
-    return handleRequest(request, env);
+    return handleRequest(request, env, ctx);
   },
   /**
    * Cron Trigger entry — fires once per `triggers.crons` cadence. We hand off

@@ -6,7 +6,7 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { compileCacheCommand, compileCacheEnv } from "./compile-cache";
+import { compileCacheCommand, compileCacheEnv, isCompileCacheLane } from "./compile-cache";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -91,6 +91,14 @@ describe("compileCacheCommand", () => {
     expect(box.log()).toBe("");
   });
 
+  it("runs a command that ends in a comment", () => {
+    const box = sandbox({ sccache: { startExit: 0 } });
+    const result = box.run("echo ran # trailing comment");
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("ran");
+    expect(result.stdout).toContain("Compile requests 12");
+  });
+
   it("refuses a repository outside the owner/name charset", () => {
     expect(() => compileCacheCommand("true", 'owner/name"; rm -rf /')).toThrow(/invalid repo/);
   });
@@ -100,5 +108,16 @@ describe("compileCacheCommand", () => {
       SCCACHE_WEBDAV_ENDPOINT: "https://d.example/v1/compile-cache",
       SCCACHE_WEBDAV_TOKEN: "t",
     });
+  });
+});
+
+describe("isCompileCacheLane", () => {
+  it("accepts the default-branch lane, a pull request's lane and the read-only lane", () => {
+    for (const lane of ["base", "read-only", "pr-1", "pr-4242"]) expect(isCompileCacheLane(lane)).toBe(true);
+  });
+
+  it("refuses anything else", () => {
+    for (const lane of ["", "pr-", "pr-0", "pr-01", "pr-1/x", "Base", "main", "../base", "pr-12345678901"])
+      expect(isCompileCacheLane(lane)).toBe(false);
   });
 });

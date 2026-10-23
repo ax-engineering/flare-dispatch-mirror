@@ -16,6 +16,7 @@ import {
   contextfulGate,
   lightLabelsKey,
   mergeStages,
+  compileCacheLane,
   NOT_AFFECTED_SUMMARY,
   parseAffected,
   parseLightLabels,
@@ -322,6 +323,7 @@ describe("contextful-gate", () => {
               checkLabel: stage,
               install: true,
               compileCache: true,
+              compileCacheLane: "read-only",
               restore,
               command: `if [ -x ${BIN} ] && ${BIN} --help >/dev/null 2>&1; then exec ${BIN} gate --predecessors --stage ${stage} --base ${BASE_SHA}; else exec ${CARGO_RUN} gate --predecessors --stage ${stage} --base ${BASE_SHA}; fi`,
             }),
@@ -999,6 +1001,12 @@ describe("contextful-gate", () => {
       expect(tierParts(parts, ["absent"], "heavy")).toEqual(parts);
     });
 
+    it("writes the default branch's compile-cache lane only from a default-branch push", () => {
+      expect(compileCacheLane(heavyInput)).toBe("base");
+      expect(compileCacheLane({ ...input, pr: 42 })).toBe("pr-42");
+      expect(compileCacheLane(input)).toBe("read-only");
+    });
+
     it("unset: a pull-request gate runs every part and the heavy tier none", () => {
       expect(tierParts(parts, undefined, "pull-request")).toBe(parts);
       expect(tierParts(parts, undefined, "heavy")).toEqual([]);
@@ -1047,6 +1055,8 @@ describe("contextful-gate", () => {
           deferred: ["pins"],
         });
         expect(spawnedLabels(handles)).toEqual(["workspace.compile", "formal"]);
+        for (const spawn of handles.childRuns.spawned)
+          expect(spawn.input).toEqual(expect.objectContaining({ compileCache: true, compileCacheLane: "base" }));
         expect(handles.github.commitPullRequestsCalls).toHaveLength(0);
         expect(handles.github.pullRequestCalls).toHaveLength(0);
       }).pipe(Effect.provide(layer));

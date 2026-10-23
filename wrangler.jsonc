@@ -48,9 +48,9 @@
       // every finished execution GitHub never received (DELIVERY_SWEEP_CRON,
       // apps/dispatcher/src/delivery-sweep.ts).
       "*/10 * * * *",
-      // The compile-cache sweep, not a run: measures each repository's
-      // compile-cache prefix, deletes expired entries and evicts down to the
-      // ceiling (COMPILE_CACHE_SWEEP_CRON, apps/dispatcher/src/routes/compile-cache.ts).
+      // The compile-cache sweep, not a run: deletes expired entries, evicts
+      // each repository down to its ceiling and measures it into the ledger
+      // (COMPILE_CACHE_SWEEP_CRON, apps/dispatcher/src/routes/compile-cache.ts).
       "41 * * * *",
     ],
   },
@@ -104,9 +104,11 @@
     "ADMISSION_CAP_BROWSER": "16",
     "ADMISSION_CAP_RELEASE": "8",
     // Compile-cache bounds (apps/dispatcher/src/routes/compile-cache.ts): one
-    // entry, one repository prefix, and the entry age the hourly sweep deletes.
+    // entry, one repository, one execution's writes, and the entry age the
+    // hourly sweep deletes.
     "COMPILE_CACHE_MAX_OBJECT_BYTES": "104857600",
     "COMPILE_CACHE_MAX_REPO_BYTES": "21474836480",
+    "COMPILE_CACHE_MAX_EXECUTION_BYTES": "10737418240",
     "COMPILE_CACHE_TTL_DAYS": "14",
     // Opt the human-facing viewer surfaces (incl. the GitHub App install flow)
     // out of the Cloudflare Access gate for the initial dogfood. Configure
@@ -248,6 +250,7 @@
       { "name": "AGENT_BUDGET", "class_name": "AgentBudget" },
       { "name": "RUNS_SANDBOX_AGENT", "class_name": "RunSandboxAgent" },
       { "name": "RUNS_SANDBOX_RELEASE", "class_name": "RunSandboxRelease" },
+      { "name": "COMPILE_CACHE_LEDGER", "class_name": "CompileCacheLedger" },
     ],
   },
 
@@ -257,6 +260,7 @@
     { "tag": "v2", "new_sqlite_classes": ["AgentBudget"] },
     { "tag": "v3", "new_sqlite_classes": ["RunSandboxAgent"] },
     { "tag": "v4", "new_sqlite_classes": ["RunSandboxRelease"] },
+    { "tag": "v5", "new_sqlite_classes": ["CompileCacheLedger"] },
   ],
 
   // Bucket name, database name and id, and namespace ids: operator overlay.

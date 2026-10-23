@@ -1,12 +1,18 @@
 // FlareDispatch Dispatcher — compile-cache tokens.
 //
 // The compile-cache route (routes/compile-cache.ts) admits a request carrying
-// a token minted for one repository and one execution, valid until that
-// execution's ceiling:
+// a token minted for one repository, one execution and one lane, valid until
+// that execution's ceiling:
 //
-//   token = "cc1." <expiresAt> "." base64url(executionId) "." mac
-//   mac   = base64url( HMAC-SHA256( k_cc, "cc1\n" repo "\n" executionId "\n" expiresAt ) )
+//   token = "cc2." <expiresAt> "." base64url(executionId) "." lane "." mac
+//   mac   = base64url( HMAC-SHA256( k_cc, "cc2\n" repo "\n" executionId "\n" lane "\n" expiresAt ) )
 //   k_cc  = HKDF-SHA256( HMAC_SECRET, salt="", info="flare-dispatch/compile-cache/v1" )
+//
+// `lane` (primitives/compile-cache.ts `CompileCacheLane`) decides where the
+// token's writes land and which entries it reads: `base`, `pr-<n>` or
+// `read-only`. The run definition names it from the execution's trigger; a
+// dispatch caller able to name `base` holds `HMAC_SECRET`, the key this MAC
+// derives from, so the lane adds no authority the caller lacks.
 //
 // `repo` is lowercase `owner/name` and is not in the token: the route takes it
 // from the request path, so a token presented under another repository's
@@ -22,12 +28,14 @@
 import {
   COMPILE_CACHE_ENDPOINT_KEY,
   COMPILE_CACHE_TOKEN_KEY,
+  type CompileCacheLane,
+  isCompileCacheLane,
 } from "@fractalboxdev/flare-dispatch-core/primitives";
 import { deriveSecret } from "./capability-token";
 import type { Env } from "./env";
 
 const HKDF_INFO = "flare-dispatch/compile-cache/v1";
-const VERSION = "cc1";
+const VERSION = "cc2";
 
 const encoder = new TextEncoder();
 
@@ -51,10 +59,11 @@ const fromBase64url = (text: string): string | undefined => {
 /** The execution id charset (log-token.ts `EXECUTION_ID_RE`). */
 const EXECUTION_ID = /^[A-Za-z0-9:_-]{3,128}$/;
 
-/** The token's scope: one repository, one execution, until `expiresAt` (epoch seconds). */
+/** The token's scope: one repository, one execution, one lane, until `expiresAt` (epoch seconds). */
 export type CompileCacheScope = {
   readonly repo: string;
   readonly executionId: string;
+  readonly lane: CompileCacheLane;
   readonly expiresAt: number;
 };
 
@@ -68,7 +77,9 @@ const macKey = async (ikm: string): Promise<CryptoKey> =>
   );
 
 const message = (scope: CompileCacheScope): Uint8Array =>
-  encoder.encode(`${VERSION}\n${scope.repo.toLowerCase()}\n${scope.executionId}\n${scope.expiresAt}`);
+  encoder.encode(
+    `${VERSION}\n${scope.repo.toLowerCase()}\n${scope.executionId}\n${scope.lane}\n${scope.expiresAt}`,
+  );
 
 /** The key material: the Worker's `HMAC_SECRET`; `undefined` when unset (the route then refuses). */
 export const resolveCompileCacheSecret = (env: Pick<Env, "HMAC_SECRET">): string | undefined =>
@@ -77,10 +88,11 @@ export const resolveCompileCacheSecret = (env: Pick<Env, "HMAC_SECRET">): string
 /** Mint the token for `scope`. */
 export const signCompileCacheToken = async (ikm: string, scope: CompileCacheScope): Promise<string> => {
   if (!EXECUTION_ID.test(scope.executionId)) throw new Error("compile-cache token: invalid execution id");
+  if (!isCompileCacheLane(scope.lane)) throw new Error("compile-cache token: invalid lane");
   if (!Number.isSafeInteger(scope.expiresAt) || scope.expiresAt <= 0)
     throw new Error("compile-cache token: invalid expiry");
   const mac = new Uint8Array(await crypto.subtle.sign("HMAC", await macKey(ikm), message(scope)));
-  return `${VERSION}.${scope.expiresAt}.${base64url(encoder.encode(scope.executionId))}.${base64url(mac)}`;
+  return `${VERSION}.${scope.expiresAt}.${base64url(encoder.encode(scope.executionId))}.${scope.lane}.${base64url(mac)}`;
 };
 
 /** Why a presented token was refused. */
@@ -97,14 +109,20 @@ export const verifyCompileCacheToken = async (
   nowSec: number,
 ): Promise<{ readonly ok: true; readonly scope: CompileCacheScope } | { readonly ok: false; readonly reason: CompileCacheTokenRefusal }> => {
   const parts = presented.split(".");
-  if (parts.length !== 4 || parts[0] !== VERSION || !/^[1-9][0-9]{0,15}$/.test(parts[1]!))
+  if (parts.length !== 5 || parts[0] !== VERSION || !/^[1-9][0-9]{0,15}$/.test(parts[1]!))
     return { ok: false, reason: "malformed" };
   const expiresAt = Number(parts[1]);
   const executionId = fromBase64url(parts[2]!);
-  if (executionId === undefined || !EXECUTION_ID.test(executionId) || !/^[A-Za-z0-9_-]{43}$/.test(parts[3]!))
+  const lane = parts[3]!;
+  if (
+    executionId === undefined ||
+    !EXECUTION_ID.test(executionId) ||
+    !isCompileCacheLane(lane) ||
+    !/^[A-Za-z0-9_-]{43}$/.test(parts[4]!)
+  )
     return { ok: false, reason: "malformed" };
-  const mac = Uint8Array.from(atob(parts[3]!.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
-  const scope = { repo, executionId, expiresAt };
+  const mac = Uint8Array.from(atob(parts[4]!.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
+  const scope = { repo, executionId, lane, expiresAt };
   const valid = await crypto.subtle.verify("HMAC", await macKey(ikm), mac, message(scope));
   if (!valid) return { ok: false, reason: "invalid" };
   if (nowSec >= expiresAt) return { ok: false, reason: "expired" };
@@ -113,8 +131,8 @@ export const verifyCompileCacheToken = async (
 
 /** What the workflow knows when it decides whether to mint. */
 export type CompileCacheMint = {
-  /** The run's own answer (`RunSpec.compileCache`). */
-  readonly wanted: boolean;
+  /** The run's own answer (`RunSpec.compileCache`): its lane, or `undefined` for no cache. */
+  readonly lane: CompileCacheLane | undefined;
   readonly repo: string;
   readonly executionId: string;
   /** The Workflow instance's creation time, epoch ms: stable across invocations. */
@@ -125,23 +143,34 @@ export type CompileCacheMint = {
   readonly secret: string | undefined;
 };
 
+/** A minted grant: the config overrides that carry it, its lane, and its token's expiry (epoch seconds). */
+export type CompileCacheGrant = {
+  readonly overrides: Record<string, string>;
+  readonly lane: CompileCacheLane;
+  readonly expiresAt: number;
+};
+
 /**
- * The config overrides that hand a run its compile-cache endpoint and token,
- * or `undefined` when the run does not want the cache or the deploy has no
+ * The grant that hands a run its compile-cache endpoint and token, or
+ * `undefined` when the run does not want the cache or the deploy has no
  * public origin or signing secret.
  */
-export const compileCacheOverrides = async (
-  mint: CompileCacheMint,
-): Promise<Record<string, string> | undefined> => {
-  if (!mint.wanted || mint.publicOrigin === undefined || mint.publicOrigin === "" || mint.secret === undefined)
+export const compileCacheOverrides = async (mint: CompileCacheMint): Promise<CompileCacheGrant | undefined> => {
+  if (mint.lane === undefined || mint.publicOrigin === undefined || mint.publicOrigin === "" || mint.secret === undefined)
     return undefined;
+  const expiresAt = Math.floor(mint.createdAtMs / 1000) + Math.ceil(mint.ceilingSec);
   const token = await signCompileCacheToken(mint.secret, {
     repo: mint.repo,
     executionId: mint.executionId,
-    expiresAt: Math.floor(mint.createdAtMs / 1000) + Math.ceil(mint.ceilingSec),
+    lane: mint.lane,
+    expiresAt,
   });
   return {
-    [COMPILE_CACHE_ENDPOINT_KEY]: `${mint.publicOrigin.replace(/\/$/, "")}/v1/compile-cache`,
-    [COMPILE_CACHE_TOKEN_KEY]: token,
+    overrides: {
+      [COMPILE_CACHE_ENDPOINT_KEY]: `${mint.publicOrigin.replace(/\/$/, "")}/v1/compile-cache`,
+      [COMPILE_CACHE_TOKEN_KEY]: token,
+    },
+    lane: mint.lane,
+    expiresAt,
   };
 };

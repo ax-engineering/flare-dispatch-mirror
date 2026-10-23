@@ -28,7 +28,11 @@ const json = (body: unknown, status: number): Response =>
   });
 
 /** Route an inbound request to its handler. */
-export const handleRequest = async (request: Request, env: Env): Promise<Response> => {
+export const handleRequest = async (
+  request: Request,
+  env: Env,
+  ctx?: Pick<ExecutionContext, "waitUntil">,
+): Promise<Response> => {
   const url = new URL(request.url);
   const segments = url.pathname.split("/").filter((s) => s.length > 0);
 
@@ -51,9 +55,13 @@ export const handleRequest = async (request: Request, env: Env): Promise<Respons
 
   // Escape hatch: the compile cache speaks WebDAV (PROPFIND, MKCOL) under
   // arbitrary-depth paths and streams PUT bodies straight into R2, so it takes
-  // the raw `Request` rather than a router route.
+  // the raw `Request` rather than a router route. `waitUntil` carries the
+  // rewrite of an aged entry past the response.
   if (url.pathname.startsWith(`${COMPILE_CACHE_ROUTE}/`)) {
-    return handleCompileCache(request, env);
+    return handleCompileCache(request, env, {
+      now: Date.now,
+      ...(ctx !== undefined ? { waitUntil: (promise: Promise<unknown>) => ctx.waitUntil(promise) } : {}),
+    });
   }
 
   return handleViaApp(request, env);

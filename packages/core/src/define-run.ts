@@ -11,6 +11,7 @@ import type { RunContext } from "./context";
 import type { RunError } from "./errors";
 import type { AdmissionClass } from "./run-admission";
 import type { WritebackSpec } from "./writeback";
+import type { CompileCacheLane } from "./primitives/compile-cache";
 
 export type RunLimits<I = unknown> = {
   readonly maxDurationSec: number;
@@ -221,16 +222,18 @@ export type RunSpec<I, O, IEnc, OEnc> = {
    */
   readonly joinsChildren?: boolean;
   /**
-   * Whether this execution compiles through the shared compile cache. When it
-   * answers `true`, the dispatcher mints a token scoped to the execution's
-   * repository and execution, valid until the execution's queue age plus its
-   * `maxDurationSec` from creation, and injects it with the cache endpoint
-   * under `COMPILE_CACHE_TOKEN_KEY` / `COMPILE_CACHE_ENDPOINT_KEY`
-   * (primitives/compile-cache.ts). A deploy without a public origin or
-   * `HMAC_SECRET` injects neither, and the run compiles without the cache.
+   * The compile-cache lane this execution writes, or `undefined` when it
+   * compiles without the cache. For a lane, the dispatcher mints a token bound
+   * to the execution's repository, execution and lane, valid until the
+   * execution's queue age plus its `maxDurationSec` from creation, and injects
+   * it with the cache endpoint under `COMPILE_CACHE_TOKEN_KEY` /
+   * `COMPILE_CACHE_ENDPOINT_KEY` (primitives/compile-cache.ts). Only a
+   * default-branch execution answers `base`; a pull request's answers its own
+   * `pr-<n>`. A deploy without a public origin or `HMAC_SECRET` injects
+   * neither, and the run compiles without the cache.
    */
-  readonly compileCache?: (input: I) => boolean;
-  readonly run:(input: I) => Effect.Effect<O, RunError, RunContext>;
+  readonly compileCache?: (input: I) => CompileCacheLane | undefined;
+  readonly run: (input: I) => Effect.Effect<O, RunError, RunContext>;
 };
 
 /**

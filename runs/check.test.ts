@@ -565,7 +565,7 @@ describe("check", () => {
         expect(exec?.command).toContain("CARGO_INCREMENTAL=0");
         expect(exec?.command).toContain("SCCACHE_IGNORE_SERVER_IO_ERROR=1");
         expect(exec?.command).toContain("sccache --show-stats");
-        expect(exec?.command).toContain(`( ${CHECK_CMD} )`);
+        expect(exec?.command).toContain(`(\n${CHECK_CMD}\n)`);
         expect(exec?.stdout ?? "").not.toContain(TOKEN);
       }).pipe(Effect.provide(layer));
     });
@@ -592,9 +592,17 @@ describe("check", () => {
       }).pipe(Effect.provide(layer));
     });
 
-    it("asks the dispatcher for a token only when the input asks for the cache", () => {
-      expect(check.compileCache?.({ ...baseInput, compileCache: true } as never)).toBe(true);
-      expect(check.compileCache?.(baseInput as never)).toBe(false);
+    it("asks the dispatcher for a token in the input's lane, read-only when it names none", () => {
+      expect(check.compileCache?.({ ...baseInput, compileCache: true, compileCacheLane: "base" } as never)).toBe("base");
+      expect(check.compileCache?.({ ...baseInput, compileCache: true, compileCacheLane: "pr-7" } as never)).toBe("pr-7");
+      expect(check.compileCache?.({ ...baseInput, compileCache: true } as never)).toBe("read-only");
+      expect(check.compileCache?.(baseInput as never)).toBeUndefined();
+    });
+
+    it("refuses a lane outside the lane grammar", () => {
+      expect(() =>
+        Schema.decodeUnknownSync(check.inputs)({ ...baseInput, compileCache: true, compileCacheLane: "pr-1/../base" }),
+      ).toThrow();
     });
   });
 

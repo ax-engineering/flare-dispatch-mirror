@@ -131,6 +131,8 @@ import { logLinksSuffix, startedSummary } from "./summary-links";
 import { resolveMailboxLinkSecret, signMailboxToken } from "./mailbox-token";
 import { resolveAgentProxySecret, signAgentToken } from "./agent-token";
 import { compileCacheOverrides, resolveCompileCacheSecret } from "./compile-cache-token";
+import { ledgersOf } from "./routes/compile-cache";
+import { revokeAtRunEnd } from "./run-end";
 import {
   deliverSlackVerdict,
   emitSlackNotice,
@@ -539,6 +541,7 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
     // is a deterministic HMAC of the execution id, and `AgentBudget.init` ignores
     // a refill once spending has begun.
     let configOverrides: Record<string, string> | undefined;
+    let agentBudgetArmed = false;
     if (
       run.sandboxImage === "agent" &&
       this.env.AGENT_BUDGET !== undefined &&
@@ -567,20 +570,21 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
           "self-heal.proxy-url": proxyUrl,
           "self-heal.agent-token": token,
         };
+        agentBudgetArmed = true;
       }
     }
 
     // Shared compile cache (routes/compile-cache.ts): a run whose definition
-    // asks for it gets the cache endpoint and a token scoped to this
-    // repository and execution. The token derives from the instance's
+    // names a lane gets the cache endpoint and a token scoped to this
+    // repository, execution and lane. The token derives from the instance's
     // creation time, so every invocation mints the same one and a check
     // command's fingerprint, which covers its env, holds across replays.
     const cacheQueueAgeSec =
       typeof run.limits.admissionMaxQueueAgeSec === "function"
         ? run.limits.admissionMaxQueueAgeSec(input)
         : (run.limits.admissionMaxQueueAgeSec ?? ADMISSION_MAX_QUEUE_AGE_MS / 1000);
-    const cacheOverrides = await compileCacheOverrides({
-      wanted: run.compileCache?.(input) === true,
+    const cacheGrant = await compileCacheOverrides({
+      lane: run.compileCache?.(input),
       repo: payload.github.repo,
       executionId: payload.executionId,
       createdAtMs: event.timestamp.getTime(),
@@ -588,7 +592,7 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
       publicOrigin,
       secret: resolveCompileCacheSecret(this.env),
     });
-    if (cacheOverrides !== undefined) configOverrides = { ...configOverrides, ...cacheOverrides };
+    if (cacheGrant !== undefined) configOverrides = { ...configOverrides, ...cacheGrant.overrides };
 
     // Per-repo container transport pin. It outranks the Worker-wide
     // `SANDBOX_TRANSPORT` in either direction, and with neither set containers
@@ -1729,19 +1733,24 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
         ),
       );
     } finally {
-      // Self-heal: mark the AgentBudget no longer live once the run ends, so the
-      // (deterministic, non-expiring) capability token can't drain the remaining
-      // budget after the execution finishes. Best-effort — the hard token cap
-      // already bounds spend; this revokes the post-run tail. specs/08 § 6.3.
-      if (
-        !engineInterrupted &&
-        configOverrides !== undefined &&
-        this.env.AGENT_BUDGET !== undefined
-      ) {
-        await this.env.AGENT_BUDGET.get(this.env.AGENT_BUDGET.idFromName(payload.executionId))
-          .kill()
-          .catch(() => {});
-      }
+      // Revoke what the run held (run-end.ts): the self-heal AgentBudget of a
+      // run that armed it, so its non-expiring token cannot drain the budget
+      // after the execution (specs/08 § 6.3), and the compile-cache writes of
+      // a writable lane, so the token stops writing before it expires.
+      const agentBudget = this.env.AGENT_BUDGET;
+      await revokeAtRunEnd(
+        {
+          engineInterrupted,
+          agentBudgetArmed,
+          executionId: payload.executionId,
+          repo: payload.github.repo,
+          ...(cacheGrant !== undefined ? { compileCache: { lane: cacheGrant.lane, expiresAt: cacheGrant.expiresAt } } : {}),
+        },
+        {
+          agentBudget: (executionId) => agentBudget?.get(agentBudget.idFromName(executionId)),
+          ledger: (repo) => ledgersOf(this.env)(repo),
+        },
+      );
     }
   }
 }

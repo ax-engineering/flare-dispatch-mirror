@@ -3,7 +3,7 @@
 // A run whose definition declares `compileCache` gets two config values the
 // dispatcher injects when the run starts (apps/dispatcher/src/workflow.ts):
 // the WebDAV endpoint of the dispatcher's compile-cache route and a token
-// scoped to the run's repository and execution. `compileCacheCommand` wraps a
+// scoped to the run's repository, execution and lane. `compileCacheCommand` wraps a
 // shell command so every `rustc` it invokes goes through sccache against that
 // endpoint, and prints sccache's statistics into the command's log when the
 // command ends.
@@ -23,6 +23,23 @@
 export const COMPILE_CACHE_ENDPOINT_KEY = "compile-cache.endpoint";
 /** Config key carrying the run's compile-cache token. */
 export const COMPILE_CACHE_TOKEN_KEY = "compile-cache.token";
+
+/**
+ * Where an execution's compile-cache writes land, bound into its token:
+ *
+ * - `base`      the default branch's lane: reads and writes it.
+ * - `pr-<n>`    pull request `n`'s lane: writes it, reads it and then `base`.
+ * - `read-only` reads `base` and writes nothing.
+ *
+ * No execution reads another pull request's lane, so an entry a pull request
+ * writes reaches only that pull request's later executions.
+ */
+export type CompileCacheLane = "base" | "read-only" | `pr-${number}`;
+
+const LANE = /^(base|read-only|pr-[1-9][0-9]{0,9})$/;
+
+/** Whether `value` names a lane. */
+export const isCompileCacheLane = (value: string): value is CompileCacheLane => LANE.test(value);
 
 /** The environment the wrapped command needs from the run. */
 export type CompileCacheAccess = {
@@ -55,6 +72,8 @@ export const compileCacheEnv = (access: CompileCacheAccess): Record<string, stri
  *   whole command.
  * - The command runs in a subshell, so an `exec` inside it returns here and
  *   the statistics still print; the wrapper exits with the command's status.
+ *   The closing parenthesis sits on its own line, so a trailing `#` comment
+ *   in the command cannot swallow it.
  */
 export const compileCacheCommand = (command: string, repo: string): string => {
   if (!REPO_SLUG.test(repo)) throw new Error(`compileCacheCommand: invalid repo ${JSON.stringify(repo)}`);
@@ -77,7 +96,9 @@ export const compileCacheCommand = (command: string, repo: string): string => {
     "else",
     "  echo 'compile cache: sccache, rustc or cache access unavailable; compiling locally' >&2",
     "fi",
-    `( ${command} )`,
+    "(",
+    command,
+    ")",
     "fd_cc_status=$?",
     "if [ \"$fd_cc_on\" = 1 ]; then",
     "  echo '--- sccache --show-stats ---'",
