@@ -220,7 +220,17 @@ export type RunSpec<I, O, IEnc, OEnc> = {
    * waiting on them leaves this unset, and its children outlive it.
    */
   readonly joinsChildren?: boolean;
-  readonly run: (input: I) => Effect.Effect<O, RunError, RunContext>;
+  /**
+   * Whether this execution compiles through the shared compile cache. When it
+   * answers `true`, the dispatcher mints a token scoped to the execution's
+   * repository and execution, valid until the execution's queue age plus its
+   * `maxDurationSec` from creation, and injects it with the cache endpoint
+   * under `COMPILE_CACHE_TOKEN_KEY` / `COMPILE_CACHE_ENDPOINT_KEY`
+   * (primitives/compile-cache.ts). A deploy without a public origin or
+   * `HMAC_SECRET` injects neither, and the run compiles without the cache.
+   */
+  readonly compileCache?: (input: I) => boolean;
+  readonly run:(input: I) => Effect.Effect<O, RunError, RunContext>;
 };
 
 /**

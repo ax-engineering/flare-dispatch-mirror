@@ -334,6 +334,15 @@ export interface Env {
   readonly PUBLIC_ORIGIN?: string;
 
   /**
+   * Compile-cache bounds (routes/compile-cache.ts): one entry's bytes, one
+   * repository prefix's bytes, and the entry age in days the sweep deletes.
+   * Unset or malformed → 100 MiB, 20 GiB, 14 days.
+   */
+  readonly COMPILE_CACHE_MAX_OBJECT_BYTES?: string;
+  readonly COMPILE_CACHE_MAX_REPO_BYTES?: string;
+  readonly COMPILE_CACHE_TTL_DAYS?: string;
+
+  /**
    * Cloudflare Email Routing `send_email` binding — backs the `email`
    * capability + the Workflow's completion-notify (`notify.emails` in the
    * dispatch body). Declared as `"send_email": [{ "name": "SEND_EMAIL" }]` in

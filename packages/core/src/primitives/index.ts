@@ -34,6 +34,13 @@ export {
   type CacheEntry,
   type PrebuiltBinary,
 } from "./prebuilt-binary";
+export {
+  compileCacheCommand,
+  compileCacheEnv,
+  COMPILE_CACHE_ENDPOINT_KEY,
+  COMPILE_CACHE_TOKEN_KEY,
+  type CompileCacheAccess,
+} from "./compile-cache";
 export { sharded, type Shard } from "./sharded";
 export { fanOut, type FanOutShard } from "./fan-out";
 export { waitForAnyChildDurably, waitForChildren, waitForChildrenDurably } from "./wait-for-children";

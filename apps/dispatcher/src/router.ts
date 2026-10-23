@@ -19,6 +19,7 @@
 import type { Env } from "./env";
 import { handleViaApp } from "./http-app";
 import { handleBrowserCdp } from "./routes/browser-cdp";
+import { COMPILE_CACHE_ROUTE, handleCompileCache } from "./routes/compile-cache";
 
 const json = (body: unknown, status: number): Response =>
   new Response(JSON.stringify(body), {
@@ -46,6 +47,13 @@ export const handleRequest = async (request: Request, env: Env): Promise<Respons
     }
     const requestId = request.headers.get("cf-ray") ?? "no-ray";
     return handleBrowserCdp(request, env, requestId);
+  }
+
+  // Escape hatch: the compile cache speaks WebDAV (PROPFIND, MKCOL) under
+  // arbitrary-depth paths and streams PUT bodies straight into R2, so it takes
+  // the raw `Request` rather than a router route.
+  if (url.pathname.startsWith(`${COMPILE_CACHE_ROUTE}/`)) {
+    return handleCompileCache(request, env);
   }
 
   return handleViaApp(request, env);

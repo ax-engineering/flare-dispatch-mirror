@@ -192,6 +192,36 @@ RUN if [ "$WITH_RUST" = "true" ]; then \
       echo "WITH_RUST=false — no prebuilt DuckDB baked. Lean image."; \
     fi
 
+# ── sccache (gated by the WITH_RUST build arg) ──────────────────────────────
+#
+# A run dispatched with `compileCache` (runs/check.ts) compiles through
+# sccache against the dispatcher's compile-cache route
+# (apps/dispatcher/src/routes/compile-cache.ts). The static musl release for
+# the build architecture is pinned by SHA-256 and only the binary is
+# extracted. Move SCCACHE_VERSION and both digests together; the route serves
+# the WebDAV methods this release's OpenDAL backend issues.
+ARG SCCACHE_VERSION=v0.18.0
+RUN if [ "$WITH_RUST" = "true" ]; then \
+      set -eux; \
+      arch="$(uname -m)"; \
+      case "$arch" in \
+        x86_64)  sha256=45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89 ;; \
+        aarch64) sha256=2b3284d5da3b46a47dc4229e75bb7b88ac4aa99c8d754fb7d2f84997e5a4354a ;; \
+        *) echo "sccache: unsupported architecture $arch" >&2; exit 1 ;; \
+      esac; \
+      name="sccache-${SCCACHE_VERSION}-${arch}-unknown-linux-musl"; \
+      archive="/tmp/${name}.tar.gz"; \
+      curl -fsSL -o "$archive" \
+        "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/${name}.tar.gz"; \
+      echo "${sha256}  ${archive}" | sha256sum -c -; \
+      tar -xzf "$archive" --strip-components=1 -C /usr/local/bin "${name}/sccache"; \
+      rm -f "$archive"; \
+      chmod 0755 /usr/local/bin/sccache; \
+      sccache --version; \
+    else \
+      echo "WITH_RUST=false — no sccache baked. Lean image."; \
+    fi
+
 # ── demo-agent layer ────────────────────────────────────────────────────────
 #
 # The `product-demo` run's bundled CLI (record start/stop, play, gif,

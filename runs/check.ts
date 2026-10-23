@@ -56,6 +56,10 @@ import {
   step,
 } from "@fractalboxdev/flare-dispatch-core";
 import {
+  compileCacheCommand,
+  compileCacheEnv,
+  COMPILE_CACHE_ENDPOINT_KEY,
+  COMPILE_CACHE_TOKEN_KEY,
   durableExec,
   ensureWorkspace,
   isRestorableEntry,
@@ -124,6 +128,13 @@ const CheckInput = Schema.Struct({
       }).pipe(Schema.filter(isRestorableEntry)),
     ),
   ),
+  /**
+   * Compile Rust through the shared compile cache: the command runs under
+   * `compileCacheCommand` (sccache as `RUSTC_WRAPPER`, statistics printed at
+   * the end) with the endpoint and token the dispatcher injected. Without an
+   * injected token the command runs unwrapped.
+   */
+  compileCache: Schema.optional(Schema.Boolean),
   /**
    * Non-sensitive env only. Dispatch inputs are persisted (executions row +
    * Workflow params) — never put credentials here. Same contract as
@@ -241,7 +252,8 @@ export const check = defineRun({
   // unlabelled dispatch resolves the same key, names the same check-run, and
   // gets the same instance id as under 1.0.0.
   // 1.2.0 — additive: `restore`. A dispatch without it runs as under 1.1.0.
-  version: "1.2.0",
+  // 1.3.0 — additive: `compileCache`. A dispatch without it runs as under 1.2.0.
+  version: "1.3.0",
 
   inputs: CheckInput,
   outputs: CheckOutput,
@@ -283,6 +295,8 @@ export const check = defineRun({
   // work). A webhook dispatch is unlabelled, so it reads `check.command:<repo>`.
   optIn: ({ input }) =>
     input.command !== undefined ? [] : commandKeys(input.repo, input.checkLabel),
+
+  compileCache: (input) => input.compileCache === true,
 
   limits: {
     // Run-body wall-time ceiling, enforced by the dispatcher: one full 2700 s
@@ -356,6 +370,21 @@ export const check = defineRun({
         required: true,
       });
 
+      // Compile-cache access, read INLINE like the secrets above: the token is
+      // a credential and stays out of checkpointed state. The dispatcher mints
+      // the same token on every invocation, so the command's fingerprint holds.
+      const cacheEndpoint = input.compileCache === true ? yield* config.get(COMPILE_CACHE_ENDPOINT_KEY) : undefined;
+      const cacheToken = input.compileCache === true ? yield* config.get(COMPILE_CACHE_TOKEN_KEY) : undefined;
+      const cache =
+        cacheEndpoint !== undefined && cacheEndpoint !== "" && cacheToken !== undefined && cacheToken !== ""
+          ? { endpoint: cacheEndpoint, token: cacheToken }
+          : undefined;
+      if (input.compileCache === true && cache === undefined) {
+        yield* io.log("warn", "check: compile cache requested but not injected — compiling without it");
+      }
+      const execCommand = cache === undefined ? command : compileCacheCommand(command, input.repo);
+      const cacheEnv = cache === undefined ? {} : compileCacheEnv(cache);
+
       // checkout — container + clone at the SHA (+ optional cached install).
       const { container, dir } = yield* step("checkout", () =>
         workspace({
@@ -394,12 +423,13 @@ export const check = defineRun({
           ),
         exec: (ws) => ({
           cwd: ws.dir,
-          command,
-          // Per-dispatch `env` wins over a same-named Worker secret.
-          env: { ...secretEnv, ...input.env },
+          command: execCommand,
+          // Per-dispatch `env` wins over a same-named Worker secret; the
+          // compile-cache endpoint and token win over both.
+          env: { ...secretEnv, ...input.env, ...cacheEnv },
           // Defense in depth (header): scrub secret VALUES from the captured
           // log before it's persisted, in case the command echoes its env.
-          redactValues: Object.values(secretEnv),
+          redactValues: [...Object.values(secretEnv), ...(cache === undefined ? [] : [cache.token])],
           timeoutSec: timeoutSec ?? DEFAULT_TIMEOUT_SEC,
         }),
       });

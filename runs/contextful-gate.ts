@@ -336,10 +336,11 @@ export const planStages = (
 
 export const contextfulGate = defineRun({
   name: "contextful-gate",
+  // 1.4.0 — every part compiles through the shared compile cache.
   // 1.3.0 — two-tier gate: `gate.lightLabels:<repo>` splits light parts (pull
   // requests) from heavy parts (pushes to the default branch).
   // 1.2.2 — a reopen ranks above the close marker of its own second.
-  version: "1.3.0",
+  version: "1.4.0",
   inputs: Input,
   outputs: Output,
   triggers: [
@@ -633,6 +634,10 @@ export const contextfulGate = defineRun({
                   // the stage fetches its own crates is not decidable here
                   // (specs/adr/0007-cost-efficient-execution.md § Fan-out parts).
                   install: true,
+                  // Every part compiles the workspace; the shared compile
+                  // cache (sccache over the dispatcher's compile-cache route)
+                  // replaces each part's cold compile with cache reads.
+                  compileCache: true,
                   ...(prebuilt === null
                     ? {}
                     : { restore: [{ key: prebuilt.key, base: prebuilt.base, paths: prebuilt.paths }] }),

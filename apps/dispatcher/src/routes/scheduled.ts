@@ -55,6 +55,7 @@ import {
   type UndeliveredRow,
 } from "../delivery-sweep";
 import { toInstanceId } from "../instance-id";
+import { COMPILE_CACHE_SWEEP_CRON, resolveCompileCacheLimits, sweepCompileCache } from "./compile-cache";
 import { type ScheduleMatch, schedulesByCron } from "../registry";
 import type { Env } from "../env";
 
@@ -188,6 +189,24 @@ export const liveDeliverySweep =
     }
   };
 
+/** The compile-cache sweep (routes/compile-cache.ts); logs and swallows its own failure. */
+export const liveCompileCacheSweep =
+  (env: Env): RunDeliverySweep =>
+  async () => {
+    try {
+      const result = await sweepCompileCache(env.RUNS_STORAGE, resolveCompileCacheLimits(env), Date.now());
+      for (const repo of result.repos) {
+        console.info(
+          `[compile-cache-sweep] ${repo.repo} bytes=${repo.bytes} objects=${repo.objects} expired=${repo.expired} evicted=${repo.evicted}${result.truncated ? " (listing truncated)" : ""}`,
+        );
+      }
+    } catch (cause) {
+      console.error(
+        `[compile-cache-sweep] tick failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+      );
+    }
+  };
+
 /** Trim a long cron to fit inline in a log message. */
 const fmt = (cron: string): string => (cron.length > 40 ? `${cron.slice(0, 37)}...` : cron);
 
@@ -202,6 +221,7 @@ const fmt = (cron: string): string => (cron.length > 40 ? `${cron.slice(0, 37)}.
  * @param scheduledTime   `controller.scheduledTime` — epoch ms.
  * @param resolveHead     installation + branch-head lookup for runs that target a branch.
  * @param deliverySweep   the verdict reconcile sweep, run on `DELIVERY_SWEEP_CRON`.
+ * @param compileCacheSweep the compile-cache sweep, run on `COMPILE_CACHE_SWEEP_CRON`.
  */
 export const handleScheduled = async (
   env: Env,
@@ -209,10 +229,15 @@ export const handleScheduled = async (
   scheduledTime: number,
   resolveHead: ResolveScheduledHead = githubScheduledHead(env),
   deliverySweep: RunDeliverySweep = liveDeliverySweep(env),
+  compileCacheSweep: RunDeliverySweep = liveCompileCacheSweep(env),
 ): Promise<void> => {
-  // The verdict reconcile sweep owns its own cron (delivery-sweep.ts).
-  const isSweepTick = cron === DELIVERY_SWEEP_CRON;
-  if (isSweepTick) await deliverySweep();
+  // The verdict reconcile sweep owns its own cron (delivery-sweep.ts), and the
+  // compile-cache sweep its own (routes/compile-cache.ts).
+  const isDeliveryTick = cron === DELIVERY_SWEEP_CRON;
+  const isCompileCacheTick = cron === COMPILE_CACHE_SWEEP_CRON;
+  const isSweepTick = isDeliveryTick || isCompileCacheTick;
+  if (isDeliveryTick) await deliverySweep();
+  if (isCompileCacheTick) await compileCacheSweep();
 
   const matches = schedulesByCron(cron);
 

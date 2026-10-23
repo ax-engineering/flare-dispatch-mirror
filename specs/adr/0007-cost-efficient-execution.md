@@ -71,6 +71,26 @@ so a budget buys more checks.
 - The image's library version and the consumer's pinned crate version move
   together.
 
+### Shared compile cache
+
+- A run whose definition answers `compileCache` with `true` compiles Rust
+  through sccache. Every contextful gate part does. The dispatcher's
+  `/v1/compile-cache` route serves sccache's WebDAV backend (GET, HEAD, PUT,
+  `Depth: 0` PROPFIND, MKCOL) from `RUNS_STORAGE` under
+  `compile-cache/<owner>/<name>/`; the client's key prefix below that is
+  `<repo>/<rustc release>/<host triple>`.
+- The dispatcher mints one token per execution: an HMAC under a key derived
+  from `HMAC_SECRET`, bound to the repository and execution, expiring at the
+  instance's creation plus its queue age and `maxDurationSec`. A token for
+  another repository, a forged one and an expired one are refused.
+- One entry is at most `COMPILE_CACHE_MAX_OBJECT_BYTES`, one repository prefix
+  at most `COMPILE_CACHE_MAX_REPO_BYTES` as of the last hourly sweep, and an
+  entry older than `COMPILE_CACHE_TTL_DAYS` is deleted. The sweep evicts the
+  oldest-written entries down to 90% of the ceiling.
+- A cache outage never fails a part: the wrapper starts the sccache server
+  first and compiles without `RUSTC_WRAPPER` when it does not start; a started
+  server reads an unreachable entry as a miss.
+
 ## Rationale
 
 The receiver is the last point where skipping costs nothing: past it, a skip
@@ -80,6 +100,11 @@ makes the receiver read an optimisation rather than the only line of defence.
 A content-addressed key makes a second upload pure waste, so the head check is
 always safe. Separating `unapplied` from `miss` keeps a broken restore visible
 in logs without paying for it in container time.
+
+Thirty gate parts each compiled the same workspace cold; a content-addressed
+compiler cache turns all but the first compile of each crate into a read.
+sccache's WebDAV backend needs no cloud credentials in the container, so the
+Worker's R2 binding stays the only storage authority.
 
 Building a C++ engine from source in every part buys nothing a prebuilt
 library does not, and only the consumer can decide whether CI may link it
@@ -92,6 +117,9 @@ dynamically while release builds stay static.
 - A broken restore still costs a cold install per part until the transport is
   fixed, but no longer a repeated pack and upload.
 - The lean image grows by the prebuilt libraries' size.
+- Pull-request parts write to the repository's shared prefix, so a
+  same-repository pull request can place an entry a later default-branch
+  part reads.
 
 ## Revisit triggers
 

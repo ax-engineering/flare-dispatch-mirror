@@ -546,6 +546,58 @@ describe("check", () => {
     },
   );
 
+  describe("compile cache", () => {
+    const ENDPOINT = "https://dispatch.example/v1/compile-cache";
+    const TOKEN = "cc1.1700000000.ZXhlYw.mac";
+
+    it.effect("wraps the command in sccache and hands it the injected endpoint and token", () => {
+      const { layer, handles } = makeCFRuntimeTest({
+        sandboxProgram: { [CHECK_CMD]: { exitCode: 0, stdout: `token=${TOKEN}` } },
+        config: { "compile-cache.endpoint": ENDPOINT, "compile-cache.token": TOKEN },
+      });
+      return Effect.gen(function* () {
+        const result = yield* check.run({ ...baseInput, compileCache: true, env: { SCCACHE_WEBDAV_TOKEN: "spoofed" } });
+        expect(result.exitCode).toBe(0);
+        const exec = handles.sandbox.execs.find((e) => e.command.includes(CHECK_CMD));
+        expect(exec?.env).toEqual({ SCCACHE_WEBDAV_ENDPOINT: ENDPOINT, SCCACHE_WEBDAV_TOKEN: TOKEN });
+        expect(exec?.command).toContain("export RUSTC_WRAPPER=sccache");
+        expect(exec?.command).toContain('export SCCACHE_WEBDAV_KEY_PREFIX="owner/name/$fd_cc_release/$fd_cc_host"');
+        expect(exec?.command).toContain("CARGO_INCREMENTAL=0");
+        expect(exec?.command).toContain("SCCACHE_IGNORE_SERVER_IO_ERROR=1");
+        expect(exec?.command).toContain("sccache --show-stats");
+        expect(exec?.command).toContain(`( ${CHECK_CMD} )`);
+        expect(exec?.stdout ?? "").not.toContain(TOKEN);
+      }).pipe(Effect.provide(layer));
+    });
+
+    it.effect("runs the command unwrapped when no token was injected", () => {
+      const { layer, handles } = makeCFRuntimeTest({ sandboxProgram: { [CHECK_CMD]: { exitCode: 0 } } });
+      return Effect.gen(function* () {
+        yield* check.run({ ...baseInput, compileCache: true });
+        const exec = handles.sandbox.execs.find((e) => e.command.includes(CHECK_CMD));
+        expect(exec?.command).toBe(CHECK_CMD);
+        expect(exec?.env ?? {}).toEqual({});
+      }).pipe(Effect.provide(layer));
+    });
+
+    it.effect("ignores injected access when the dispatch does not ask for the cache", () => {
+      const { layer, handles } = makeCFRuntimeTest({
+        sandboxProgram: { [CHECK_CMD]: { exitCode: 0 } },
+        config: { "compile-cache.endpoint": ENDPOINT, "compile-cache.token": TOKEN },
+      });
+      return Effect.gen(function* () {
+        yield* check.run(baseInput);
+        const exec = handles.sandbox.execs.find((e) => e.command.includes(CHECK_CMD));
+        expect(exec?.command).toBe(CHECK_CMD);
+      }).pipe(Effect.provide(layer));
+    });
+
+    it("asks the dispatcher for a token only when the input asks for the cache", () => {
+      expect(check.compileCache?.({ ...baseInput, compileCache: true } as never)).toBe(true);
+      expect(check.compileCache?.(baseInput as never)).toBe(false);
+    });
+  });
+
   it.effect(
     "secrets — a named-but-unset secret fails with SecretsMissing before checkout or exec",
     () => {

@@ -130,6 +130,7 @@ import { buildLogsUrl, resolveLogLinkSecret, signLogToken } from "./log-token";
 import { logLinksSuffix, startedSummary } from "./summary-links";
 import { resolveMailboxLinkSecret, signMailboxToken } from "./mailbox-token";
 import { resolveAgentProxySecret, signAgentToken } from "./agent-token";
+import { compileCacheOverrides, resolveCompileCacheSecret } from "./compile-cache-token";
 import {
   deliverSlackVerdict,
   emitSlackNotice,
@@ -568,6 +569,26 @@ export class RunWorkflow extends WorkflowEntrypoint<Env> {
         };
       }
     }
+
+    // Shared compile cache (routes/compile-cache.ts): a run whose definition
+    // asks for it gets the cache endpoint and a token scoped to this
+    // repository and execution. The token derives from the instance's
+    // creation time, so every invocation mints the same one and a check
+    // command's fingerprint, which covers its env, holds across replays.
+    const cacheQueueAgeSec =
+      typeof run.limits.admissionMaxQueueAgeSec === "function"
+        ? run.limits.admissionMaxQueueAgeSec(input)
+        : (run.limits.admissionMaxQueueAgeSec ?? ADMISSION_MAX_QUEUE_AGE_MS / 1000);
+    const cacheOverrides = await compileCacheOverrides({
+      wanted: run.compileCache?.(input) === true,
+      repo: payload.github.repo,
+      executionId: payload.executionId,
+      createdAtMs: event.timestamp.getTime(),
+      ceilingSec: (Number.isFinite(cacheQueueAgeSec) ? cacheQueueAgeSec : 0) + run.limits.maxDurationSec,
+      publicOrigin,
+      secret: resolveCompileCacheSecret(this.env),
+    });
+    if (cacheOverrides !== undefined) configOverrides = { ...configOverrides, ...cacheOverrides };
 
     // Per-repo container transport pin. It outranks the Worker-wide
     // `SANDBOX_TRANSPORT` in either direction, and with neither set containers

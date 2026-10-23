@@ -13,6 +13,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 import { DELIVERY_SWEEP_CRON } from "../delivery-sweep";
+import { COMPILE_CACHE_SWEEP_CRON } from "./compile-cache";
 import { handleScheduled, liveDeliverySweepPorts } from "./scheduled";
 import type { Env } from "../env";
 import { makeFakeR2, makeFakeWorkflow } from "../test-helpers";
@@ -168,6 +169,19 @@ describe("handleScheduled — verdict reconcile sweep", () => {
     await handleScheduled(makeEnv(workflow), DELIVERY_SWEEP_CRON, FIRED_AT, undefined, sweep);
 
     expect(sweep).toHaveBeenCalledTimes(1);
+    expect(workflow.calls).toHaveLength(0);
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("routes the compile-cache cron to the compile-cache sweep alone", async () => {
+    const workflow = makeFakeWorkflow();
+    const delivery = vi.fn(async () => {});
+    const compileCache = vi.fn(async () => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await handleScheduled(makeEnv(workflow), COMPILE_CACHE_SWEEP_CRON, FIRED_AT, undefined, delivery, compileCache);
+    expect(compileCache).toHaveBeenCalledTimes(1);
+    expect(delivery).not.toHaveBeenCalled();
     expect(workflow.calls).toHaveLength(0);
     expect(warn).not.toHaveBeenCalled();
     warn.mockRestore();

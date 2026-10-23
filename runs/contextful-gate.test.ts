@@ -321,6 +321,7 @@ describe("contextful-gate", () => {
             expect.objectContaining({
               checkLabel: stage,
               install: true,
+              compileCache: true,
               restore,
               command: `if [ -x ${BIN} ] && ${BIN} --help >/dev/null 2>&1; then exec ${BIN} gate --predecessors --stage ${stage} --base ${BASE_SHA}; else exec ${CARGO_RUN} gate --predecessors --stage ${stage} --base ${BASE_SHA}; fi`,
             }),
@@ -337,6 +338,7 @@ describe("contextful-gate", () => {
           const part = spawn.input as { checkLabel: string; command: string; install: boolean; restore?: unknown };
           expect(part.command).toBe(`${CARGO_RUN} gate --predecessors --stage ${part.checkLabel} --base ${BASE_SHA}`);
           expect(part.install).toBe(true);
+          expect((part as { compileCache?: boolean }).compileCache).toBe(true);
           expect(part.restore).toBeUndefined();
         }
       }).pipe(Effect.provide(layer));
