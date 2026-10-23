@@ -30,7 +30,7 @@ import { check } from "./check";
 const REPO = "fractalboxdev/contextful";
 const SHA40 = /^[a-f0-9]{40}$/i;
 const ZERO_SHA = "0".repeat(40);
-const CI_PACKAGE = "contextful-ci";
+export const CI_PACKAGE = "contextful-ci";
 const CARGO_RUN_CI = `cargo run --locked -q -p ${CI_PACKAGE} --`;
 const DISCOVER = `${CARGO_RUN_CI} stages --parts`;
 const STAGE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
@@ -44,7 +44,7 @@ const checkoutCommand = (sha: string): string =>
  * takes 550–760 s, and its ordinary suite another ~1100 s, so a single part needs
  * up to ~1750 s; 2700 s keeps that at about 65% of the deadline.
  */
-const STAGE_TIMEOUT_SEC = 2700;
+export const STAGE_TIMEOUT_SEC = 2700;
 /** Admission queue age a part may wait before it starts. */
 const STAGE_QUEUE_SEC = 90 * 60;
 /** A spawned part's whole budget: its queue age plus the check run's ceiling. */

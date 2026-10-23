@@ -56,6 +56,9 @@
   one.
 - Branch protection on the light tier is the repository owner's setting, not
   the dispatcher's.
+- The compile cache's `@base` lane does not wait on this opt-in: every
+  default-branch push warms it (ADR-0007 § Base-lane warm), and the warm
+  stands down when the heavy tier compiles the same part.
 
 ### Pools sized under the spend guard
 

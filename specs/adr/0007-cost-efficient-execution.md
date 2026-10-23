@@ -1,7 +1,7 @@
 # ADR-0007 — Cost-efficient execution: dispatch only work, upload each cache key once, build heavy native dependencies once
 
 **Status:** proposed
-**Related:** `apps/dispatcher/src/routes/webhook.ts` · `runs/check.ts` · `runs/offload-test.ts` · `runs/worker-deploy.ts` · `packages/runtime-cf/src/cache-r2.ts` · `packages/runtime-cf/src/cache-restore-or.ts` · `runs/contextful-gate.ts` · `infra/Dockerfile.sandbox-demo` · ADR-0006
+**Related:** `apps/dispatcher/src/routes/webhook.ts` · `runs/check.ts` · `runs/offload-test.ts` · `runs/worker-deploy.ts` · `packages/runtime-cf/src/cache-r2.ts` · `packages/runtime-cf/src/cache-restore-or.ts` · `runs/contextful-gate.ts` · `runs/contextful-cache-warm.ts` · `infra/Dockerfile.sandbox-demo` · ADR-0006
 
 ## Context
 
@@ -101,6 +101,28 @@ so a budget buys more checks.
   first and compiles without `RUSTC_WRAPPER` when it does not start; a started
   server reads an unreachable entry as a miss.
 
+### Base-lane warm
+
+- Every push to contextful's default branch starts `contextful-cache-warm`,
+  whatever the two-tier opt-in. It needs no `CONFIG_KV` key.
+- One container per head: checkout with install, the gate's prebuilt
+  `contextful-ci`, then the gate's `workspace.compile` part
+  (`cargo test --workspace --no-run`) under the compile-cache wrapper, with
+  the identical command, checkout path and environment a gate part uses. It
+  spawns no child and posts no part check-run.
+- Its token's lane is `base`. Before any checkout the run reads the default
+  branch's head and skips unless it equals the run's head; an unreadable head
+  skips too. Pull-request gates keep reading `@pr-<n>` then `@base` and
+  writing `@pr-<n>`.
+- One supersession group per repository and default branch, ranked by the
+  head commit's timestamp: a newer head cancels the older warm, queued or
+  running. The idempotency key is the head, so an equal head warms once.
+- It skips when the deploy injects no compile-cache access, and when
+  `gate.lightLabels:<repo>` omits `workspace.compile`: the heavy tier then
+  compiles that part into `@base` on the same push.
+- A failed compile concludes the warm green with its exit code; the gate
+  owns the verdict on the head.
+
 ## Rationale
 
 The receiver is the last point where skipping costs nothing: past it, a skip
@@ -123,6 +145,15 @@ links and runs. Lanes confine each pull request's writes to itself. A ledger
 counted at admission keeps the byte bound against a client that ignores
 sccache's write pattern, where a bound measured hourly would not.
 
+Lanes leave `@base` empty unless a default-branch execution compiles. The
+heavy tier is opt-in, so without the warm every pull request's first gate
+compiles cold. sccache keys an entry on the compile's arguments, working
+directory and `CARGO_*` environment, so the warm runs the gate's own part
+command rather than a cargo invocation of its own: a `cargo run` parent or
+another target directory would write entries no part reads. One compile-only
+part in one container is the cheapest build every `workspace.*` part links
+against; superseding by head keeps a burst of merges to one live warm.
+
 Building a C++ engine from source in every part buys nothing a prebuilt
 library does not, and only the consumer can decide whether CI may link it
 dynamically while release builds stay static.
@@ -136,9 +167,14 @@ dynamically while release builds stay static.
 - The lean image grows by the prebuilt libraries' size.
 - A pull request reuses entries across its own pushes and the default
   branch's entries. It reuses nothing another pull request compiled. Only
-  default-branch executions write `@base`. A gate whose default-branch tier
-  runs other parts than its pull-request tier therefore populates `@base` only
-  for the compiles those parts share.
+  default-branch executions write `@base`: the warm, and the heavy tier when
+  configured.
+- The warm fills `@base` for `workspace.compile`'s build. A part that
+  compiles under other features or another target directory, such as a
+  `features.*` part, reads only the crates whose compile matches; warming it
+  needs a compile-only mode of that part in the consumer's `contextful-ci`.
+- Each default-branch head costs one container for the warm's prebuild and
+  compile, and posts one `flare-dispatch/contextful-cache-warm` check-run.
 - A pull request's lane holds its entries until they expire, after the pull
   request closes too.
 - A deploy whose `wrangler.jsonc` lacks the `COMPILE_CACHE_LEDGER` binding

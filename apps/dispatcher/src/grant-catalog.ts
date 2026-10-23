@@ -144,6 +144,7 @@ export const RUN_GRANTS: Readonly<Record<string, RunGrant>> = {
   "offload-test": { profiles: POLYGLOT_BUILD, rollout: "legacy" },
   check: { profiles: POLYGLOT_BUILD, rollout: "legacy" },
   "contextful-gate": { profiles: POLYGLOT_BUILD, rollout: "legacy" },
+  "contextful-cache-warm": { profiles: POLYGLOT_BUILD, rollout: "legacy" },
   oxlint: { profiles: JS_BUILD, rollout: "legacy" },
   "vitest-shard": { profiles: JS_BUILD, rollout: "legacy" },
   // The parent of a fan-out does no work of its own beyond the checkout; the

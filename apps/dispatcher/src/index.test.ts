@@ -108,6 +108,7 @@ describe("GET /health", () => {
         "cdp-acceptance",
         "check",
         "ci-triage-pr",
+        "contextful-cache-warm",
         "contextful-gate",
         "contextful-measures",
         "contextful-protocol",
