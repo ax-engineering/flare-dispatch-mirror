@@ -44,6 +44,13 @@ import {
   workerDeploy,
 } from "@fractalboxdev/flare-dispatch-runs";
 
+/**
+ * A run registered without its webhook triggers: no GitHub event starts it,
+ * and it stays dispatchable by name. contextful uses FlareDispatch for tag
+ * releases only, so its pull-request gate and cache warm fire on no push.
+ */
+const dispatchOnly = <I, O>(run: Run<I, O>): Run<I, O> => ({ ...run, triggers: [] });
+
 /** name → Run. The single seam new runs are registered through. */
 const RUN_REGISTRY: Record<string, Run<unknown, unknown>> = {
   [offloadTest.name]: offloadTest as Run<unknown, unknown>,
@@ -75,8 +82,8 @@ const RUN_REGISTRY: Record<string, Run<unknown, unknown>> = {
   [contextfulReleaseFormula.name]: contextfulReleaseFormula as Run<unknown, unknown>,
   [oxlint.name]: oxlint as Run<unknown, unknown>,
   [check.name]: check as Run<unknown, unknown>,
-  [contextfulGate.name]: contextfulGate as Run<unknown, unknown>,
-  [contextfulCacheWarm.name]: contextfulCacheWarm as Run<unknown, unknown>,
+  [contextfulGate.name]: dispatchOnly(contextfulGate) as Run<unknown, unknown>,
+  [contextfulCacheWarm.name]: dispatchOnly(contextfulCacheWarm) as Run<unknown, unknown>,
   [vitestShard.name]: vitestShard as Run<unknown, unknown>,
   [emailOtpLogin.name]: emailOtpLogin as Run<unknown, unknown>,
   [finopsAudit.name]: finopsAudit as Run<unknown, unknown>,

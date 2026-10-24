@@ -551,23 +551,15 @@ describe("POST /v1/webhooks/github — pull request closed", () => {
     },
   });
 
-  it("starts one group close per superseding run and dispatches no run", async () => {
+  it("starts no group close and dispatches no run, since no registered run supersedes on a pull request", async () => {
     for (const merged of [true, false]) {
       const { env, workflow } = fixture();
       const res = await handleRequest(await webhookRequest(closed(merged), { event: "pull_request" }), env);
       expect(res.status).toBe(202);
       const body = (await res.json()) as { dispatched: unknown[]; closed?: unknown[] };
       expect(body.dispatched).toEqual([]);
-      expect(workflow.calls).toHaveLength(1);
-      expect(workflow.calls[0]?.params).toEqual({
-        closeGroup: {
-          group: `contextful-gate:${REPO}#42`,
-          rank: Date.parse("2026-10-19T10:00:05Z") + 1,
-          repo: REPO,
-          installation_id: 77,
-        },
-      });
-      expect(body.closed).toEqual([{ group: `contextful-gate:${REPO}#42`, instanceId: workflow.calls[0]?.id }]);
+      expect(workflow.calls).toHaveLength(0);
+      expect(body.closed ?? []).toEqual([]);
     }
   });
 });

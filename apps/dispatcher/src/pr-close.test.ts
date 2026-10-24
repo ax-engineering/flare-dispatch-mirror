@@ -1,5 +1,6 @@
 import { Effect } from "effect";
 import { describe, expect, it } from "vitest";
+import type { Run, TriggerSpec } from "@fractalboxdev/flare-dispatch-core";
 import { contextfulGate } from "@fractalboxdev/flare-dispatch-runs";
 import {
   CLOSE_MARKER_PREFIX,
@@ -10,7 +11,6 @@ import {
   isCloseGroupPayload,
   isCloseMarker,
 } from "./pr-close";
-import { triggersByEvent } from "./registry";
 import { supersededSummary } from "./supersede";
 
 const REPO = "fractalboxdev/contextful";
@@ -28,7 +28,11 @@ const closedPayload = (over: { merged?: boolean; headRepo?: string; action?: str
 });
 
 describe("closedGroups", () => {
-  const matches = triggersByEvent("pull_request");
+  // The gate's own triggers: the registry carries it without them, so no
+  // pull request starts or closes one there.
+  const matches = (contextfulGate.triggers ?? [])
+    .filter((trigger) => trigger.event === "pull_request")
+    .map((trigger) => ({ run: contextfulGate as Run<unknown, unknown>, trigger: trigger as TriggerSpec<unknown> }));
 
   it("names the gate's group, ranked one millisecond after the close, for a merged or unmerged close", () => {
     expect(matches.some(({ run }) => run.name === contextfulGate.name)).toBe(true);

@@ -40,7 +40,7 @@ const readArmedCrons = (): readonly string[] => {
  * that explains why. Adding a name here is the deliberate act; forgetting to is
  * what this test catches.
  */
-const DELIBERATELY_UNARMED = new Set(["release-notes", "product-demo"]);
+const DELIBERATELY_UNARMED = new Set(["release-notes", "product-demo", "contextful-measures", "contextful-protocol"]);
 
 describe("cron parity", () => {
   it("every armed cron binds at least one registered run", () => {
@@ -98,4 +98,15 @@ describe("cron parity", () => {
       .map((r) => r.name);
     expect(armedButListed).toEqual([]);
   });
+
+  it("arms no contextful schedule", () => {
+    // contextful uses FlareDispatch for tag releases only.
+    const armed = readArmedCrons();
+    const contextful = scheduledRuns().filter((r) => r.name.startsWith("contextful-"));
+    for (const { crons } of contextful) {
+      for (const cron of crons) expect(armed).not.toContain(cron);
+    }
+    expect(contextful.length).toBeGreaterThan(0);
+  });
+
 });
