@@ -56,16 +56,35 @@
 // `loadSecrets` resolves via the `secrets` capability (Worker string
 // bindings only — no CONFIG_KV). Commands + secret *names* stay in KV.
 //
-// --- A deploy is never step-retried -------------------------------------------
+// --- A deploy launches once ---------------------------------------------------
 //
-// The `exec` step carries explicit StepOpts: `retries: 0`, and a step timeout
-// of the exec timeout plus headroom. Left bare, the step inherits Cloudflare
-// Workflows' defaults — a 10-minute step timeout and several retries — so a
-// deploy command that outruns 600s is killed at the step boundary and run
-// AGAIN in the same container (its log lands as `exec-2.ndjson`), publishing
-// every Worker a second time. A deploy is not idempotent the way a test is:
-// each attempt ships a new version. So no failure class is retried here, not
-// even a platform `StepFailed` — a killed step may already have published.
+// A deploy is not idempotent the way a test is: each run of the command ships
+// a new version. So the command runs as ONE process the sandbox owns
+// (`durableExec`), not inside one long Workflow step. Holding a single step
+// open for the whole deploy made it hostage to that step: a Workflows restart
+// of the instance, a dropped sandbox connection, or a reset sandbox Durable
+// Object failed the deploy even though the command itself was fine.
+//
+// Only the short steps that launch, observe, and finalize the process retry
+// (platform failures only, never a returned exit code). `exec-start` claims
+// the launch once at the durable owner (check-command.ts, `reserve`), so a
+// retried start recovers the recorded intent and never starts a second
+// process.
+//
+// A lost process — the container recycled mid-command — fails
+// `SandboxProcessLost`, because the deploy may already have published. A
+// dispatch whose command may run twice (one commit published again to the
+// same preview name) sets `relaunchOnProcessLoss`, and the command relaunches
+// once in a fresh container — only while the relaunch can still finish inside
+// the run ceiling (`limits.maxDurationSec`), which would otherwise interrupt
+// it mid-publish.
+//
+// The durable form applies at every exec timeout, short ones included: a
+// Workflows restart or a dropped connection ends a short deploy's held step
+// as surely as a long one's. Only without a durable owner does the command
+// run as a single `exec` step, with `retries: 0` and a step timeout of the
+// exec timeout plus headroom: a retry of that step would run the whole deploy
+// again.
 //
 // --- Several deploys of one commit: `checkLabel` ------------------------------
 //
@@ -122,10 +141,14 @@ import {
   github,
   io,
   RunSkipped,
-  sandbox,
   step,
 } from "@fractalboxdev/flare-dispatch-core";
-import { loadSecrets, workspace } from "@fractalboxdev/flare-dispatch-core/primitives";
+import {
+  durableExec,
+  ensureWorkspace,
+  loadSecrets,
+  workspace,
+} from "@fractalboxdev/flare-dispatch-core/primitives";
 
 const WorkerDeployInput = Schema.Struct({
   repo: Schema.String, // "owner/name"
@@ -180,7 +203,7 @@ const WorkerDeployInput = Schema.Struct({
    * false. No effect without `branch`, or when the head cannot be read.
    */
   requireHead: Schema.optionalWith(Schema.Boolean, { default: () => true }),
-  /** `sandbox.exec` timeout. Omitted → `worker-deploy.timeoutSec:<repo>` → 900. */
+  /** The deploy command's timeout. Omitted → `worker-deploy.timeoutSec:<repo>` → 900. */
   timeoutSec: Schema.optional(Schema.Number),
   /**
    * Fail the run Effect (→ red check) on a non-zero exit. Webhook mode sets
@@ -190,6 +213,13 @@ const WorkerDeployInput = Schema.Struct({
   failOnNonZeroExit: Schema.optionalWith(Schema.Boolean, {
     default: () => false,
   }),
+  /**
+   * Relaunch the command once when the sandbox loses its process (its
+   * container was recycled mid-command). Only for a command that may run
+   * twice: one commit published again to the same preview name. Default
+   * false — a lost process fails the check, and a person retries it.
+   */
+  relaunchOnProcessLoss: Schema.optionalWith(Schema.Boolean, { default: () => false }),
 });
 
 const WorkerDeployOutput = Schema.Struct({
@@ -206,13 +236,8 @@ const WorkerDeployOutput = Schema.Struct({
 /** Default `exec` timeout — a build + `wrangler deploy` fits comfortably. */
 const TIMEOUT_SEC_DEFAULT = 900;
 
-/**
- * Headroom added to the exec timeout to derive the Workflow STEP timeout, so
- * the sandbox's own deadline fires first (a clean `ExecTimeout` with the log
- * so far) instead of the platform killing the step. Same constant as
- * `offload-test` / `check`.
- */
-const STEP_TIMEOUT_HEADROOM_SEC = 120;
+/** The run ceiling (`limits.maxDurationSec`); a relaunch must fit inside it. */
+const MAX_DURATION_SEC = 1800;
 
 /** The env names the deploy command reads the dequeue-time branch head from. */
 export const BRANCH_ENV = "FLAREDISPATCH_BRANCH";
@@ -282,7 +307,9 @@ export const workerDeploy = defineRun({
   name: "worker-deploy",
   // 1.2.0 — additive: per-group serialization, the dequeue-time head check
   // (`requireHead`), and the `FLAREDISPATCH_*` head env.
-  version: "1.2.0",
+  // 1.3.0 — additive: `exec` runs as a durable process, and the opt-in
+  // `relaunchOnProcessLoss`.
+  version: "1.3.0",
 
   // Webhook-mode trigger — `check_suite.requested` is GitHub's per-push signal
   // to checks-writing Apps (see header). Gated to the repo's default branch.
@@ -314,6 +341,7 @@ export const workerDeploy = defineRun({
         install: false,
         secrets: [],
         requireHead: true,
+        relaunchOnProcessLoss: false,
       }),
     },
   ],
@@ -338,7 +366,7 @@ export const workerDeploy = defineRun({
     input.command !== undefined ? [] : [commandKey(input.repo, input.checkLabel)],
 
   limits: {
-    maxDurationSec: 1800,
+    maxDurationSec: MAX_DURATION_SEC,
     // A deploy someone waits on: admitted ahead of batch work.
     admissionClass: "interactive",
   },
@@ -348,7 +376,8 @@ export const workerDeploy = defineRun({
       // resolve-config — the per-repo deploy command, exec timeout, and secret
       // key NAMES (never values: this step's return is checkpointed). Missing
       // command → the repo hasn't opted in; no-op green rather than failing
-      // every push of every installed repo.
+      // every push of every installed repo. `startedAt` is the body's first
+      // checkpointed clock, which the relaunch budget counts from.
       const cmdKey = commandKey(input.repo, input.checkLabel);
       const cfg = yield* step("resolve-config", () =>
         Effect.gen(function* () {
@@ -372,7 +401,7 @@ export const workerDeploy = defineRun({
                   .filter((s) => s.length > 0);
           const secretPrefix =
             input.secretPrefix ?? (yield* config.get(secretPrefixKey(input.repo)));
-          return { command, timeoutSec, secretNames, secretPrefix };
+          return { command, timeoutSec, secretNames, secretPrefix, startedAt: yield* io.now };
         }),
       );
       if (cfg.command === undefined || cfg.command.trim().length === 0) {
@@ -438,37 +467,51 @@ export const workerDeploy = defineRun({
 
       // exec — the deploy itself. A non-zero exit is a normal ExecResult here;
       // the failOnNonZeroExit branch below decides whether it reds the check.
-      // StepOpts are explicit (see header § A deploy is never step-retried):
-      // `retries: 0`, and a step timeout above the exec's so the sandbox
-      // deadline, not the platform's 600s default, ends a long deploy.
+      // It launches once (see header § A deploy launches once): a durable
+      // process whose launch and observation steps retry platform failures,
+      // and a single `exec` step with `retries: 0` without a durable owner.
       const execTimeoutSec = cfg.timeoutSec ?? TIMEOUT_SEC_DEFAULT;
-      const result = yield* step(
-        "exec",
-        () =>
-          sandbox.exec({
-            cwd: dir,
-            container,
-            command,
-            // Per-dispatch `env` wins over a same-named config-store secret;
-            // the head env wins over both, so no dispatch can spoof it.
-            env: {
-              ...secretEnv,
-              ...input.env,
-              [BRANCH_ENV]: branch ?? "",
-              [BRANCH_HEAD_SHA_ENV]: head.sha,
-              [DEPLOY_SHA_ENV]: input.sha,
-            },
-            // Scrub secret VALUES from the captured log before it is persisted,
-            // in case the command echoes its env. Not hypothetical here: a deploy
-            // command is the one that carries a cloud provider's write-scoped API
-            // token, and `wrangler`-class tools print their environment on some
-            // error paths. The log lands in R2 on a stable path (artifact TTLs are
-            // not yet enforced), so a leak there is durable.
-            redactValues: Object.values(secretEnv),
-            timeoutSec: execTimeoutSec,
+      const { result } = yield* durableExec({
+        name: "exec",
+        workspace: { container, dir },
+        // A container recycled before the launch takes the checkout with it;
+        // rebuilding it publishes nothing.
+        ensure: (current) =>
+          ensureWorkspace({
+            current,
+            repo: input.repo,
+            sha: input.sha,
+            ...(input.image !== undefined ? { image: input.image } : {}),
+            install: input.install,
           }),
-        { timeoutSec: execTimeoutSec + STEP_TIMEOUT_HEADROOM_SEC, retries: 0 },
-      );
+        exec: (ws) => ({
+          cwd: ws.dir,
+          command,
+          // Per-dispatch `env` wins over a same-named config-store secret;
+          // the head env wins over both, so no dispatch can spoof it.
+          env: {
+            ...secretEnv,
+            ...input.env,
+            [BRANCH_ENV]: branch ?? "",
+            [BRANCH_HEAD_SHA_ENV]: head.sha,
+            [DEPLOY_SHA_ENV]: input.sha,
+          },
+          // Scrub secret VALUES from the captured log before it is persisted,
+          // in case the command echoes its env. Not hypothetical here: a deploy
+          // command is the one that carries a cloud provider's write-scoped API
+          // token, and `wrangler`-class tools print their environment on some
+          // error paths. The log lands in R2 on a stable path (artifact TTLs are
+          // not yet enforced), so a leak there is durable.
+          redactValues: Object.values(secretEnv),
+          timeoutSec: execTimeoutSec,
+        }),
+        relaunches: input.relaunchOnProcessLoss ? 1 : 0,
+        // A relaunch the run ceiling would cut short dies mid-publish.
+        relaunchDeadlineMs: cfg.startedAt + MAX_DURATION_SEC * 1000,
+        // Durable at any length: the single step cannot retry a lost attempt.
+        minDurableTimeoutSec: 0,
+        singleStepRetries: 0,
+      });
 
       // upload-log — the deploy log as a signed R2 artifact.
       const logUri = yield* step("upload-log", () =>

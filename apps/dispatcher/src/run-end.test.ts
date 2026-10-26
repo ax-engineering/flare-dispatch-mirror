@@ -9,7 +9,7 @@ const EXPIRES = 1_800_003_600;
 
 const ports = () => {
   const kill = vi.fn(async () => {});
-  const end = vi.fn(async (_: { executionId: string; expiresAt: number }) => {});
+  const end = vi.fn(async (_opts: { executionId: string; expiresAt: number }) => {});
   return {
     kill,
     end,

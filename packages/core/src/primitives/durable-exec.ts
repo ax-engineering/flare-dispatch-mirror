@@ -24,16 +24,22 @@
 // relaunches in a destroyed-and-rebuilt container under
 // `<name>-relaunch-<n>-*` step names (a new `stepName` is a new process
 // identity), up to `relaunches` times, and then fails `SandboxProcessLost`.
+// A caller with a run ceiling passes `relaunchDeadlineMs`, and a relaunch that
+// could not finish before it fails `SandboxProcessLost` instead of starting.
 //
 // A deploy without a durable process owner (`Sandbox.checkCommand` absent),
 // and a command short enough that one step is the honest unit, run as a
-// single retryable `<name>` step with `ensure` inside it.
+// single retryable `<name>` step with `ensure` inside it. A command that must
+// not run twice (a deploy) passes `minDurableTimeoutSec: 0`, so it takes the
+// durable form at any length wherever an owner exists, and
+// `singleStepRetries: 0` for the step it runs in without one.
 //
 // Layer: 03-dsl § Primitives. Rides on `sandbox`, `step` and `checkpointSleep`.
 
 import { Effect } from "effect";
 import type { RunContext } from "../context";
 import { type ExecFailed, type ExecTimeout, SandboxProcessLost, type StepFailed } from "../errors";
+import { io } from "../services/io";
 import { sandbox, Sandbox, type ExecResult } from "../services/sandbox";
 import { checkpointSleep, step } from "../step";
 import type { Workspace } from "./workspace";
@@ -52,6 +58,11 @@ const CONTAINER_CALL_STEP_TIMEOUT_SEC = 300;
  * `finish`; each spool read in a loaded container can take a minute.
  */
 const FINALIZE_STEP_TIMEOUT_SEC = CONTAINER_CALL_STEP_TIMEOUT_SEC;
+/**
+ * What a relaunch spends besides its command: destroying the container,
+ * rebuilding the checkout, the launch, and the last poll and finalize.
+ */
+const RELAUNCH_HEADROOM_SEC = CONTAINER_CALL_STEP_TIMEOUT_SEC;
 const POLL_MIN_MS = 5_000;
 const POLL_MAX_MS = 60_000;
 /** Polls at each interval before it doubles. */
@@ -95,6 +106,27 @@ export type DurableExecOpts<E> = {
   readonly relaunches?: number;
   /** Platform retries per step. Default 3. */
   readonly retries?: number;
+  /**
+   * Platform retries for the single-step form (a command within
+   * `minDurableTimeoutSec`, or no durable owner). That step re-runs the whole
+   * command, so a caller whose command must not run twice passes 0.
+   * Default `retries`.
+   */
+  readonly singleStepRetries?: number;
+  /**
+   * At or below this command timeout, one step is the unit even where a
+   * durable owner exists. Default `DURABLE_EXEC_MIN_TIMEOUT_SEC`. A command
+   * that must not run twice passes 0: a short one then survives a lost
+   * attempt as well as a long one does.
+   */
+  readonly minDurableTimeoutSec?: number;
+  /**
+   * Epoch ms a relaunch must finish by — the caller's run ceiling. A relaunch
+   * whose command timeout plus `RELAUNCH_HEADROOM_SEC` would outrun it fails
+   * `SandboxProcessLost` instead: the ceiling would interrupt it mid-command.
+   * Absent, only `relaunches` bounds them.
+   */
+  readonly relaunchDeadlineMs?: number;
 };
 
 export type DurableExecResult = { readonly result: ExecResult; readonly workspace: Workspace };
@@ -111,7 +143,8 @@ export const durableExec = <E>(
     const durable = (yield* Sandbox).checkCommand;
     const timeoutSec = opts.exec(opts.workspace).timeoutSec;
 
-    if (durable === undefined || timeoutSec <= DURABLE_EXEC_MIN_TIMEOUT_SEC) {
+    if (durable === undefined || timeoutSec <= (opts.minDurableTimeoutSec ?? DURABLE_EXEC_MIN_TIMEOUT_SEC)) {
+      const singleStepRetries = opts.singleStepRetries ?? retry.retries;
       // The checkpoint stays an `ExecResult` with the workspace beside it, so an
       // instance that checkpointed a bare `ExecResult` replays unchanged.
       const { workspace = opts.workspace, ...result } = yield* step(
@@ -122,7 +155,11 @@ export const durableExec = <E>(
             const result = yield* sandbox.exec({ ...opts.exec(ws), container: ws.container });
             return { ...result, workspace: ws } as ExecResult & { workspace?: Workspace };
           }),
-        { ...retry, timeoutSec: timeoutSec + STEP_TIMEOUT_HEADROOM_SEC },
+        {
+          // With no retries, no failure class applies.
+          ...(singleStepRetries > 0 ? { ...retry, retries: singleStepRetries } : { retries: 0 }),
+          timeoutSec: timeoutSec + STEP_TIMEOUT_HEADROOM_SEC,
+        },
       );
       return { result, workspace };
     }
@@ -134,6 +171,17 @@ export const durableExec = <E>(
       // checkpointed; each relaunch gets its own names and process identity.
       const name = launch === 0 ? opts.name : `${opts.name}-relaunch-${launch}`;
       if (launch > 0) {
+        if (opts.relaunchDeadlineMs !== undefined) {
+          // Checkpointed, so a replay takes the same decision.
+          const { at } = yield* step(`${name}-clock`, () => Effect.map(io.now, (at) => ({ at })));
+          if (at + (timeoutSec + RELAUNCH_HEADROOM_SEC) * 1000 > opts.relaunchDeadlineMs) {
+            yield* io.log(
+              "warn",
+              `${opts.name}: the sandbox lost the process, and a relaunch could not finish before the run ceiling — not relaunching`,
+            );
+            return yield* Effect.fail(new SandboxProcessLost({ launches: launch }));
+          }
+        }
         // A supervisor that died may leave its process group running, so the
         // relaunch starts from a destroyed container and `ensure` rebuilds it.
         const lost = ws.container;

@@ -18,8 +18,9 @@
 //                          a non-zero exit into `AcceptanceFailed`
 //   (f) trigger mapping — the `check_suite.requested` payload maps to inputs;
 //                          the gate admits only the default branch
-//   (g) step opts       — the exec step carries `retries: 0` and a step
-//                          timeout of the exec timeout + headroom
+//   (g) step opts       — without a durable owner, the single exec step
+//                          carries `retries: 0` and a step timeout of the exec
+//                          timeout + headroom
 //   (h) timeout key     — `worker-deploy.timeoutSec:<repo>` sets the webhook
 //                          exec timeout; a dispatched value wins
 //   (i) checkLabel      — a labelled dispatch reads only its labelled command
@@ -27,6 +28,12 @@
 //                          skips a stale commit (unless `requireHead: false`)
 //                          and hands the head to the command as env, empty
 //                          when unknown
+//   (k) durable exec    — with a durable owner the deploy launches once over
+//                          retryable steps, at any exec timeout; a lost
+//                          process fails unless the dispatch sets
+//                          `relaunchOnProcessLoss`, which relaunches it
+//                          exactly once, and only while the relaunch fits the
+//                          run ceiling; no secret lands in a checkpoint
 //
 // Plus the standard determinism source guard.
 //
@@ -37,6 +44,12 @@ import { fileURLToPath } from "node:url";
 import { it } from "@effect/vitest";
 import { Cause, Effect, Either, Exit, Option, Schema } from "effect";
 import { describe, expect } from "vitest";
+import {
+  Sandbox,
+  StepRunner,
+  type CheckCommandService,
+  type StepRunnerService,
+} from "@fractalboxdev/flare-dispatch-core";
 import { makeCFRuntimeTest } from "@fractalboxdev/flare-dispatch-core/testing";
 import { workerDeploy } from "./worker-deploy";
 
@@ -50,6 +63,7 @@ const baseInput = {
   install: false,
   requireHead: true,
   failOnNonZeroExit: false,
+  relaunchOnProcessLoss: false,
 } as const;
 
 describe("worker-deploy", () => {
@@ -95,6 +109,7 @@ describe("worker-deploy", () => {
         install: false,
         requireHead: true,
         failOnNonZeroExit: true,
+        relaunchOnProcessLoss: false,
       };
 
       return Effect.gen(function* () {
@@ -121,6 +136,7 @@ describe("worker-deploy", () => {
         install: false,
         requireHead: true,
         failOnNonZeroExit: true,
+        relaunchOnProcessLoss: false,
       };
 
       return Effect.gen(function* () {
@@ -156,6 +172,7 @@ describe("worker-deploy", () => {
         install: false,
         requireHead: true,
         failOnNonZeroExit: true,
+        relaunchOnProcessLoss: false,
       };
 
       return Effect.gen(function* () {
@@ -190,6 +207,7 @@ describe("worker-deploy", () => {
       install: false,
       requireHead: true,
       failOnNonZeroExit: true,
+      relaunchOnProcessLoss: false,
     };
 
     return Effect.gen(function* () {
@@ -230,6 +248,7 @@ describe("worker-deploy", () => {
       install: false,
       requireHead: true,
       failOnNonZeroExit: true,
+      relaunchOnProcessLoss: false,
     };
 
     return Effect.gen(function* () {
@@ -296,7 +315,7 @@ describe("worker-deploy", () => {
     },
   );
 
-  // --- exec StepOpts — a deploy is never step-retried --------------------------
+  // --- exec StepOpts — without a durable owner, one step that never retries ---
 
   const execStepOf = (steps: ReadonlyArray<{ name: string; metadata?: Record<string, unknown> }>) =>
     steps.find((s) => s.name === "exec");
@@ -338,6 +357,7 @@ describe("worker-deploy", () => {
     install: false,
     requireHead: true,
     failOnNonZeroExit: true,
+    relaunchOnProcessLoss: false,
   };
 
   it.effect("timeoutSec — a webhook dispatch reads `worker-deploy.timeoutSec:<repo>`", () => {
@@ -379,6 +399,227 @@ describe("worker-deploy", () => {
     return Effect.gen(function* () {
       yield* workerDeploy.run(webhookInput);
       expect(handles.sandbox.execs.find((e) => e.command === DEPLOY_CMD)?.timeoutSec).toBe(900);
+    }).pipe(Effect.provide(layer));
+  });
+
+  // --- durable exec — the deploy launches once ---------------------------------
+
+  type Launch = Parameters<CheckCommandService["prepare"]>[0];
+
+  /**
+   * A durable process owner that loses the first `lost` launches (the sandbox
+   * holds no process for them), then reports exit 0. Records every call, and
+   * what each `prepare` was asked to launch.
+   */
+  const owner = (lost: number, calls: string[], launched: Launch[] = []): CheckCommandService => ({
+    prepare: (opts) =>
+      Effect.sync(() => {
+        calls.push(`prepare:${opts.stepName}`);
+        launched.push(opts);
+        return { id: opts.stepName, container: opts.container!, fingerprint: "f", startedAt: 0, deadline: 1 };
+      }),
+    start: (h) => Effect.sync(() => void calls.push(`start:${h.id}`)),
+    observe: (h) =>
+      Effect.sync(() => {
+        calls.push(`observe:${h.id}`);
+        return calls.filter((c) => c.startsWith("start:")).length <= lost
+          ? { state: "missing" as const }
+          : { state: "exited" as const, exitCode: 0, durationMs: 1 };
+      }),
+    finalize: (h) =>
+      Effect.sync(() => {
+        calls.push(`finalize:${h.id}`);
+        return { exitCode: 0, durationMs: 1, logPath: "logs/exec.ndjson", stdout: "", stderr: "" };
+      }),
+  });
+
+  /** Run the deploy against a sandbox that has a durable process owner. */
+  const runWithOwner = (input: Parameters<typeof workerDeploy.run>[0], checkCommand: CheckCommandService) =>
+    Effect.flatMap(Sandbox, (original) =>
+      workerDeploy.run(input).pipe(Effect.provideService(Sandbox, { ...original, checkCommand })),
+    );
+
+  const startsOf = (calls: string[]) => calls.filter((c) => c.startsWith("start:"));
+  const failureOf = (exit: Exit.Exit<unknown, unknown>) =>
+    Exit.isFailure(exit) ? Option.getOrUndefined(Cause.failureOption(exit.cause)) : undefined;
+
+  it.effect("durable exec — the deploy launches once, over short steps, from the checkout", () => {
+    const { layer, handles } = makeCFRuntimeTest();
+    const calls: string[] = [];
+    const launched: Launch[] = [];
+    return Effect.gen(function* () {
+      const result = yield* runWithOwner(baseInput, owner(0, calls, launched));
+      expect(result.deployed).toBe(true);
+      // PRE-FIX: ["resolve-config", "checkout", "exec", "upload-log"]
+      expect(handles.executions.steps.map((s) => s.name)).toEqual([
+        "resolve-config",
+        "checkout",
+        "exec-workspace",
+        "exec-prepare",
+        "exec-start",
+        "exec-observe-0",
+        "exec-finalize",
+        "upload-log",
+      ]);
+      expect(startsOf(calls)).toEqual(["start:exec"]);
+      expect(launched).toHaveLength(1);
+      expect(launched[0]).toMatchObject({ command: DEPLOY_CMD, cwd: "/workspace/name", timeoutSec: 900 });
+      // The owner runs the command; the sandbox never holds it in a blocking exec.
+      expect(handles.sandbox.execs.map((e) => e.command)).not.toContain(DEPLOY_CMD);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("durable exec — a lost process fails SandboxProcessLost, with no relaunch by default", () => {
+    const { layer, handles } = makeCFRuntimeTest();
+    const calls: string[] = [];
+    return Effect.gen(function* () {
+      const exit = yield* Effect.exit(runWithOwner(baseInput, owner(1, calls)));
+      // PRE-FIX: success — the owner is never asked
+      expect(failureOf(exit)).toMatchObject({ _tag: "SandboxProcessLost", launches: 1 });
+      expect(startsOf(calls)).toEqual(["start:exec"]);
+      expect(handles.executions.steps.some((s) => s.name.startsWith("exec-relaunch-"))).toBe(false);
+      expect(handles.sandbox.destroyed).toEqual([]);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("durable exec — launch and observation retry platform failures only", () => {
+    const { layer, handles } = makeCFRuntimeTest();
+    const calls: string[] = [];
+    return Effect.gen(function* () {
+      yield* runWithOwner(baseInput, owner(0, calls));
+      const retried = handles.executions.steps.filter(
+        (s) => s.name === "exec-start" || s.name.startsWith("exec-observe-"),
+      );
+      // PRE-FIX: [] — one blocking exec step
+      expect(retried.map((s) => s.name)).toEqual(["exec-start", "exec-observe-0"]);
+      for (const s of retried) {
+        expect(s.metadata?.["stepOpts.retries"]).toBe(3);
+        expect(s.metadata?.["stepOpts.retryOn"]).toEqual(["ExecFailed", "StepFailed", "CheckoutFailed"]);
+      }
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("relaunchOnProcessLoss — a lost process relaunches exactly once, in a fresh container", () => {
+    const { layer, handles } = makeCFRuntimeTest();
+    const calls: string[] = [];
+    return Effect.gen(function* () {
+      const result = yield* runWithOwner({ ...baseInput, relaunchOnProcessLoss: true }, owner(1, calls));
+      // PRE-FIX: SandboxProcessLost — the input is ignored
+      expect(result.deployed).toBe(true);
+      expect(startsOf(calls)).toEqual(["start:exec", "start:exec-relaunch-1"]);
+      expect(handles.executions.steps.map((s) => s.name)).toEqual(
+        expect.arrayContaining([
+          "exec-relaunch-1-destroy",
+          "exec-relaunch-1-workspace",
+          "exec-relaunch-1-prepare",
+          "exec-relaunch-1-start",
+          "exec-relaunch-1-finalize",
+        ]),
+      );
+      expect(handles.sandbox.destroyed).toEqual(["fake-container"]);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("relaunchOnProcessLoss — a second loss fails after exactly two launches", () => {
+    const { layer } = makeCFRuntimeTest();
+    const calls: string[] = [];
+    return Effect.gen(function* () {
+      const exit = yield* Effect.exit(
+        runWithOwner({ ...baseInput, relaunchOnProcessLoss: true }, owner(2, calls)),
+      );
+      // PRE-FIX: success — the owner is never asked
+      expect(failureOf(exit)).toMatchObject({ _tag: "SandboxProcessLost", launches: 2 });
+      expect(startsOf(calls)).toEqual(["start:exec", "start:exec-relaunch-1"]);
+      expect(calls.some((c) => c.startsWith("finalize:"))).toBe(false);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("durable exec — a short exec timeout still runs the deploy durably", () => {
+    const { layer, handles } = makeCFRuntimeTest();
+    const calls: string[] = [];
+    return Effect.gen(function* () {
+      yield* runWithOwner({ ...baseInput, timeoutSec: 300 }, owner(0, calls));
+      // PRE-FIX: ["resolve-config", "checkout", "exec", "upload-log"] — one
+      // step that cannot retry, so a lost attempt still reds the deploy
+      expect(handles.executions.steps.map((s) => s.name)).toContain("exec-observe-0");
+      expect(handles.executions.steps.map((s) => s.name)).not.toContain("exec");
+      expect(startsOf(calls)).toEqual(["start:exec"]);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("relaunchOnProcessLoss — no relaunch the run ceiling would cut short", () => {
+    const { layer, handles } = makeCFRuntimeTest();
+    const calls: string[] = [];
+    const lostLate = owner(1, calls);
+    return Effect.gen(function* () {
+      const exit = yield* Effect.exit(
+        runWithOwner(
+          { ...baseInput, relaunchOnProcessLoss: true },
+          {
+            ...lostLate,
+            // The process is lost 700 s in: a 900 s relaunch plus its rebuild
+            // would end past the 1800 s ceiling.
+            observe: (h, c) =>
+              Effect.sync(() => void (handles.io.nowCursor += 700_000)).pipe(
+                Effect.zipRight(lostLate.observe(h, c)),
+              ),
+          },
+        ),
+      );
+      // PRE-FIX: success — relaunched, and the ceiling would interrupt it mid-publish
+      expect(failureOf(exit)).toMatchObject({ _tag: "SandboxProcessLost", launches: 1 });
+      expect(startsOf(calls)).toEqual(["start:exec"]);
+      expect(handles.sandbox.destroyed).toEqual([]);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it("relaunchOnProcessLoss — the input defaults to false and rejects a non-boolean", () => {
+    const decode = Schema.decodeUnknownEither(workerDeploy.inputs);
+    // PRE-FIX: undefined — the schema drops the key
+    expect(Either.getOrUndefined(decode({ repo: "owner/name", sha: "abc123" }))?.relaunchOnProcessLoss).toBe(false);
+    expect(
+      Either.getOrUndefined(decode({ repo: "owner/name", sha: "abc123", relaunchOnProcessLoss: true }))
+        ?.relaunchOnProcessLoss,
+    ).toBe(true);
+    expect(Either.isLeft(decode({ repo: "owner/name", sha: "abc123", relaunchOnProcessLoss: "yes" }))).toBe(true);
+  });
+
+  it.effect("durable exec — the secret reaches the command, never a checkpoint or a step record", () => {
+    const { layer, handles } = makeCFRuntimeTest({
+      config: {
+        "worker-deploy.command:owner/name": DEPLOY_CMD,
+        "worker-deploy.secrets:owner/name": "CLOUDFLARE_API_TOKEN",
+      },
+      secrets: { CLOUDFLARE_API_TOKEN: "cf_token_from_worker" },
+    });
+    const calls: string[] = [];
+    const launched: Launch[] = [];
+    const checkpoints: { name: string; value: string }[] = [];
+    return Effect.gen(function* () {
+      // Every step's return value is what Workflows checkpoints durably.
+      const ordinary = yield* StepRunner;
+      const recording: StepRunnerService = {
+        ...ordinary,
+        run: (name, body, opts) =>
+          ordinary
+            .run(name, body, opts)
+            .pipe(Effect.tap((value) => Effect.sync(() => void checkpoints.push({ name, value: JSON.stringify(value) ?? "" })))),
+      };
+      const result = yield* runWithOwner(webhookInput, owner(0, calls, launched)).pipe(
+        Effect.provideService(StepRunner, recording),
+      );
+      expect(result.deployed).toBe(true);
+      // PRE-FIX: undefined — the owner is never asked
+      expect(launched[0]?.env?.["CLOUDFLARE_API_TOKEN"]).toBe("cf_token_from_worker");
+      // ...with the policy that scrubs it from the command's log.
+      expect(launched[0]?.redactValues).toEqual(["cf_token_from_worker"]);
+      expect(checkpoints.map((c) => c.name)).toEqual(
+        expect.arrayContaining(["resolve-config", "exec-prepare", "exec-start", "exec-finalize"]),
+      );
+      for (const c of checkpoints) expect(c.value).not.toContain("cf_token_from_worker");
+      for (const s of handles.executions.steps) {
+        expect(JSON.stringify(s.metadata ?? {})).not.toContain("cf_token_from_worker");
+      }
     }).pipe(Effect.provide(layer));
   });
 
@@ -607,6 +848,7 @@ describe("worker-deploy", () => {
       install: false,
       secrets: [],
       requireHead: true,
+      relaunchOnProcessLoss: false,
     });
     expect(trigger?.idempotencyKey(ctx)).toBe("worker-deploy:owner_name:abcdef012345");
   });

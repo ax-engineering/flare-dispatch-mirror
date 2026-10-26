@@ -152,4 +152,111 @@ describe("durableExec", () => {
       expect(calls.some((c) => c.startsWith("finalize:"))).toBe(false);
     }).pipe(Effect.provide(layer));
   });
+
+  it.effect("singleStepRetries: 0 keeps the single step to one attempt; the durable steps still retry", () => {
+    const short = makeCFRuntimeTest();
+    const long = makeCFRuntimeTest();
+    const calls: string[] = [];
+    return Effect.gen(function* () {
+      // No durable owner: the whole command is one step, and it must not re-run.
+      yield* durableExec({
+        name: "deploy",
+        workspace: ws,
+        ensure: Effect.succeed,
+        exec: exec(900),
+        singleStepRetries: 0,
+      }).pipe(Effect.provide(short.layer));
+      const only = short.handles.executions.steps.find((s) => s.name === "deploy");
+      // PRE-FIX: 3
+      expect(only?.metadata?.["stepOpts.retries"]).toBe(0);
+      expect(only?.metadata?.["stepOpts.retryOn"]).toBeUndefined();
+      expect(only?.metadata?.["stepOpts.timeoutSec"]).toBe(1_020);
+
+      // A durable owner: launch and observation are short steps a retry cannot
+      // turn into a second process, so they keep their retries.
+      yield* Effect.gen(function* () {
+        const original = yield* Sandbox;
+        yield* durableExec({
+          name: "deploy",
+          workspace: ws,
+          ensure: Effect.succeed,
+          exec: exec(900),
+          singleStepRetries: 0,
+        }).pipe(Effect.provideService(Sandbox, { ...original, checkCommand: loses(0, calls) }));
+      }).pipe(Effect.provide(long.layer));
+      const start = long.handles.executions.steps.find((s) => s.name === "deploy-start");
+      expect(start?.metadata?.["stepOpts.retries"]).toBe(3);
+      expect(start?.metadata?.["stepOpts.retryOn"]).toEqual(["ExecFailed", "StepFailed", "CheckoutFailed"]);
+    });
+  });
+
+  it.effect("minDurableTimeoutSec: 0 runs even a short command durably where an owner exists", () => {
+    const { layer, handles } = makeCFRuntimeTest();
+    const calls: string[] = [];
+    return Effect.gen(function* () {
+      const original = yield* Sandbox;
+      yield* durableExec({
+        name: "deploy",
+        workspace: ws,
+        ensure: Effect.succeed,
+        exec: exec(300),
+        minDurableTimeoutSec: 0,
+        singleStepRetries: 0,
+      }).pipe(Effect.provideService(Sandbox, { ...original, checkCommand: loses(0, calls) }));
+      // PRE-FIX: ["deploy"] — one step that cannot retry a lost attempt
+      expect(handles.executions.steps.map((s) => s.name)).toEqual([
+        "deploy-workspace",
+        "deploy-prepare",
+        "deploy-start",
+        "deploy-observe-0",
+        "deploy-finalize",
+      ]);
+    }).pipe(Effect.provide(layer));
+  });
+
+  describe("relaunchDeadlineMs", () => {
+    // The IO fake's clock starts at 1_700_000_000_000 and ticks 1 s per read;
+    // a 900 s command plus the 300 s relaunch headroom needs 1_200 s left.
+    const START = 1_700_000_000_000;
+    const relaunchUnder = (deadlineSec: number, calls: string[]) =>
+      Effect.flatMap(Sandbox, (original) =>
+        durableExec({
+          name: "deploy",
+          workspace: ws,
+          ensure: Effect.succeed,
+          exec: exec(900),
+          relaunches: 1,
+          relaunchDeadlineMs: START + deadlineSec * 1000,
+        }).pipe(Effect.provideService(Sandbox, { ...original, checkCommand: loses(1, calls) })),
+      );
+
+    it.effect("a relaunch that cannot finish before the deadline fails SandboxProcessLost unlaunched", () => {
+      const { layer, handles } = makeCFRuntimeTest();
+      const calls: string[] = [];
+      return Effect.gen(function* () {
+        const exit = yield* Effect.exit(relaunchUnder(1_100, calls));
+        // PRE-FIX: success — relaunched into a ceiling that would cut it short
+        expect(Exit.isFailure(exit)).toBe(true);
+        if (Exit.isFailure(exit))
+          expect(Option.getOrUndefined(Cause.failureOption(exit.cause))).toMatchObject({
+            _tag: "SandboxProcessLost",
+            launches: 1,
+          });
+        expect(calls.filter((c) => c.startsWith("prepare:"))).toEqual(["prepare:deploy"]);
+        expect(handles.sandbox.destroyed).toEqual([]);
+      }).pipe(Effect.provide(layer));
+    });
+
+    it.effect("a relaunch that fits before the deadline runs", () => {
+      const { layer } = makeCFRuntimeTest();
+      const calls: string[] = [];
+      return Effect.gen(function* () {
+        yield* relaunchUnder(1_300, calls);
+        expect(calls.filter((c) => c.startsWith("prepare:"))).toEqual([
+          "prepare:deploy",
+          "prepare:deploy-relaunch-1",
+        ]);
+      }).pipe(Effect.provide(layer));
+    });
+  });
 });
